@@ -3,14 +3,14 @@
  * Listeners and the mock upstream bind 127.0.0.1 only.
  */
 import { createHash } from 'node:crypto';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { createFunnelGate, listenGate } from '../scripts/grok-shared-brain/gate.ts';
-import { clearStaleIndexLock, gitIsRunning, isGitComm, listLocalProcesses, parsePs, STALE_INDEX_LOCK_MS } from '../scripts/grok-shared-brain/index-lock.ts';
+import { BODY_LIMIT, createFunnelGate, listenGate } from '../scripts/grok-shared-brain/gate.ts';
+import { clearStaleIndexLock, gitIsRunning, isGitComm, listLocalProcesses, parsePs, REFUSED_WITHOUT_FORCE, STALE_INDEX_LOCK_MS } from '../scripts/grok-shared-brain/index-lock.ts';
 import { evaluateMcpBody } from '../scripts/grok-shared-brain/mcp-policy.ts';
 import { findFunnelEnableInvocations, FUNNEL_ENABLE_COMMAND, readScriptTree, requestFunnelEnable } from '../scripts/grok-shared-brain/funnel-policy.ts';
 import { authenticate, configContainsPlaintext, generateTokens, parseFunnelConfig, pathInside, repoRootFrom, sha256Hex, tokenMatchesHash, writeTokenFile, type FunnelConfig } from '../scripts/grok-shared-brain/tokens.ts';
@@ -127,18 +127,35 @@ describe('funnel stays off', () => {
     for (const path of ['../docs/grok/BUILD-NOTES.md', '../docs/grok/shared-brain/README.md']) {
       expect(readFileSync(join(import.meta.dir, path), 'utf8')).toContain('tailscale funnel --bg 8767');
     }
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-setup-home-'));
+    const host = spawnSync('hostname', ['-s'], { encoding: 'utf8' }).stdout.trim();
+    mkdirSync(join(home, '.gbrain', 'serve'), { recursive: true });
+    const hostEnv = join(home, '.gbrain', 'serve', 'host.env');
+    writeFileSync(hostEnv, `GBRAIN_EXPECTED_HOST=${host}\n`);
     const ran = spawnSync('bash', ['-x', join(SCRIPT_DIR, 'setup.sh')], {
       encoding: 'utf8',
-      env: { ...process.env, GBRAIN_SHARED_BRAIN_TEST: '1', PATH: process.env.PATH },
+      env: { ...process.env, HOME: home, PATH: process.env.PATH },
     });
     expect(ran.status).toBe(0);
     expect(ran.stdout).toContain('Funnel is OFF');
     expect(ran.stdout).toContain('tailscale funnel --bg 8767');
     const trace = `${ran.stderr}\n${ran.stdout}`;
     expect(trace.split('\n').some(line => /^\+ tailscale\b/.test(line))).toBe(false);
-    const wrong = spawnSync('bash', [join(SCRIPT_DIR, 'setup.sh')], { encoding: 'utf8', env: { ...process.env, GBRAIN_SHARED_BRAIN_TEST: '' } });
-    expect(wrong.status).toBe(1);
-    expect(wrong.stderr).toContain('Wrong machine:');
+    const missing = spawnSync('bash', [join(SCRIPT_DIR, 'setup.sh')], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: mkdtempSync(join(tmpdir(), 'gbrain-setup-missing-')) },
+    });
+    expect(missing.status).not.toBe(0);
+    expect(missing.stderr).toContain('host.env');
+    expect(missing.stderr).toContain('GBRAIN_EXPECTED_HOST=<MAC_HOSTNAME>');
+    writeFileSync(hostEnv, '# no assignment\n');
+    const unset = spawnSync('bash', [join(SCRIPT_DIR, 'setup.sh')], { encoding: 'utf8', env: { ...process.env, HOME: home } });
+    expect(unset.status).not.toBe(0);
+    expect(unset.stderr).toContain('GBRAIN_EXPECTED_HOST is missing');
+    writeFileSync(hostEnv, 'GBRAIN_EXPECTED_HOST=not-this-machine\n');
+    const wrong = spawnSync('bash', [join(SCRIPT_DIR, 'setup.sh')], { encoding: 'utf8', env: { ...process.env, HOME: home } });
+    expect(wrong.status).not.toBe(0);
+    expect(wrong.stderr).toContain('does not match GBRAIN_EXPECTED_HOST');
   });
 
   test('print command exits without enabling funnel', () => {
@@ -224,9 +241,28 @@ describe('funnel gate', () => {
     const other = await call(port, 'POST', '/mcp', tokens.personal, remember('business'));
     expect(other.status).toBe(403);
     expect(other.text).toContain('wrong_scope');
+    const missingSource = await call(port, 'POST', '/mcp', tokens.personal, JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'remember', arguments: { text: 'fixture' } },
+    }));
+    expect(missingSource.status).toBe(403);
+    expect(missingSource.text).toContain('wrong_scope');
+    const emptySource = await call(port, 'POST', '/mcp', tokens.personal, remember(''));
+    expect(emptySource.status).toBe(403);
+    expect(emptySource.text).toContain('wrong_scope');
     const header = await call(port, 'POST', '/mcp?source=shared', tokens.hermes, '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}');
     expect(header.status).toBe(403);
     expect(hits.length).toBe(before);
+  });
+
+  test('a write with a missing, empty, or wrong source is refused', () => {
+    const record = config.clients.personal!;
+    const callTool = (args: Record<string, unknown>) => evaluateMcpBody(JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'remember', arguments: args },
+    }), record);
+    expect(callTool({ text: 'fixture' })).toEqual({ ok: false, status: 403, error: 'forbidden', code: 'wrong_scope' });
+    expect(callTool({ text: 'fixture', source: '' })).toEqual({ ok: false, status: 403, error: 'forbidden', code: 'wrong_scope' });
+    expect(callTool({ text: 'fixture', source: 'business' })).toEqual({ ok: false, status: 403, error: 'forbidden', code: 'wrong_scope' });
+    expect(callTool({ text: 'fixture', source: 'personal' })).toEqual({ ok: true });
   });
 
   test('a token that lists shared as writable is still refused', () => {
@@ -249,6 +285,36 @@ describe('funnel gate', () => {
       expect(hit.authorization).toBe('');
       for (const token of Object.values(tokens)) expect(hit.authorization.includes(token)).toBe(false);
     }
+  });
+
+  test('an oversize body is 413 and the socket stays open', async () => {
+    const payload = Buffer.alloc(BODY_LIMIT + 32, 0x61);
+    const result = await new Promise<{ status: number; body: string; error: string }>((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port,
+        path: '/mcp',
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${tokens.personal}`,
+          'content-type': 'application/json',
+          'content-length': payload.length,
+        },
+      }, response => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve({
+          status: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString('utf8'),
+          error: '',
+        }));
+      });
+      req.on('error', error => reject(error));
+      req.end(payload);
+    });
+    expect(result.error).toBe('');
+    expect(result.status).toBe(413);
+    expect(result.body).toContain('too_large');
   });
 
   test('query-string bearers are not accepted and tokens never appear in logs', async () => {
@@ -361,34 +427,35 @@ describe('index.lock', () => {
   test('clears a stale lock only when no git process is running', () => {
     const dir = checkout('clear');
     const path = lock(dir, STALE_INDEX_LOCK_MS + 5_000);
-    const none = clearStaleIndexLock(dir, { listProcesses: () => [] });
+    const none = clearStaleIndexLock(dir, { force: true, listProcesses: () => [] });
     expect(none).toEqual({ cleared: true, reason: 'cleared' });
     expect(existsSync(path)).toBe(false);
 
     const kept = checkout('kept');
     const keptLock = lock(kept, STALE_INDEX_LOCK_MS + 5_000);
-    const running = clearStaleIndexLock(kept, { listProcesses: () => [{ pid: 40, comm: 'git' }] });
+    const running = clearStaleIndexLock(kept, { force: true, listProcesses: () => [{ pid: 40, comm: 'git' }] });
     expect(running).toEqual({ cleared: false, reason: 'git_running' });
     expect(existsSync(keptLock)).toBe(true);
 
     const fresh = checkout('fresh');
     const freshLock = lock(fresh, 1_000);
-    expect(clearStaleIndexLock(fresh, { listProcesses: () => [] }).reason).toBe('lock_not_stale');
+    expect(clearStaleIndexLock(fresh, { force: true, listProcesses: () => [] }).reason).toBe('lock_not_stale');
     expect(existsSync(freshLock)).toBe(true);
 
     const future = checkout('future');
     const futureLock = lock(future, -60_000);
-    expect(clearStaleIndexLock(future, { listProcesses: () => [] }).reason).toBe('lock_dated_in_the_future');
+    expect(clearStaleIndexLock(future, { force: true, listProcesses: () => [] }).reason).toBe('lock_dated_in_the_future');
     expect(existsSync(futureLock)).toBe(true);
 
     const blind = checkout('blind');
     lock(blind, STALE_INDEX_LOCK_MS + 5_000);
-    expect(clearStaleIndexLock(blind, { listProcesses: () => null }).reason).toBe('process_table_unreadable');
+    expect(clearStaleIndexLock(blind, { force: true, listProcesses: () => null }).reason).toBe('process_table_unreadable');
 
     let calls = 0;
     const raced = checkout('raced');
     const racedLock = lock(raced, STALE_INDEX_LOCK_MS + 5_000);
     const race = clearStaleIndexLock(raced, {
+      force: true,
       listProcesses: () => {
         calls += 1;
         return calls === 1 ? [] : [{ pid: 7, comm: 'git' }];
@@ -403,13 +470,38 @@ describe('index.lock', () => {
     const real = join(root, 'real-lock');
     writeFileSync(real, '');
     symlinkSync(real, join(dir, '.git', 'index.lock'));
-    expect(clearStaleIndexLock(dir, { listProcesses: () => [] }).reason).toBe('lock_not_a_regular_file');
+    expect(clearStaleIndexLock(dir, { force: true, listProcesses: () => [] }).reason).toBe('lock_not_a_regular_file');
     expect(existsSync(real)).toBe(true);
 
     const linked = join(root, 'linked');
     mkdirSync(linked, { recursive: true });
     symlinkSync(join(dir, '.git'), join(linked, '.git'));
-    expect(clearStaleIndexLock(linked, { listProcesses: () => [] }).reason).toBe('git_dir_not_a_real_directory');
+    expect(clearStaleIndexLock(linked, { force: true, listProcesses: () => [] }).reason).toBe('git_dir_not_a_real_directory');
+  });
+
+  test('refuses to clear unless --force, then clears only when the checks pass', () => {
+    const dir = checkout('force');
+    const path = lock(dir, STALE_INDEX_LOCK_MS + 5_000);
+    const refused = clearStaleIndexLock(dir, { listProcesses: () => [] });
+    expect(refused).toEqual({ cleared: false, reason: 'refused_without_force' });
+    expect(existsSync(path)).toBe(true);
+    const cli = spawnSync(process.execPath, [join(SCRIPT_DIR, 'cli-clear-index-lock.ts'), dir], { encoding: 'utf8' });
+    expect(cli.status).not.toBe(0);
+    expect(cli.stderr).toContain(REFUSED_WITHOUT_FORCE);
+    expect(existsSync(path)).toBe(true);
+    const local = listLocalProcesses();
+    if (local && gitIsRunning(local)) {
+      const blocked = spawnSync(process.execPath, [join(SCRIPT_DIR, 'cli-clear-index-lock.ts'), dir, '--force'], { encoding: 'utf8' });
+      expect(blocked.status).not.toBe(0);
+      expect(existsSync(path)).toBe(true);
+      const forced = clearStaleIndexLock(dir, { force: true, listProcesses: () => [] });
+      expect(forced).toEqual({ cleared: true, reason: 'cleared' });
+    } else {
+      const forced = spawnSync(process.execPath, [join(SCRIPT_DIR, 'cli-clear-index-lock.ts'), dir, '--force'], { encoding: 'utf8' });
+      expect(forced.status).toBe(0);
+      expect(forced.stdout).toContain('"cleared":true');
+    }
+    expect(existsSync(path)).toBe(false);
   });
 
   test('a live process whose command is git keeps the lock', () => {
@@ -431,7 +523,7 @@ describe('index.lock', () => {
         spawnSync('sleep', ['0.05']);
       }
       expect(visible).toBe(true);
-      const result = clearStaleIndexLock(dir);
+      const result = clearStaleIndexLock(dir, { force: true });
       expect(result.cleared).toBe(false);
       expect(result.reason).toBe('git_running');
       expect(existsSync(path)).toBe(true);

@@ -39,7 +39,15 @@ export GBRAIN_MLSFS_ROOT="/Volumes/<share>/personalgrok/gbrain"   # replace <sha
 GBRAIN_SHARED_BRAIN_TEST=1 GBRAIN_SHARED_APPLY_STEP4=1 bash scripts/grok-shared-brain/setup.sh
 ```
 
-On the Mac mini, `setup.sh` checks the hostname from the design before it does anything else. `GBRAIN_SHARED_BRAIN_TEST=1` is only for the offline test. Step 4 sets `user.name=gbrain` and `user.email=gbrain@localhost` only on the commit command. It does not run `gbrain sources add` (that needs the brain the operator inits in design step 3). After init, from the Mac:
+`setup.sh` reads the expected hostname from an untracked file outside the repo, `~/.gbrain/serve/host.env`. It refuses to run when that file or `GBRAIN_EXPECTED_HOST` is missing. The file is one assignment and is not committed:
+
+```
+GBRAIN_EXPECTED_HOST=<MAC_HOSTNAME>
+```
+
+`<MAC_HOSTNAME>` is the placeholder. Replace it locally with the output of `hostname -s`. Do not commit that file.
+
+Step 4 sets `user.name=gbrain` and `user.email=gbrain@localhost` only on the commit command. It does not remove a stale `.git/index.lock` unless you re-run the clearer with `--force`. It does not run `gbrain sources add` (that needs the brain the operator inits in design step 3). After init, from the Mac:
 
 ```bash
 ROOT="$GBRAIN_MLSFS_ROOT"
@@ -49,10 +57,10 @@ gbrain sources add hermes --path "$ROOT/hermes" --name "hermes" --no-federated -
 gbrain sources add shared --path "$ROOT/shared" --name "shared" --federated --json
 ```
 
-A stale `.git/index.lock` is removed only when `ps` shows no git process and the lock is at least 10 minutes old:
+A stale `.git/index.lock` is left in place unless `--force` is passed. Even then it is removed only when `ps` shows no git process, the lock is a regular file at least 10 minutes old, and that is checked again immediately before unlink:
 
 ```bash
-bun scripts/grok-shared-brain/cli-clear-index-lock.ts "$GBRAIN_MLSFS_ROOT/personal"
+bun scripts/grok-shared-brain/cli-clear-index-lock.ts "$GBRAIN_MLSFS_ROOT/personal" --force
 ```
 
 ## Tokens

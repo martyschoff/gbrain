@@ -37,17 +37,33 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let tooLarge = false;
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    // Read the body to completion and answer 413. Do not destroy the socket:
+    // destroying it drops the connection before the client can read the status.
     req.on('data', (chunk: Buffer) => {
+      if (tooLarge) return;
       size += chunk.length;
       if (size > limit) {
-        reject(Object.assign(new Error('too_large'), { code: 'too_large' }));
-        req.destroy();
+        tooLarge = true;
+        chunks.length = 0;
         return;
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on('end', () => {
+      if (tooLarge) fail(Object.assign(new Error('too_large'), { code: 'too_large' }));
+      else if (!settled) {
+        settled = true;
+        resolve(Buffer.concat(chunks));
+      }
+    });
+    req.on('error', fail);
   });
 }
 

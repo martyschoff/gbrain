@@ -57,8 +57,14 @@ function collectSources(value: unknown, found: string[]): void {
 
 function decideSources(tool: string, sources: string[], record: ClientRecord): PolicyDecision {
   const reading = READ_TOOLS.has(tool);
-  if (!reading && sources.includes('shared')) {
-    return { ok: false, status: 403, error: 'forbidden', code: 'shared_write_forbidden' };
+  if (!reading) {
+    // A write with no source would otherwise land in the grant's default source. Fail closed.
+    if (sources.length === 0 || sources.some(source => source.trim() === '')) {
+      return { ok: false, status: 403, error: 'forbidden', code: 'wrong_scope' };
+    }
+    if (sources.includes('shared')) {
+      return { ok: false, status: 403, error: 'forbidden', code: 'shared_write_forbidden' };
+    }
   }
   const allowed = reading ? record.read : record.write;
   for (const source of sources) {

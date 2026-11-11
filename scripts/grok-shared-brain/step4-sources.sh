@@ -1,6 +1,7 @@
 #!/bin/bash
 # Create the four source checkouts and commit README.md with a repo-local
-# git identity. A stale index.lock is removed only when no git process is running.
+# git identity. A stale index.lock is left in place unless the clearer is
+# re-run with --force. This script does not pass --force.
 set -euo pipefail
 
 ROOT="${GBRAIN_MLSFS_ROOT:-}"

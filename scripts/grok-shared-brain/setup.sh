@@ -1,14 +1,37 @@
 #!/bin/bash
 # Shared-brain runbook driver. It does not install Bun, gbrain, or Tailscale,
 # and it does not run `tailscale funnel`.
+# The expected hostname is read from an untracked file outside the repo.
+# Format (one assignment, placeholder shown):
+#   GBRAIN_EXPECTED_HOST=<MAC_HOSTNAME>
 set -euo pipefail
 
-if [ "${GBRAIN_SHARED_BRAIN_TEST:-}" != "1" ]; then
-  host=$(hostname -s)
-  if [ "$host" != "Martins-Mac-mini" ]; then
-    echo "Wrong machine: $host" >&2
-    exit 1
-  fi
+HOST_ENV="${HOME}/.gbrain/serve/host.env"
+if [ ! -f "$HOST_ENV" ]; then
+  echo "refusing: missing ${HOST_ENV}. Create it with one line: GBRAIN_EXPECTED_HOST=<MAC_HOSTNAME>" >&2
+  exit 1
+fi
+
+expected=""
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    ''|'#'*) continue ;;
+    GBRAIN_EXPECTED_HOST=*) expected=${line#GBRAIN_EXPECTED_HOST=} ;;
+  esac
+done < "$HOST_ENV"
+case "$expected" in
+  \"*\") expected=${expected#\"}; expected=${expected%\"} ;;
+  \'*\') expected=${expected#\'}; expected=${expected%\'} ;;
+esac
+if [ -z "$expected" ]; then
+  echo "refusing: GBRAIN_EXPECTED_HOST is missing from ${HOST_ENV}" >&2
+  exit 1
+fi
+
+host=$(hostname -s)
+if [ "$host" != "$expected" ]; then
+  echo "refusing: this machine does not match GBRAIN_EXPECTED_HOST in ${HOST_ENV}" >&2
+  exit 1
 fi
 
 echo "Funnel is OFF. This script does not publish Tailscale Funnel."

@@ -99,9 +99,11 @@ The email is the placeholder `gbrain@localhost`.
 
 ### L2 — stale SMB `index.lock`
 
-`cli-clear-index-lock.ts` deletes `.git/index.lock` only when all of these hold: the process list was readable, no process command is `git`, `git.exe`, or `git-*`, `.git` is a real directory, the lock is a regular file, and the lock is at least 10 minutes old and not dated in the future. The process list is checked again immediately before unlink. Anything else leaves the lock in place (exit 2). Step 4 calls this before `git add` when a lock is present.
+`cli-clear-index-lock.ts` refuses to delete `.git/index.lock` unless `--force` is passed (exit 2, lock left in place). A git on the Windows side of the share is not in this machine's process list, so the default is to leave the lock. With `--force`, deletion still requires every local check: the process list was readable, no process command is `git`, `git.exe`, or `git-*`, `.git` is a real directory, the lock is a regular file, and the lock is at least 10 minutes old and not dated in the future. The process list is checked again immediately before unlink. Step 4 calls the clearer without `--force`.
 
-This is broader than upstream `proveIndexLockAbandoned`, which refuses a network filesystem because a git on another machine is invisible. The operator asked for a stale lock on the share to be clearable. Residual risk: a git on the Windows side of the same share does not appear in the Mac process list. The 10-minute age check is what limits that window. A future-dated lock is not removed.
+### Hostname file
+
+`setup.sh` does not contain a hostname. It reads `GBRAIN_EXPECTED_HOST` from `~/.gbrain/serve/host.env` (mode of that directory stays outside the repo, so it is not a gitignore path). One line, placeholder `<MAC_HOSTNAME>`. A missing file or a missing variable refuses to run.
 
 ## Runtime the operator installs in person
 
