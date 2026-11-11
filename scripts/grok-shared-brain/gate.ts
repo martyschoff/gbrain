@@ -126,7 +126,14 @@ function upstreamAuthorization(record: ClientRecord): { header: string | null; s
   return { header: `Bearer ${parsed.access_token}`, secret: parsed.access_token };
 }
 
-function proxy(upstream: URL, req: IncomingMessage, body: Buffer, res: ServerResponse, authorization: string | null): void {
+function proxy(
+  upstream: URL,
+  req: IncomingMessage,
+  body: Buffer,
+  res: ServerResponse,
+  authorization: string | null,
+  onStatus: (status: number) => void,
+): void {
   const target = new URL(req.url ?? '/', upstream);
   const headers: Record<string, string | number> = {};
   for (const [key, value] of Object.entries(req.headers)) {
@@ -138,6 +145,19 @@ function proxy(upstream: URL, req: IncomingMessage, body: Buffer, res: ServerRes
   if (authorization) headers.authorization = authorization;
   headers.host = upstream.host;
   headers['content-length'] = body.length;
+  let reported = false;
+  const report = (status: number) => {
+    if (reported) return;
+    reported = true;
+    onStatus(status);
+  };
+  const fail = (status: number) => {
+    if (res.headersSent) return;
+    report(status);
+    sendJson(res, status, { error: 'bad_gateway' });
+  };
+  // One attempt per request. A down upstream is 502; the process keeps listening
+  // and the next request tries again. Nothing here is logged, including authorization.
   const upstreamReq = httpRequest({
     protocol: upstream.protocol,
     hostname: upstream.hostname,
@@ -146,6 +166,7 @@ function proxy(upstream: URL, req: IncomingMessage, body: Buffer, res: ServerRes
     path: `${target.pathname}${target.search}`,
     headers,
   }, upstreamRes => {
+    report(upstreamRes.statusCode ?? 502);
     const out: Record<string, string | number | string[]> = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (value === undefined) continue;
@@ -157,10 +178,10 @@ function proxy(upstream: URL, req: IncomingMessage, body: Buffer, res: ServerRes
   });
   upstreamReq.setTimeout(5_000, () => {
     upstreamReq.destroy();
-    if (!res.headersSent) sendJson(res, 502, { error: 'bad_gateway' });
+    fail(502);
   });
   upstreamReq.on('error', () => {
-    if (!res.headersSent) sendJson(res, 502, { error: 'bad_gateway' });
+    fail(502);
   });
   upstreamReq.end(body);
 }
@@ -206,7 +227,7 @@ export function createFunnelGate(options: GateOptions): Server {
     const auth = authenticate(presented, options.config);
     const secret = presented?.replace(/^Bearer\s+/i, '').trim();
     const finish = (status: number, client: string, upstreamSecret?: string | null) => {
-      const extras = [secret ?? '', upstreamSecret ?? ''].filter(item => item.length > 0);
+      const extras = [presented ?? '', secret ?? '', upstreamSecret ?? ''].filter(item => item.length > 0);
       log(redactSecrets(`${method} ${url.pathname} client=${client} status=${status}`, extras));
     };
     if (!auth.ok) {
@@ -258,8 +279,7 @@ export function createFunnelGate(options: GateOptions): Server {
       sendJson(res, 502, { error: 'bad_gateway' });
       return;
     }
-    finish(200, auth.client, upstreamSecret);
-    proxy(upstream, req, body, res, authorization);
+    proxy(upstream, req, body, res, authorization, status => finish(status, auth.client, upstreamSecret));
   }
 }
 

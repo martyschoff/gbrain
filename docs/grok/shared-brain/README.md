@@ -79,13 +79,233 @@ bun scripts/grok-shared-brain/cli-gate.ts \
   --port 8767
 ```
 
-Missing or unknown bearers are 401, including `/health`. A token for the wrong route or source is 403. `/admin` and a write to `shared` are 403 with a valid token. Over the per-token limit the response is 429.
+Missing or unknown bearers are 401, including `/health`. A token for the wrong route or source is 403. `/admin` and a write to `shared` are 403 with a valid token. Over the per-token limit the response is 429. The process listens even when nothing is on port 8766. A proxied call then returns 502, and the next request tries the upstream again.
 
 Expose gbrain without Funnel (design step 5). Do not add `--funnel`:
 
 ```bash
 gbrain mcp expose --port 8766 --no-install --yes
 ```
+
+## LaunchAgent
+
+`com.gbrain.funnel-gate` starts the gate at login and after a reboot, and launchd restarts it if it dies (`RunAtLoad`, `KeepAlive`, `ThrottleInterval` 15). The plist template is `scripts/grok-shared-brain/launchd/com.gbrain.funnel-gate.plist`. Placeholders are `__BUN__`, `__REPO__`, and `__HOME__`. The installed plist has absolute paths because launchd has no `PATH`.
+
+The gate checks `~/.gbrain/serve/host.env` itself, the same file `setup.sh` reads. On a mismatch it exits non-zero and prints `Wrong machine:` plus the short hostname. No hostname is written into the plist or this repo. The agent does not run `tailscale funnel` or `tailscale serve`. Leave Funnel off until the step in [Turn Funnel on](#turn-funnel-on-operator-only).
+
+Each block below is one paste. Every block starts by loading `host.env` and comparing `hostname -s` to `GBRAIN_EXPECTED_HOST`. Create that file first (see Layout). Do not `cat` a grant file. The `gbrain mcp grant` receipt on the terminal is redacted and has no `access_token`.
+
+The harness id is `grok-bot` for all three. That is the HTTP thin-cli id in `gbrain mcp` (`src/core/harness/registry.ts`). The client name and `--source` are `personal`, `business`, or `hermes`. `--profile memory-writer` is the default writer profile. Do not use `operator` or `full`. The grant URL is loopback serve, because the gate forwards that file's `access_token` to `127.0.0.1:8766`. The public bots keep using their Funnel bearers, not these files.
+
+`grok-bot` access tokens expire. The gate reads `access_token` from the grant file on every proxied request and does not refresh it. After you replace a grant file, the next request uses the new value.
+
+### 1. Grant personal
+
+```bash
+. ~/.gbrain/serve/host.env
+host=$(hostname -s)
+if [ "$host" != "$GBRAIN_EXPECTED_HOST" ]; then
+  echo "Wrong machine: $host" >&2
+  exit 1
+fi
+set -euo pipefail
+umask 077
+mkdir -p "$HOME/.gbrain/serve/grants"
+chmod 700 "$HOME/.gbrain/serve/grants"
+gbrain mcp grant personal --harness grok-bot --profile memory-writer \
+  --source personal --federated-read personal,shared --skills memory-only \
+  --url "http://127.0.0.1:8766/mcp" \
+  --admin-token-file "$HOME/.gbrain/serve/admin-token" \
+  --credentials-out "$HOME/.gbrain/serve/grants/personal.json" \
+  --json
+chmod 600 "$HOME/.gbrain/serve/grants/personal.json"
+stat -f '%Lp' "$HOME/.gbrain/serve/grants"
+stat -f '%Lp' "$HOME/.gbrain/serve/grants/personal.json"
+```
+
+The directory mode is `700`. The file mode is `600`. Both paths are outside the repo.
+
+### 2. Grant business
+
+```bash
+. ~/.gbrain/serve/host.env
+host=$(hostname -s)
+if [ "$host" != "$GBRAIN_EXPECTED_HOST" ]; then
+  echo "Wrong machine: $host" >&2
+  exit 1
+fi
+set -euo pipefail
+umask 077
+mkdir -p "$HOME/.gbrain/serve/grants"
+chmod 700 "$HOME/.gbrain/serve/grants"
+gbrain mcp grant business --harness grok-bot --profile memory-writer \
+  --source business --federated-read business,shared --skills memory-only \
+  --url "http://127.0.0.1:8766/mcp" \
+  --admin-token-file "$HOME/.gbrain/serve/admin-token" \
+  --credentials-out "$HOME/.gbrain/serve/grants/business.json" \
+  --json
+chmod 600 "$HOME/.gbrain/serve/grants/business.json"
+stat -f '%Lp' "$HOME/.gbrain/serve/grants/business.json"
+```
+
+### 3. Grant hermes
+
+```bash
+. ~/.gbrain/serve/host.env
+host=$(hostname -s)
+if [ "$host" != "$GBRAIN_EXPECTED_HOST" ]; then
+  echo "Wrong machine: $host" >&2
+  exit 1
+fi
+set -euo pipefail
+umask 077
+mkdir -p "$HOME/.gbrain/serve/grants"
+chmod 700 "$HOME/.gbrain/serve/grants"
+gbrain mcp grant hermes --harness grok-bot --profile memory-writer \
+  --source hermes --federated-read hermes,shared --skills memory-only \
+  --url "http://127.0.0.1:8766/mcp" \
+  --admin-token-file "$HOME/.gbrain/serve/admin-token" \
+  --credentials-out "$HOME/.gbrain/serve/grants/hermes.json" \
+  --json
+chmod 600 "$HOME/.gbrain/serve/grants/hermes.json"
+stat -f '%Lp' "$HOME/.gbrain/serve/grants/hermes.json"
+```
+
+### 4. Point the token file at the grants
+
+This parses `funnel-tokens.json` as JSON, sets `upstream_token_file` for `personal`, `business`, and `hermes` to the absolute grant paths, and writes the file back mode `0600`. It does not read or print the grant files.
+
+```bash
+. ~/.gbrain/serve/host.env
+host=$(hostname -s)
+if [ "$host" != "$GBRAIN_EXPECTED_HOST" ]; then
+  echo "Wrong machine: $host" >&2
+  exit 1
+fi
+set -euo pipefail
+bun scripts/grok-shared-brain/cli-set-upstream-tokens.ts \
+  --tokens "$HOME/.gbrain/serve/funnel-tokens.json" \
+  --grants "$HOME/.gbrain/serve/grants"
+stat -f '%Lp' "$HOME/.gbrain/serve/funnel-tokens.json"
+```
+
+Run that from the checkout. Expected file mode is `600`.
+
+### 5. Install the plist
+
+`REPO` is this checkout. Change the assignment if it is not `$HOME/gbrain`. `sed -i ''` is the macOS form. The bun path, the repo path, and `$HOME` must not contain `#`, `&`, or `\`.
+
+```bash
+. ~/.gbrain/serve/host.env
+host=$(hostname -s)
+if [ "$host" != "$GBRAIN_EXPECTED_HOST" ]; then
+  echo "Wrong machine: $host" >&2
+  exit 1
+fi
+set -euo pipefail
+REPO="$HOME/gbrain"
+BUN="$(command -v bun || true)"
+if [ -z "$BUN" ] && [ -x "$HOME/.bun/bin/bun" ]; then
+  BUN="$HOME/.bun/bin/bun"
+fi
+case "$BUN" in
+  /*) ;;
+  *) echo "bun path must be absolute" >&2; exit 1 ;;
+esac
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+cp "$REPO/scripts/grok-shared-brain/launchd/com.gbrain.funnel-gate.plist" "$HOME/Library/LaunchAgents/com.gbrain.funnel-gate.plist"
+sed -i '' \
+  -e "s#__BUN__#${BUN}#g" \
+  -e "s#__REPO__#${REPO}#g" \
+  -e "s#__HOME__#${HOME}#g" \
+  "$HOME/Library/LaunchAgents/com.gbrain.funnel-gate.plist"
+if grep -n -E '__BUN__|__REPO__|__HOME__' "$HOME/Library/LaunchAgents/com.gbrain.funnel-gate.plist"; then
+  echo "FAIL: leftover placeholders" >&2
+  exit 1
+fi
+chmod 644 "$HOME/Library/LaunchAgents/com.gbrain.funnel-gate.plist"
+plutil -lint "$HOME/Library/LaunchAgents/com.gbrain.funnel-gate.plist"
+```
+
+`plutil` prints `OK`. Any leftover placeholder prints `FAIL: leftover placeholders`.
+
+### 6. Bootstrap
+
+```bash
+. ~/.gbrain/serve/host.env
+host=$(hostname -s)
+if [ "$host" != "$GBRAIN_EXPECTED_HOST" ]; then
+  echo "Wrong machine: $host" >&2
+  exit 1
+fi
+launchctl bootout gui/$(id -u)/com.gbrain.funnel-gate || true
+launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.gbrain.funnel-gate.plist"
+```
+
+### 7. Verify
+
+`401` means the gate is listening. Every route needs a bearer, including `/health`, so this curl does not send one and does not need serve to be up. `000` means nothing is listening on `8767`.
+
+```bash
+. ~/.gbrain/serve/host.env
+host=$(hostname -s)
+if [ "$host" != "$GBRAIN_EXPECTED_HOST" ]; then
+  echo "Wrong machine: $host" >&2
+  exit 1
+fi
+launchctl print gui/$(id -u)/com.gbrain.funnel-gate | grep -E 'state|pid'
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8767/health
+tail -n 40 "$HOME/Library/Logs/com.gbrain.funnel-gate.err"
+```
+
+Expect `401` from curl. The log lines are method, path, client id, and status. They do not contain bearer tokens, grant credentials, or the Authorization header.
+
+### 8. After a reboot
+
+Restart the Mac, log in, and paste this again. Expect the same `401` and a running pid.
+
+```bash
+. ~/.gbrain/serve/host.env
+host=$(hostname -s)
+if [ "$host" != "$GBRAIN_EXPECTED_HOST" ]; then
+  echo "Wrong machine: $host" >&2
+  exit 1
+fi
+launchctl print gui/$(id -u)/com.gbrain.funnel-gate | grep -E 'state|pid'
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8767/health
+tail -n 40 "$HOME/Library/Logs/com.gbrain.funnel-gate.err"
+```
+
+### 9. Uninstall
+
+This stops the agent and removes the plist. The grant files stay.
+
+```bash
+. ~/.gbrain/serve/host.env
+host=$(hostname -s)
+if [ "$host" != "$GBRAIN_EXPECTED_HOST" ]; then
+  echo "Wrong machine: $host" >&2
+  exit 1
+fi
+launchctl bootout gui/$(id -u)/com.gbrain.funnel-gate || true
+rm -f "$HOME/Library/LaunchAgents/com.gbrain.funnel-gate.plist"
+```
+
+To remove the grant files later, paste this. Deleting them does not revoke the clients. `gbrain mcp admin --help` lists `revoke`.
+
+```bash
+. ~/.gbrain/serve/host.env
+host=$(hostname -s)
+if [ "$host" != "$GBRAIN_EXPECTED_HOST" ]; then
+  echo "Wrong machine: $host" >&2
+  exit 1
+fi
+rm -f "$HOME/.gbrain/serve/grants/personal.json" \
+  "$HOME/.gbrain/serve/grants/business.json" \
+  "$HOME/.gbrain/serve/grants/hermes.json"
+```
+
+The gate reads `~/.gbrain` and the checkout. It does not read the SMB share, so it does not need Full Disk Access. If the checkout itself is on a network volume, grant Network Volumes access to the bun binary that the plist runs.
 
 ## Turn Funnel on (operator only)
 

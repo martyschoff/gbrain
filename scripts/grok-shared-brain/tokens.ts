@@ -155,6 +155,21 @@ export function parseFunnelConfig(raw: unknown): FunnelConfig {
   };
 }
 
+/** Point personal, business, and hermes at grant JSON files outside the repo. Does not read those files. */
+export function withUpstreamTokenFiles(config: FunnelConfig, grantsDir: string, repoRoot?: string): FunnelConfig {
+  if (!isAbsolute(grantsDir)) throw new Error('grants directory must be an absolute path');
+  if (repoRoot && pathInside(grantsDir, repoRoot)) throw new Error('upstream token file must stay outside the repo');
+  const clients: Record<string, ClientRecord> = { ...config.clients };
+  for (const id of FUNNEL_CLIENTS) {
+    const file = join(grantsDir, `${id}.json`);
+    if (repoRoot && pathInside(file, repoRoot)) throw new Error('upstream token file must stay outside the repo');
+    const record = clients[id];
+    if (!record) throw new Error(`missing client ${id}`);
+    clients[id] = { ...record, upstream_token_file: file };
+  }
+  return { ...config, clients };
+}
+
 export function configContainsPlaintext(serialized: string, plaintext: Record<string, string>): boolean {
   return Object.values(plaintext).some(token => token.length > 0 && serialized.includes(token));
 }
