@@ -49,7 +49,8 @@ export function evaluateHostGuard(text: string | null, shortName: string): HostG
   if (!expected) {
     return { ok: false, status: 1, message: 'refusing: GBRAIN_EXPECTED_HOST is missing from ~/.gbrain/serve/host.env' };
   }
-  if (shortName !== expected) return { ok: false, status: 1, message: `Wrong machine: ${shortName}` };
+  // Exit 0 so launchd KeepAlive SuccessfulExit=false does not restart a mismatch forever.
+  if (shortName !== expected) return { ok: false, status: 0, message: `Wrong machine: ${shortName}` };
   return { ok: true };
 }
 

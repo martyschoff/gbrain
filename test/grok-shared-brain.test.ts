@@ -716,7 +716,15 @@ describe('launchd plist', () => {
     const dict = plistDict(parseXml(template));
     expect(dict.get('Label')?.text).toBe('com.gbrain.funnel-gate');
     expect(dict.get('RunAtLoad')?.tag).toBe('true');
-    expect(dict.get('KeepAlive')?.tag).toBe('true');
+    const keepAlive = dict.get('KeepAlive');
+    expect(keepAlive?.tag).toBe('dict');
+    const keepAliveKeys = new Map<string, XmlNode>();
+    for (let cursor = 0; cursor < (keepAlive?.children.length ?? 0); cursor += 2) {
+      const key = keepAlive?.children[cursor];
+      const value = keepAlive?.children[cursor + 1];
+      if (key?.tag === 'key' && value) keepAliveKeys.set(key.text, value);
+    }
+    expect(keepAliveKeys.get('SuccessfulExit')?.tag).toBe('false');
     expect(Number(dict.get('ThrottleInterval')?.text)).toBeGreaterThanOrEqual(10);
     expect(Number(dict.get('ThrottleInterval')?.text)).toBeLessThanOrEqual(30);
     expect(dict.get('WorkingDirectory')?.text).toBe('__REPO__');
@@ -760,9 +768,11 @@ describe('host guard', () => {
     expect(parseExpectedHost('# comment\n\nGBRAIN_EXPECTED_HOST="quoted-host"\n')).toBe('quoted-host');
     expect(parseExpectedHost('# only a comment\n')).toBeNull();
     expect(evaluateHostGuard(null, short).ok).toBe(false);
-    expect(evaluateHostGuard('GBRAIN_EXPECTED_HOST=\n', short).message).toContain('GBRAIN_EXPECTED_HOST is missing');
+    const missingVar = evaluateHostGuard('GBRAIN_EXPECTED_HOST=\n', short);
+    expect(missingVar.ok).toBe(false);
+    if (!missingVar.ok) expect(missingVar.message).toContain('GBRAIN_EXPECTED_HOST is missing');
     const wrong = evaluateHostGuard('GBRAIN_EXPECTED_HOST=not-this-machine\n', short);
-    expect(wrong).toEqual({ ok: false, status: 1, message: `Wrong machine: ${short}` });
+    expect(wrong).toEqual({ ok: false, status: 0, message: `Wrong machine: ${short}` });
     expect(evaluateHostGuard(`GBRAIN_EXPECTED_HOST=${short}\n`, short)).toEqual({ ok: true });
     const home = mkdtempSync(join(tmpdir(), 'gbrain-host-env-'));
     mkdirSync(join(home, '.gbrain', 'serve'), { recursive: true });
@@ -770,7 +780,7 @@ describe('host guard', () => {
     writeFileSync(hostEnv, `GBRAIN_EXPECTED_HOST=${short}\n`);
     expect(guardThisHost(home, short)).toEqual({ ok: true });
     writeFileSync(hostEnv, 'GBRAIN_EXPECTED_HOST=not-this-machine\n');
-    expect(guardThisHost(home, short)).toEqual({ ok: false, status: 1, message: `Wrong machine: ${short}` });
+    expect(guardThisHost(home, short)).toEqual({ ok: false, status: 0, message: `Wrong machine: ${short}` });
   });
 
   test('cli-gate exits on the wrong machine before it listens', () => {
@@ -782,7 +792,7 @@ describe('host guard', () => {
       timeout: 8_000,
       env: { ...process.env, HOME: home },
     });
-    expect(ran.status).not.toBe(0);
+    expect(ran.status).toBe(0);
     expect(ran.stderr).toContain(`Wrong machine: ${short}`);
     expect(ran.stderr.includes('listening')).toBe(false);
   });
@@ -934,11 +944,20 @@ describe('launch agent docs', () => {
     const blocks = [...section.matchAll(/```bash\n([\s\S]*?)```/g)].map(match => match[1] ?? '');
     expect(blocks.length).toBeGreaterThanOrEqual(8);
     for (const block of blocks) {
-      expect(block.startsWith('. ~/.gbrain/serve/host.env\n')).toBe(true);
+      expect(block.startsWith('(\n. ~/.gbrain/serve/host.env || exit 1\n')).toBe(true);
+      expect(block.trimEnd().endsWith(')')).toBe(true);
       expect(block).toContain('hostname -s');
       expect(block).toContain('"$host" != "$GBRAIN_EXPECTED_HOST"');
       expect(block).toContain('Wrong machine: $host');
+      expect(block.indexOf('. ~/.gbrain/serve/host.env')).toBeLessThan(block.indexOf('set -euo pipefail') === -1 ? block.length : block.indexOf('set -euo pipefail'));
     }
+    expect(section).toContain('REPO="$HOME/personalgrok/gbrain"');
+    expect(section).toContain('checkout not found: $REPO/scripts/grok-shared-brain/cli-gate.ts');
+    expect(section).toContain('cd "$REPO"');
+    expect(section).toContain('--json >/dev/null');
+    expect(section).toContain('echo "granted personal; private handoff is $HOME/.gbrain/serve/grants/personal.json"');
+    expect(section.includes('Create that file first')).toBe(false);
+    expect(section.includes('REPO="$HOME/gbrain"')).toBe(false);
     expect(section).toContain('gbrain mcp grant personal --harness grok-bot --profile memory-writer');
     expect(section).toContain('gbrain mcp grant business --harness grok-bot --profile memory-writer');
     expect(section).toContain('gbrain mcp grant hermes --harness grok-bot --profile memory-writer');

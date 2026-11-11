@@ -85,7 +85,7 @@ Start the gate (still does not run Tailscale). The process listens even when por
 bun scripts/grok-shared-brain/cli-gate.ts --tokens "$HOME/.gbrain/serve/funnel-tokens.json" --upstream http://127.0.0.1:8766 --port 8767
 ```
 
-Login and reboot use the LaunchAgent `com.gbrain.funnel-gate` (`scripts/grok-shared-brain/launchd/com.gbrain.funnel-gate.plist`, `RunAtLoad`, `KeepAlive`, `ThrottleInterval` 15). Copyable install and uninstall steps are in `docs/grok/shared-brain/README.md`. The gate reads `GBRAIN_EXPECTED_HOST` from `~/.gbrain/serve/host.env` and exits with `Wrong machine:` plus the short hostname on a mismatch. The plist stores no token and no hostname. Nothing in the kit runs `tailscale funnel` or `tailscale serve`.
+Login and reboot use the LaunchAgent `com.gbrain.funnel-gate` (`scripts/grok-shared-brain/launchd/com.gbrain.funnel-gate.plist`, `RunAtLoad`, `KeepAlive` with `SuccessfulExit` false, `ThrottleInterval` 15). Copyable install and uninstall steps are in `docs/grok/shared-brain/README.md`. The gate reads `GBRAIN_EXPECTED_HOST` from `~/.gbrain/serve/host.env` and, on a mismatch, logs `Wrong machine:` plus the short hostname and exits 0 so launchd does not restart it. A non-zero exit still restarts. The plist stores no token and no hostname. Nothing in the kit runs `tailscale funnel` or `tailscale serve`.
 
 ## QA lows
 
