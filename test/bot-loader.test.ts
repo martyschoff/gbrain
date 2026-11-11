@@ -380,6 +380,46 @@ describe('loader run', () => {
     expect(blocked.puts.every((put) => put.source === 'personal')).toBe(true);
     expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
   });
+
+  test('a clean file containing an xoxb token is not written or queued', async () => {
+    const home = temp('gbrain-loader-xoxb-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    write(join(share, 'personalgrok/alpha/meeting.md'), 'prefix xoxb-FAKEFAKEFAKE\n');
+    const config = baseConfig(home, share);
+    const { brain, puts } = fakeBrain();
+    const result = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain });
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).toContain('bot alpha source=personal scanned=1 written=0 unchanged=0 skipped=0 secrets_skipped=1');
+    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/meeting.md'))).toBe(false);
+    expect(puts).toHaveLength(0);
+  });
+
+  test('forbidGit true checks remotes and forbidGit false does not', async () => {
+    const home = temp('gbrain-loader-forbid-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    write(join(share, 'personalgrok/alpha/local.md'), 'keep\n');
+    write(join(share, 'personalgrok/ledger/feed.md'), 'numbers\n');
+    const personal = join(share, 'personalgrok/gbrain/personal');
+    const finance = join(share, 'personalgrok/gbrain/finance');
+    mkdirSync(personal, { recursive: true });
+    mkdirSync(finance, { recursive: true });
+    expect(spawnSync('git', ['init'], { cwd: personal }).status).toBe(0);
+    expect(spawnSync('git', ['init'], { cwd: finance }).status).toBe(0);
+    expect(spawnSync('git', ['remote', 'add', 'origin', 'https://example.invalid/personal.git'], { cwd: personal }).status).toBe(0);
+    expect(spawnSync('git', ['remote', 'add', 'origin', 'https://example.invalid/finance.git'], { cwd: finance }).status).toBe(0);
+    const config = baseConfig(home, share);
+    expect(config.groups.find((group) => group.source === 'personal')?.forbidGit).toBe(false);
+    expect(config.groups.find((group) => group.source === 'finance')?.forbidGit).toBe(true);
+    const { brain, puts } = fakeBrain();
+    const result = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain });
+    expect(result.exitCode).toBe(1);
+    expect(result.summaryText).toContain('source finance has a git remote; refusing to write');
+    expect(puts.map((put) => put.source)).toEqual(['personal']);
+    expect(existsSync(join(personal, 'alpha/local.md'))).toBe(true);
+    expect(existsSync(join(finance, 'ledger/feed.md'))).toBe(false);
+  });
 });
 
 describe('counts, placeholders, and the lock', () => {
@@ -461,6 +501,94 @@ describe('counts, placeholders, and the lock', () => {
     expect(relative.exitCode).toBe(1);
     expect(lines.join('\n')).toContain('gbrain_bin must be an absolute path');
     expect(existsSync(config.statePath)).toBe(false);
+  });
+
+  test('the example share root is refused unless share_root_confirmed is true', async () => {
+    const home = temp('gbrain-share-');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const writeCfg = (share: string, confirmed: boolean) => {
+      const path = join(home, `${confirmed ? 'yes' : 'no'}-${share.replace(/[/~]/g, '_')}.json`);
+      writeFileSync(path, JSON.stringify({
+        share_root: share,
+        ...(confirmed ? { share_root_confirmed: true } : {}),
+        state_path: join(home, 'state.json'),
+        summary_path: join(home, 'summary.txt'),
+        lock_path: join(home, 'run.lock'),
+        host_env: join(home, 'host.env'),
+        gbrain_bin: '/usr/bin/gbrain',
+        groups: [{
+          id: 'personal',
+          source: 'personal',
+          target_root: join(home, 'personal'),
+          ensure_source: false,
+          forbid_git: false,
+          extensions: ['.md'],
+          bots: [{ id: 'alpha', inputs: [{ path: join(home, 'in'), required: false }] }],
+        }],
+      }));
+      return loadConfig(path, home);
+    };
+    for (const share of ['~/mnt/netfs', join(home, 'mnt/netfs')]) {
+      const config = writeCfg(share, false);
+      expect(config.placeholder).toContain('share_root is the example');
+      const refused = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain: fakeBrain().brain });
+      expect(refused.exitCode).toBe(1);
+      expect(refused.summaryText).toBe('');
+    }
+    expect(existsSync(join(home, 'state.json'))).toBe(false);
+    write(join(home, 'in/note.md'), 'hello\n');
+    const confirmed = writeCfg('~/mnt/netfs', true);
+    expect(confirmed.placeholder).toBeNull();
+    const allowed = await runLoader({ config: confirmed, hostname: 'test-host', isMounted: () => true, brain: fakeBrain().brain });
+    expect(allowed.exitCode).toBe(0);
+    expect(existsSync(join(home, 'personal/alpha/note.md'))).toBe(true);
+  });
+
+  test('sources add is recorded and not spawned again', async () => {
+    const home = temp('gbrain-loader-add-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    write(join(share, 'personalgrok/ledger/feed.md'), 'numbers\n');
+    const config = baseConfig(home, share);
+    let adds = 0;
+    const brain: BrainClient = {
+      async ensureSource() { adds += 1; return { ok: true }; },
+      async putPage() { return { ok: true, pending: false }; },
+      async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+    };
+    const first = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain });
+    expect(first.exitCode).toBe(0);
+    expect(adds).toBe(1);
+    expect(readManifest(config.statePath).sources?.finance?.added).toBe(true);
+    const second = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain });
+    expect(second.exitCode).toBe(0);
+    expect(adds).toBe(1);
+  });
+
+  test('a pending put warns after three attempts and still retries', async () => {
+    const home = temp('gbrain-loader-stuck-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const note = join(share, 'personalgrok/alpha/local.md');
+    write(note, 'keep\n');
+    const config = baseConfig(home, share);
+    let puts = 0;
+    const brain: BrainClient = {
+      async ensureSource() { return { ok: true }; },
+      async putPage() { puts += 1; return { ok: false, pending: true }; },
+      async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+    };
+    let last = '';
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const result = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain });
+      expect(result.exitCode).toBe(0);
+      expect(result.summaryText).toContain('bot-loader: ok');
+      last = result.summaryText;
+      if (attempt < 3) expect(result.summaryText).not.toContain('WARN stuck pending');
+    }
+    expect(puts).toBe(4);
+    expect(last).toContain('WARN stuck pending 1');
+    expect(readManifest(config.statePath).files[note]?.pendingAttempts).toBe(4);
   });
 
   test('a second loader refuses the lock and a dead pid is taken over', async () => {
@@ -611,11 +739,16 @@ describe('install and verify scripts', () => {
     expect(result.stdout).toContain('PASS launchd');
     expect(result.stdout).toContain('PASS status fresh');
     expect(result.stdout).toContain('PASS finance remotes');
+    expect(result.stdout).toContain('PASS stuck pending');
     expect(result.stdout).toContain('source personal pages=2 via=pages written by the loader (manifest)');
     writeFileSync(join(home, '.gbrain/bot-loader/last-summary.txt'), 'bot-loader: skipped: wrong host\nWARN hostname does not match GBRAIN_EXPECTED_HOST\n');
     const stale = spawnSync('bash', [VERIFY], { encoding: 'utf8', env });
     expect(stale.status).not.toBe(0);
     expect(stale.stdout).toContain('FAIL status fresh');
+    writeFileSync(join(home, '.gbrain/bot-loader/last-summary.txt'), 'bot-loader: ok\nWARN stuck pending 1\n');
+    const stuck = spawnSync('bash', [VERIFY], { encoding: 'utf8', env });
+    expect(stuck.status).not.toBe(0);
+    expect(stuck.stdout).toContain('FAIL stuck pending');
     mkdirSync(join(home, 'Library/LaunchAgents'), { recursive: true });
     writeFileSync(join(home, 'Library/LaunchAgents/com.gbrain.bot-loader.plist'), '<plist></plist>\n');
     const removed = spawnSync('bash', [UNINSTALL], { encoding: 'utf8', env });

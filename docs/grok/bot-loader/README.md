@@ -153,7 +153,25 @@ plutil -lint "$RENDERED"
 uid=$(id -u)
 launchctl bootout "gui/${uid}/com.gbrain.bot-loader" || true
 launchctl bootstrap "gui/${uid}" "$RENDERED"
-if grep -q '__SET_ME__' "$CFG" || grep -Eq '"bot-a"|"bot-b"|"fin-bot"' "$CFG"; then
+example_share=0
+if python3 - "$CFG" "$HOME" <<'PY'
+import json, os, sys
+path, home = sys.argv[1], sys.argv[2]
+cfg = json.load(open(path, encoding="utf-8"))
+if cfg.get("share_root_confirmed") is True:
+    sys.exit(1)
+share = cfg.get("share_root")
+if not isinstance(share, str):
+    sys.exit(1)
+expanded = os.path.abspath(os.path.expanduser(share))
+if share == "~/mnt/netfs" or expanded == os.path.abspath(os.path.join(home, "mnt/netfs")):
+    sys.exit(0)
+sys.exit(1)
+PY
+then
+  example_share=1
+fi
+if grep -q '__SET_ME__' "$CFG" || grep -Eq '"bot-a"|"bot-b"|"fin-bot"' "$CFG" || [ "$example_share" -eq 1 ]; then
   echo "edit ${CFG}, then rerun this block"
   exit 0
 fi
@@ -191,9 +209,9 @@ For each bot in the local config, in each group:
 
 1. Read the bot's input folders. Missing optional folders, a missing `_box-export` directory, and a stale or missing `EXPORTED_AT` stamp (older than `box_export_max_age_hours`, default 36) are warnings. The run still reads the other folders and exits 0. The only hard stop before any write is a share root that is missing or not a real mount (its device id matches its parent). A hostname mismatch logs, writes `bot-loader: skipped: wrong host` plus a `WARN` line into the status file (`summary_path`), and exits 0. Example placeholders (`bot-a`, `bot-b`, `fin-bot`, `__SET_ME__`) and a non-absolute `gbrain_bin` refuse the run with a non-zero exit. A second overlapping run exits non-zero on the lock file. A lock whose pid is dead is taken over.
 2. Keep `.md`, `.txt`, `.json`, and the group's extension list, under `max_bytes` (default 1 MiB). `.csv` is on the finance group's default list and becomes a markdown table. Data rows stop at `csv_max_rows` (default 500) with a truncation note. Images, audio, video, archives, and database files (`.db`, `.sqlite`, `-wal`, `-shm`) are skipped even if a group lists them. Directories named `audit`, `audits`, `audit-logs`, or `automations` are not entered. Sources are not modified, moved, or deleted.
-3. Skip a whole file when its name or its contents match `scripts/bot-loader/secret-patterns.json` (the same list the box-export helper loads). Names include `config.env`, `*.env`, `.envrc`, `id_ed25519*`, `id_ecdsa*`, `id_dsa*`, `*.p12`, `*.pfx`, `*-key.json`, `service-account*.json`, `credentials*.json`, `.netrc`, `.npmrc`, and `.pypirc`, plus the older `.env*`, `*token*`, `*secret*`, `*credential*`, `*.pem`, `*.key`, `auth.json`, and `id_rsa*` names. Contents include `sk-ant-`, `sk-proj-`, `github_pat_`, `gh[opsu]_`, `glpat-`, `xoxa`/`xoxe`, AWS secret keys, JWTs, every PEM private key, Slack and Discord webhook URLs, and `aws_secret_access_key` or `password=` lines. A match is omitted. It is not redacted into a page. The summary counts those skips and does not print the contents.
+3. Skip a whole file when its name or its contents match `scripts/bot-loader/secret-patterns.json` (the same list the box-export helper loads). Names include `config.env`, `*.env`, `.envrc`, `id_ed25519*`, `id_ecdsa*`, `id_dsa*`, `*.p12`, `*.pfx`, `*-key.json`, `service-account*.json`, `credentials*.json`, `.netrc`, `.npmrc`, and `.pypirc`, plus the older `.env*`, `*token*`, `*secret*`, `*credential*`, `*.pem`, `*.key`, `auth.json`, and `id_rsa*` names. Contents include `sk-ant-`, `sk-proj-`, `github_pat_`, `gh[opsu]_`, `glpat-`, `xox[a-z]-` (including `xoxb`, `xoxp`, `xoxs`, `xoxa`, `xoxe`, and `xoxr`), AWS secret keys, JWTs, every PEM private key, Slack and Discord webhook URLs, and `aws_secret_access_key` or `password=` lines. A match is omitted. It is not redacted into a page. The summary counts those skips and does not print the contents.
 4. Write `target_root/<bot>/<relative-path>.md` with gbrain frontmatter. The slug is the path under the source. `origin_relpath` is the path relative to the share (or `external/...` when an input is outside it) and `origin_sha256` is the sha256 of the source bytes.
-5. Update `~/.gbrain/bot-loader/state.json` (atomic replace, mode 0600). A matching sha256 that is already in the brain is not rewritten and not imported. A put that exits 10 is pending: the run stays successful, the page is not counted, and the next run retries it. Any other non-zero put is a failure and is not counted. A manifest entry whose source file is gone, or whose bot is no longer in the config, is reported as `orphaned <bot> <count>`, left on disk, and excluded from the counts.
+5. Update `~/.gbrain/bot-loader/state.json` (atomic replace, mode 0600). A matching sha256 that is already in the brain is not rewritten and not imported. A put that exits 10 is pending: the run stays successful, the page is not counted, and the next run retries it. The manifest counts those attempts. After 3 attempts the summary warns `WARN stuck pending <count>`, and verify fails that check. Retries continue. Any other non-zero put is a failure and is not counted. A manifest entry whose source file is gone, or whose bot is no longer in the config, is reported as `orphaned <bot> <count>`, left on disk, and excluded from the counts.
 
 A group whose `source` is `finance` can only use a target directory named `finance`. Targets of different sources cannot contain each other. Bots have no source field of their own, so a finance input cannot be written into `personal`.
 
@@ -207,7 +225,7 @@ Changed pages are imported with:
 gbrain --source <source> put <slug> --file <page> --json
 ```
 
-`gbrain put` with `--file` returns from `runSharedOperation` in `src/cli/main.ts` at the `put_page` branch (line 560) into `runPutFile` in `src/cli/commands/append.ts`. `pageWriteCaller` there (lines 85-93) calls `maybeDelegateLocalOperation` for `put_page` before `connect()`. The resident serve performs the write. A new source is registered the same way, with `gbrain sources add <id> --path <dir> --no-federated --force --json` and no `--url`. `--force` is what registers a plain directory. The loader never invokes git and never publishes the checkout.
+`gbrain put` with `--file` returns from `runSharedOperation` in `src/cli/main.ts` at the `put_page` branch (line 560) into `runPutFile` in `src/cli/commands/append.ts`. `pageWriteCaller` there (lines 85-93) calls `maybeDelegateLocalOperation` for `put_page` before `connect()`. The resident serve performs the write. A new source is registered with `gbrain sources add <id> --path <dir> --no-federated --force --json` and no `--url`. That command is `source_add` through `maybeDelegateLocalAdministration` in `src/commands/sources-lifecycle.ts` (admin IPC) before `getEngine()`, so it does not call `connectEngine` while serve holds the lock. `--force` is what registers a plain directory. The loader calls it only when the manifest has not yet recorded that source. The loader never publishes the checkout.
 
 `gbrain sync` is not used. On a git checkout, sync imports commits unless `--working-tree` is set, and the older serve-delegation ladder refuses `--working-tree`. Sync can also pull when an origin exists. `put` does neither.
 
@@ -219,7 +237,7 @@ The admin token at `~/.gbrain/serve/admin-token` is the owner bootstrap credenti
 
 `scripts/grok-shared-brain/step4-sources.sh` runs `git init` in the personal source directory and commits a README with a repo-local identity. It does not add a remote and it does not publish the checkout. Whether an origin was added later is local state and is not in this repo. The loader never commits and never pushes, so bot pages it writes stay uncommitted working-tree files. A later `gbrain sync` without `--working-tree` will not import those uncommitted files; the loader's own `gbrain put` is what indexes them. Do not point a checkout publisher at the bot folders.
 
-The finance source is a plain directory (`sources add --force`, no remote). Before writing into that target, if `.git` exists the loader runs `git -C <target> remote`. Empty output means the directory has no remotes and the group is written. Any remote, or a check that cannot be run, refuses that group with a clear error and does not write its pages into `personal` or into `finance`. The run then exits non-zero.
+The finance source is a plain directory (`sources add --force`, no remote). A group with `forbid_git` true is checked, when `.git` exists, with `git -C <target> remote`. Empty output means the directory has no remotes and the group is written. Any remote, or a check that cannot be run, refuses that group with a clear error. A group with `forbid_git` false is not checked. The finance example sets `forbid_git` true, so a remote there does not write its pages into `personal` or into `finance`, and the run exits non-zero.
 
 ## Config schema
 
@@ -227,11 +245,12 @@ The finance source is a plain directory (`sources add --force`, no remote). Befo
 
 | Field | Meaning |
 | --- | --- |
-| `share_root` | Mount that must be a real filesystem mount. The example is `~/mnt/netfs`. |
+| `share_root` | Mount that must be a real filesystem mount. The example value `~/mnt/netfs`, and the same path expanded under the home directory, refuses the run unless `share_root_confirmed` is true. |
 | `state_path` | Manifest. Default `~/.gbrain/bot-loader/state.json`. |
 | `summary_path` | Last summary. Default `~/.gbrain/bot-loader/last-summary.txt`. |
 | `lock_path` | Overlap lock. Default `~/.gbrain/bot-loader/run.lock`. |
 | `host_env` | File with `GBRAIN_EXPECTED_HOST=<MAC_HOSTNAME>`. Default `~/.gbrain/serve/host.env`. |
+| `share_root_confirmed` | Set true only after the share root is the real mount. Without it, the example share root is a placeholder. |
 | `gbrain_bin` | Absolute path used for `put` and `sources add`. The loader refuses a relative value. Install writes the resolved path. The example value `gbrain` is not absolute. |
 | `max_bytes` | Per-file cap. Default 1048576. |
 | `csv_max_rows` | Data rows kept from a CSV. Default 500. |
@@ -241,7 +260,7 @@ The finance source is a plain directory (`sources add --force`, no remote). Befo
 | `groups[].target_root` | Directory registered as that source. Finance must be named `finance`. |
 | `groups[].extensions` | Allowlist. Omitted personal groups use `.md .txt .json .yaml .yml`. Omitted finance groups also use `.csv`. |
 | `groups[].ensure_source` | Create the source when it is missing. Default true for `finance`. |
-| `groups[].forbid_git` | Recorded for finance. The write guard is the remote check above, not this flag by itself. |
+| `groups[].forbid_git` | When true, run the remote check above. Default true for `finance`. When false, git metadata is not a reason to skip the group. |
 | `groups[].bots[].id` | Placeholder or real id. Lowercase slug. One subfolder under the target. |
 | `groups[].bots[].inputs[]` | `{ "path", "required", "role"? }`. `required` false warns and continues when the folder is missing. `required` true also warns and continues: an unmounted share root is the hard failure. `role` `box-export` marks a box-export folder. Omitted `inputs` means `<share>/personalgrok/<bot>` and `<share>/personalgrok/gbrain/_box-export/<bot>`. An input inside another input of the same bot is covered by the parent walk. |
 

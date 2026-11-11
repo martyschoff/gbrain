@@ -63,8 +63,8 @@ function assertDestination(groups: GroupConfig[], group: GroupConfig, output: st
 
 const WRONG_HOST_STATUS = 'bot-loader: skipped: wrong host\nWARN hostname does not match GBRAIN_EXPECTED_HOST\n';
 
-function financeRemoteRefusal(group: GroupConfig): string | null {
-  if (group.source !== 'finance') return null;
+function gitRemoteRefusal(group: GroupConfig): string | null {
+  if (!group.forbidGit) return null;
   if (!existsSync(join(group.targetRoot, '.git'))) return null;
   let output = '';
   try {
@@ -137,14 +137,14 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
   const allowCache = new Map<string, Set<string>>();
 
   for (const group of config.groups) {
-    const remoteRefusal = financeRemoteRefusal(group);
+    const remoteRefusal = gitRemoteRefusal(group);
     if (remoteRefusal) {
       warnings.push(remoteRefusal);
       ok = false;
       for (const bot of group.bots) bots.push(emptyBot(bot.id, group.source));
       continue;
     }
-    if (group.ensureSource) {
+    if (group.ensureSource && !manifest.sources?.[group.source]?.added) {
       mkdirSync(group.targetRoot, { recursive: true });
       const ensured = await brain.ensureSource(group.source, group.targetRoot);
       if (!ensured.ok) {
@@ -153,6 +153,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
         for (const bot of group.bots) bots.push(emptyBot(bot.id, group.source));
         continue;
       }
+      manifest.sources = { ...manifest.sources, [group.source]: { added: true } };
     }
     for (const bot of group.bots) {
       const summary = emptyBot(bot.id, group.source);
@@ -210,6 +211,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
           if (!slug.startsWith(`${bot.id}/`) || !isInside(group.targetRoot, output)) throw new Error('route check failed');
           writeAtomic(output, page, 0o644);
           const put = await brain.putPage(group.source, slug, output);
+          const attempts = put.pending ? (prior && prior.sha256 === digest ? (prior.pendingAttempts ?? 0) : 0) + 1 : 0;
           const entry: ManifestEntry = {
             sha256: digest,
             bot: bot.id,
@@ -219,6 +221,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
             originRelpath: originOf(config.shareRoot, file.absolute, bot.id, index, file.relativePosix),
             inBrain: put.ok,
             pending: put.pending,
+            ...(put.pending ? { pendingAttempts: attempts } : {}),
           };
           manifest.files[file.absolute] = entry;
           if (put.pending) continue;
@@ -241,6 +244,8 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
   for (const bot of bots) bot.pages = counts.bots[`${bot.source}/${bot.id}`] ?? 0;
   const configured = new Set(activeBots.map((bot) => `${bot.source}/${bot.bot}`));
   const orphanLines = orphanLinesFor(manifest, configured, seen);
+  const stuck = Object.values(manifest.files).filter((entry) => entry.pending && (entry.pendingAttempts ?? 0) >= 3).length;
+  if (stuck > 0) warnings.push(`stuck pending ${stuck}`);
   const summary: RunSummary = {
     ok,
     bots,

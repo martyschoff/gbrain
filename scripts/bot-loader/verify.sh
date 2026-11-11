@@ -103,6 +103,15 @@ finance_clean() {
 }
 check "finance remotes" finance_clean
 
+stuck_clear() {
+  [ -f "$summary" ] || return 0
+  if grep -q '^WARN stuck pending ' "$summary"; then
+    return 1
+  fi
+  return 0
+}
+check "stuck pending" stuck_clear
+
 echo "---- counts ----"
 if [ -f "$summary" ]; then
   grep -E '^(bot |source )' "$summary" || true

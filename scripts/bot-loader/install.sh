@@ -139,7 +139,25 @@ plutil -lint "$RENDERED"
 uid=$(id -u)
 launchctl bootout "gui/${uid}/com.gbrain.bot-loader" || true
 launchctl bootstrap "gui/${uid}" "$RENDERED"
-if grep -q '__SET_ME__' "$CFG" || grep -Eq '"bot-a"|"bot-b"|"fin-bot"' "$CFG"; then
+example_share=0
+if python3 - "$CFG" "$HOME" <<'PY'
+import json, os, sys
+path, home = sys.argv[1], sys.argv[2]
+cfg = json.load(open(path, encoding="utf-8"))
+if cfg.get("share_root_confirmed") is True:
+    sys.exit(1)
+share = cfg.get("share_root")
+if not isinstance(share, str):
+    sys.exit(1)
+expanded = os.path.abspath(os.path.expanduser(share))
+if share == "~/mnt/netfs" or expanded == os.path.abspath(os.path.join(home, "mnt/netfs")):
+    sys.exit(0)
+sys.exit(1)
+PY
+then
+  example_share=1
+fi
+if grep -q '__SET_ME__' "$CFG" || grep -Eq '"bot-a"|"bot-b"|"fin-bot"' "$CFG" || [ "$example_share" -eq 1 ]; then
   echo "edit ${CFG}, then rerun this block"
   exit 0
 fi

@@ -36,7 +36,7 @@ export interface LoaderConfig {
   csvMaxRows: number;
   boxExportMaxAgeHours: number;
   boxExportDir: string;
-  /** Set when the file still contains example bot ids or __SET_ME__. */
+  /** Set when the file still contains example bot ids, the example share root, or __SET_ME__. */
   placeholder: string | null;
   groups: GroupConfig[];
 }
@@ -44,6 +44,7 @@ export interface LoaderConfig {
 const PERSONAL_EXTENSIONS = ['.md', '.txt', '.json', '.yaml', '.yml'];
 const FINANCE_EXTENSIONS = [...PERSONAL_EXTENSIONS, '.csv'];
 const PLACEHOLDER_BOTS = new Set(['bot-a', 'bot-b', 'fin-bot']);
+const EXAMPLE_SHARE = '~/mnt/netfs';
 
 interface RawInput {
   path?: unknown;
@@ -118,7 +119,9 @@ function parseExtensions(raw: unknown, source: string): string[] {
 export function loadConfig(path: string, home: string): LoaderConfig {
   const raw = readFileSync(path, 'utf8');
   const parsed = JSON.parse(raw) as Record<string, unknown>;
-  const shareRoot = resolve(expandHome(asString(parsed.share_root, 'share_root'), home));
+  const rawShare = asString(parsed.share_root, 'share_root');
+  const shareRoot = resolve(expandHome(rawShare, home));
+  const shareConfirmed = parsed.share_root_confirmed === true;
   const groupsRaw = parsed.groups;
   if (!Array.isArray(groupsRaw) || groupsRaw.length === 0) throw new Error('config: groups must be a non-empty list');
   const groups: GroupConfig[] = groupsRaw.map((item, index) => {
@@ -164,11 +167,14 @@ export function loadConfig(path: string, home: string): LoaderConfig {
   }
   assertRoutes(groups);
   const placeholderBot = groups.flatMap((group) => group.bots).find((bot) => PLACEHOLDER_BOTS.has(bot.id));
+  const exampleShare = !shareConfirmed && (rawShare === EXAMPLE_SHARE || shareRoot === resolve(join(home, 'mnt/netfs')));
   const placeholder = placeholderBot
     ? `bot id ${placeholderBot.id} is an example placeholder`
     : raw.includes('__SET_ME__')
       ? 'config contains __SET_ME__'
-      : null;
+      : exampleShare
+        ? 'share_root is the example ~/mnt/netfs'
+        : null;
   return {
     shareRoot,
     statePath: resolve(expandHome(typeof parsed.state_path === 'string' ? parsed.state_path : '~/.gbrain/bot-loader/state.json', home)),
