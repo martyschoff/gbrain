@@ -9,34 +9,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import sys
 import tempfile
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from secret_rules import secret_content, secret_name
+
 DEFAULT_OUT = os.path.expanduser("~/.gbrain/box-export")
-
-SECRET_NAME = re.compile(
-    r"(?:^|/)(?:\.env(?:\.|$)|auth\.json$|id_rsa|[^/]*token[^/]*|[^/]*secret[^/]*|[^/]*credential[^/]*|[^/]*\.pem$|[^/]*\.key$)",
-    re.IGNORECASE,
-)
-SECRET_CONTENT = [
-    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
-    re.compile(r"\bsk-[A-Za-z0-9]{16,}"),
-    re.compile(r"\bghp_[A-Za-z0-9]{16,}"),
-    re.compile(r"\bxox[a-z]-[A-Za-z0-9-]{10,}", re.IGNORECASE),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\b[Bb]earer\s+[A-Za-z0-9\-._~+/]{20,}={0,2}"),
-]
-
-
-def secret_name(rel):
-    return SECRET_NAME.search(rel.replace("\\", "/")) is not None
-
-
-def secret_content(text):
-    return any(pattern.search(text) for pattern in SECRET_CONTENT)
 
 
 def allowlisted(root):

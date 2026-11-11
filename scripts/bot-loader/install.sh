@@ -62,6 +62,41 @@ if [ "$dev" = "$parent" ]; then
   exit 1
 fi
 
+GBRAIN_BIN=""
+if command -v gbrain >/dev/null 2>&1; then
+  GBRAIN_BIN=$(command -v gbrain)
+elif [ -x "${HOME}/.bun/bin/gbrain" ]; then
+  GBRAIN_BIN="${HOME}/.bun/bin/gbrain"
+fi
+if [ -z "$GBRAIN_BIN" ]; then
+  echo "refusing: gbrain was not found with command -v or at ${HOME}/.bun/bin/gbrain" >&2
+  exit 1
+fi
+GBRAIN_BIN=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$GBRAIN_BIN")
+case "$GBRAIN_BIN" in
+  /*) ;;
+  *) echo "refusing: resolved gbrain path is not absolute (${GBRAIN_BIN})" >&2; exit 1 ;;
+esac
+if [ ! -x "$GBRAIN_BIN" ]; then
+  echo "refusing: gbrain is not executable at ${GBRAIN_BIN}" >&2
+  exit 1
+fi
+python3 - "$CFG" "$GBRAIN_BIN" <<'PY'
+import os, re, sys
+path, binary = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+if re.search(r'"gbrain_bin"\s*:', text):
+    text2, _ = re.subn(r'("gbrain_bin"\s*:\s*")[^"]*"', lambda m: m.group(1) + binary + '"', text, count=1)
+else:
+    text2 = text.replace("{", '{\n  "gbrain_bin": "%s",' % binary, 1)
+if text2 != text:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+PY
+
 BUN="${HOME}/.bun/bin/bun"
 if [ ! -x "$BUN" ]; then
   echo "refusing: bun is not executable at ${BUN}" >&2
@@ -76,7 +111,7 @@ if [ -e "${FIN}/.git" ]; then
 fi
 mkdir -p "$FIN"
 set +e
-add_out=$(gbrain sources add finance --path "$FIN" --name finance --no-federated --force --json 2>&1)
+add_out=$("$GBRAIN_BIN" sources add finance --path "$FIN" --name finance --no-federated --force --json 2>&1)
 add_status=$?
 set -e
 if [ "$add_status" -ne 0 ]; then
@@ -89,10 +124,12 @@ fi
 AGENT="${HOME}/Library/LaunchAgents"
 mkdir -p "$AGENT" "${HOME}/Library/Logs"
 RENDERED="${AGENT}/com.gbrain.bot-loader.plist"
+LOADER_PATH="${HOME}/.bun/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 sed \
   -e "s|__BUN__|${BUN}|g" \
   -e "s|__REPO__|${REPO}|g" \
   -e "s|__HOME__|${HOME}|g" \
+  -e "s|__PATH__|${LOADER_PATH}|g" \
   "$REPO/scripts/bot-loader/com.gbrain.bot-loader.plist" > "$RENDERED"
 if grep -q '__' "$RENDERED"; then
   echo "refusing: rendered plist still has placeholders" >&2
@@ -102,4 +139,8 @@ plutil -lint "$RENDERED"
 uid=$(id -u)
 launchctl bootout "gui/${uid}/com.gbrain.bot-loader" || true
 launchctl bootstrap "gui/${uid}" "$RENDERED"
+if grep -q '__SET_ME__' "$CFG" || grep -Eq '"bot-a"|"bot-b"|"fin-bot"' "$CFG"; then
+  echo "edit ${CFG}, then rerun this block"
+  exit 0
+fi
 "$BUN" "$REPO/scripts/bot-loader/cli.ts" --config "$CFG"

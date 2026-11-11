@@ -16,6 +16,13 @@
     <key>Minute</key>
     <integer>30</integer>
   </dict>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
   <key>StandardOutPath</key>
   <string>__HOME__/Library/Logs/com.gbrain.bot-loader.log</string>
   <key>StandardErrorPath</key>

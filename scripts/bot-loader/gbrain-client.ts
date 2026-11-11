@@ -7,12 +7,20 @@ export interface PageCounts {
   sources: Record<string, number>;
   /** Keyed by `source/bot`. */
   bots: Record<string, number>;
-  via: 'stats' | 'manifest';
+  /** Always the loader manifest. Live brain totals are not read. */
+  via: 'pages written by the loader (manifest)';
+}
+
+export interface PutOutcome {
+  /** Exit 0. A failed put and a pending put are both not ok. */
+  ok: boolean;
+  /** Exit 10: accepted, not committed. Retried next run. Not a failure and not counted. */
+  pending: boolean;
 }
 
 export interface BrainClient {
   ensureSource(source: string, directory: string): Promise<{ ok: boolean }>;
-  putPage(source: string, slug: string, file: string): Promise<{ ok: boolean }>;
+  putPage(source: string, slug: string, file: string): Promise<PutOutcome>;
   counts(sources: string[], bots: { source: string; bot: string }[], manifest: Manifest): Promise<PageCounts>;
 }
 
@@ -32,15 +40,8 @@ export function addSourceArgv(bin: string, source: string, directory: string): s
   return [bin, 'sources', 'add', source, '--path', directory, '--name', source, '--no-federated', '--force', '--json'];
 }
 
-export function statsArgv(bin: string): string[] {
-  return [bin, 'stats', '--by', 'source', '--json'];
-}
-
-export function listArgv(bin: string, source: string): string[] {
-  return [bin, '--source', source, 'list', '--json'];
-}
-
 const ALREADY = /already registered|already exists|duplicate key/i;
+const PENDING_EXIT = 10;
 
 export function spawnGbrain(argv: string[]): Promise<SpawnResult> {
   return new Promise((resolvePromise) => {
@@ -60,55 +61,21 @@ export function spawnGbrain(argv: string[]): Promise<SpawnResult> {
   });
 }
 
-export function parseSourceCounts(stdout: string): Record<string, number> | null {
-  const start = stdout.indexOf('{');
-  if (start < 0) return null;
-  try {
-    const data = JSON.parse(stdout.slice(start)) as { groups?: { source_id?: string; source?: string; pages?: number }[] };
-    if (!Array.isArray(data.groups)) return null;
-    const counts: Record<string, number> = {};
-    for (const group of data.groups) {
-      const id = group.source_id ?? group.source;
-      if (typeof id !== 'string' || typeof group.pages !== 'number') continue;
-      counts[id] = (counts[id] ?? 0) + group.pages;
-    }
-    return counts;
-  } catch {
-    return null;
-  }
-}
-
-export function parseSlugList(stdout: string): string[] | null {
-  const startObj = stdout.indexOf('{');
-  const startArr = stdout.indexOf('[');
-  const start = startObj < 0 ? startArr : startArr < 0 ? startObj : Math.min(startObj, startArr);
-  if (start < 0) return null;
-  try {
-    const data = JSON.parse(stdout.slice(start)) as { pages?: { slug?: string }[]; results?: { slug?: string }[] } | { slug?: string }[];
-    const rows = Array.isArray(data) ? data : data.pages ?? data.results;
-    if (!Array.isArray(rows)) return null;
-    return rows.map((row) => (typeof row.slug === 'string' ? row.slug : '')).filter(Boolean);
-  } catch {
-    return null;
-  }
-}
-
+/** Pages this loader has committed. Failed puts, pending puts, missing source files, and gone bots are excluded. */
 export function manifestCounts(sources: string[], bots: { source: string; bot: string }[], manifest: Manifest): PageCounts {
   const sourceCounts: Record<string, number> = {};
   const botCounts: Record<string, number> = {};
+  const active = new Set(bots.map((bot) => `${bot.source}/${bot.bot}`));
   for (const source of sources) sourceCounts[source] = 0;
   for (const bot of bots) botCounts[`${bot.source}/${bot.bot}`] = 0;
-  for (const entry of Object.values(manifest.files)) {
-    if (!entry.inBrain || !existsSync(entry.output)) continue;
-    if (sourceCounts[entry.source] !== undefined) sourceCounts[entry.source] = (sourceCounts[entry.source] ?? 0) + 1;
+  for (const [path, entry] of Object.entries(manifest.files)) {
+    if (!entry.inBrain || entry.pending) continue;
     const key = `${entry.source}/${entry.bot}`;
+    if (!active.has(key) || !existsSync(path)) continue;
+    if (sourceCounts[entry.source] !== undefined) sourceCounts[entry.source] = (sourceCounts[entry.source] ?? 0) + 1;
     if (botCounts[key] !== undefined) botCounts[key] = (botCounts[key] ?? 0) + 1;
   }
-  return { sources: sourceCounts, bots: botCounts, via: 'manifest' };
-}
-
-function belongsToBot(slug: string, bot: string): boolean {
-  return slug === bot || slug.startsWith(`${bot}/`);
+  return { sources: sourceCounts, bots: botCounts, via: 'pages written by the loader (manifest)' };
 }
 
 export function createGbrainClient(bin: string, spawnFn: SpawnFn = spawnGbrain): BrainClient {
@@ -121,29 +88,13 @@ export function createGbrainClient(bin: string, spawnFn: SpawnFn = spawnGbrain):
     },
     async putPage(source, slug, file) {
       const result = await spawnFn(putArgv(bin, source, slug, file));
-      return { ok: result.code === 0 };
+      if (result.code === 0) return { ok: true, pending: false };
+      if (result.code === PENDING_EXIT) return { ok: false, pending: true };
+      return { ok: false, pending: false };
     },
     async counts(sources, bots, manifest) {
-      const stats = await spawnFn(statsArgv(bin));
-      const parsed = stats.code === 0 ? parseSourceCounts(stats.stdout) : null;
-      if (!parsed) return manifestCounts(sources, bots, manifest);
-      const sourceCounts: Record<string, number> = {};
-      for (const source of sources) sourceCounts[source] = parsed[source] ?? 0;
-      const botCounts: Record<string, number> = {};
-      let listOk = true;
-      for (const source of sources) {
-        const listed = await spawnFn(listArgv(bin, source));
-        const slugs = listed.code === 0 ? parseSlugList(listed.stdout) : null;
-        if (!slugs) { listOk = false; break; }
-        for (const bot of bots.filter((item) => item.source === source)) {
-          botCounts[`${source}/${bot.bot}`] = slugs.filter((slug) => belongsToBot(slug, bot.bot)).length;
-        }
-      }
-      if (!listOk) {
-        const fallback = manifestCounts(sources, bots, manifest);
-        return { sources: sourceCounts, bots: fallback.bots, via: 'stats' };
-      }
-      return { sources: sourceCounts, bots: botCounts, via: 'stats' };
+      // stats and list call connectEngine. Never spawn them; the manifest is the count.
+      return manifestCounts(sources, bots, manifest);
     },
   };
 }

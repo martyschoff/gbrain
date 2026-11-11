@@ -1,6 +1,6 @@
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 
 export function readExpectedHost(hostEnvPath: string): { ok: true; expected: string } | { ok: false; reason: 'missing_file' | 'missing_value' } {
   if (!existsSync(hostEnvPath)) return { ok: false, reason: 'missing_file' };
@@ -33,6 +33,30 @@ export function shareIsMounted(shareRoot: string): boolean {
     return here.dev !== parent.dev;
   } catch {
     return false;
+  }
+}
+
+/**
+ * True when a live process holds this PGLite directory.
+ * Reads the legacy lock metadata and, if present, tries a non-blocking flock
+ * on the kernel lock file. It does not open the database.
+ */
+export function serveLockHeld(dataDir: string): boolean {
+  const legacy = join(dataDir, '.gbrain-lock');
+  if (existsSync(legacy)) {
+    let meta: { pid?: unknown } | null = null;
+    try { meta = JSON.parse(readFileSync(join(legacy, 'lock'), 'utf8')) as { pid?: unknown }; } catch { meta = null; }
+    if (!meta) return true;
+    const pid = typeof meta.pid === 'number' ? meta.pid : 0;
+    if (!(pid > 0 && !pidAlive(pid))) return true;
+  }
+  const kernel = `${dataDir}.gbrain-owner.lock`;
+  if (!existsSync(kernel)) return false;
+  try {
+    execFileSync('flock', ['-n', kernel, '-c', 'true'], { stdio: 'ignore' });
+    return false;
+  } catch {
+    return true;
   }
 }
 

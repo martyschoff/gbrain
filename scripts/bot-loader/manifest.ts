@@ -8,7 +8,10 @@ export interface ManifestEntry {
   slug: string;
   output: string;
   originRelpath: string;
+  /** True only after put exits 0. Pending and failed puts stay false and are not counted. */
   inBrain: boolean;
+  /** Put exited 10. The next run retries it. It is not a failure. */
+  pending?: boolean;
 }
 
 export interface Manifest {

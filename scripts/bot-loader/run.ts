@@ -1,9 +1,10 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { basename, join, relative, resolve as resolvePath } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
 import type { LoaderConfig, GroupConfig } from './config.ts';
 import { assertRoutes } from './config.ts';
 import { isInside, toPosix, writeAtomic } from './files.ts';
-import { acquireLock, LockBusy, readExpectedHost, shareIsMounted, shortHostname } from './host.ts';
+import { acquireLock, LockBusy, readExpectedHost, serveLockHeld, shareIsMounted, shortHostname } from './host.ts';
 import type { BrainClient } from './gbrain-client.ts';
 import { createGbrainClient } from './gbrain-client.ts';
 import { readManifest, writeManifest, type Manifest, type ManifestEntry } from './manifest.ts';
@@ -18,6 +19,8 @@ export interface RunOptions {
   brain?: BrainClient;
   now?: Date;
   stderr?: (line: string) => void;
+  /** When set, skips the PGLite lock read. True means serve holds the lock. */
+  serveLockHeld?: boolean;
 }
 
 export interface RunResult {
@@ -58,10 +61,33 @@ function assertDestination(groups: GroupConfig[], group: GroupConfig, output: st
   }
 }
 
+const WRONG_HOST_STATUS = 'bot-loader: skipped: wrong host\nWARN hostname does not match GBRAIN_EXPECTED_HOST\n';
+
+function financeRemoteRefusal(group: GroupConfig): string | null {
+  if (group.source !== 'finance') return null;
+  if (!existsSync(join(group.targetRoot, '.git'))) return null;
+  let output = '';
+  try {
+    output = execFileSync('git', ['-C', group.targetRoot, 'remote'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {
+    return `source ${group.source} git remote check failed; refusing to write`;
+  }
+  if (output.trim() !== '') return `source ${group.source} has a git remote; refusing to write`;
+  return null;
+}
+
 export async function runLoader(opts: RunOptions): Promise<RunResult> {
   const stderr = opts.stderr ?? ((line) => process.stderr.write(line.endsWith('\n') ? line : `${line}\n`));
   const config = opts.config;
   assertRoutes(config.groups);
+  if (config.placeholder) {
+    stderr(`bot-loader: refusing to run; ${config.placeholder}. Edit the config and remove example placeholders.`);
+    return { exitCode: 1, summaryText: '' };
+  }
+  if (!isAbsolute(config.gbrainBin)) {
+    stderr(`bot-loader: gbrain_bin must be an absolute path (got ${config.gbrainBin})`);
+    return { exitCode: 1, summaryText: '' };
+  }
   const host = readExpectedHost(config.hostEnv);
   if (!host.ok) {
     stderr(`bot-loader: ${config.hostEnv} ${host.reason === 'missing_file' ? 'is missing' : 'has no GBRAIN_EXPECTED_HOST'}; nothing was changed`);
@@ -69,8 +95,9 @@ export async function runLoader(opts: RunOptions): Promise<RunResult> {
   }
   const hostname = opts.hostname ?? shortHostname();
   if (hostname !== host.expected) {
+    writeAtomic(config.summaryPath, WRONG_HOST_STATUS, 0o600);
     stderr('bot-loader: this machine does not match GBRAIN_EXPECTED_HOST; exiting');
-    return { exitCode: 0, summaryText: '' };
+    return { exitCode: 0, summaryText: WRONG_HOST_STATUS };
   }
   const mounted = opts.isMounted ?? shareIsMounted;
   if (!mounted(config.shareRoot)) {
@@ -90,16 +117,19 @@ export async function runLoader(opts: RunOptions): Promise<RunResult> {
   }
 
   try {
-    return await runLocked(config, opts.brain ?? createGbrainClient(config.gbrainBin), opts.now ?? new Date());
+    const home = process.env.HOME ?? '';
+    const lockHeld = opts.serveLockHeld ?? serveLockHeld(join(home, '.gbrain', 'brain.pglite'));
+    return await runLocked(config, opts.brain ?? createGbrainClient(config.gbrainBin), opts.now ?? new Date(), lockHeld);
   } finally {
     release();
   }
 }
 
-async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date): Promise<RunResult> {
+async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, serveHeld: boolean): Promise<RunResult> {
   const warnings: string[] = [];
   const box = boxWarning(config.boxExportDir, config.boxExportMaxAgeHours, now);
   if (box) warnings.push(box);
+  if (serveHeld) warnings.push('live brain totals are unavailable while serve runs');
   const manifest = readManifest(config.statePath);
   const seen = new Set<string>();
   const bots: BotSummary[] = [];
@@ -107,8 +137,9 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date): P
   const allowCache = new Map<string, Set<string>>();
 
   for (const group of config.groups) {
-    if (group.forbidGit && existsSync(join(group.targetRoot, '.git'))) {
-      warnings.push(`source ${group.source} has git metadata; skipped`);
+    const remoteRefusal = financeRemoteRefusal(group);
+    if (remoteRefusal) {
+      warnings.push(remoteRefusal);
       ok = false;
       for (const bot of group.bots) bots.push(emptyBot(bot.id, group.source));
       continue;
@@ -187,31 +218,29 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date): P
             output,
             originRelpath: originOf(config.shareRoot, file.absolute, bot.id, index, file.relativePosix),
             inBrain: put.ok,
+            pending: put.pending,
           };
           manifest.files[file.absolute] = entry;
+          if (put.pending) continue;
           if (!put.ok) { ok = false; continue; }
           summary.written++;
         }
       }
-      const orphans = orphanCount(manifest, bot.id, group.source, seen);
       summary.pages = 0;
       bots.push(summary);
-      if (orphans > 0) warnings.push(`orphaned ${bot.id} ${orphans}`);
     }
   }
 
   writeManifest(config.statePath, manifest);
+  const activeBots = config.groups.flatMap((group) => group.bots.map((bot) => ({ source: group.source, bot: bot.id })));
   const counts = await brain.counts(
     [...new Set(config.groups.map((group) => group.source))],
-    config.groups.flatMap((group) => group.bots.map((bot) => ({ source: group.source, bot: bot.id }))),
+    activeBots,
     manifest,
   );
   for (const bot of bots) bot.pages = counts.bots[`${bot.source}/${bot.id}`] ?? 0;
-  if (counts.via === 'manifest') warnings.push('page counts from loader manifest');
-  const orphanLines = config.groups.flatMap((group) => group.bots.map((bot) => {
-    const count = orphanCount(manifest, bot.id, group.source, seen);
-    return { bot: bot.id, count };
-  })).filter((item) => item.count > 0);
+  const configured = new Set(activeBots.map((bot) => `${bot.source}/${bot.bot}`));
+  const orphanLines = orphanLinesFor(manifest, configured, seen);
   const summary: RunSummary = {
     ok,
     bots,
@@ -228,11 +257,14 @@ function emptyBot(id: string, source: string): BotSummary {
   return { id, source, scanned: 0, written: 0, unchanged: 0, skipped: 0, secretsSkipped: 0, pages: 0 };
 }
 
-function orphanCount(manifest: Manifest, bot: string, source: string, seen: Set<string>): number {
-  let count = 0;
+function orphanLinesFor(manifest: Manifest, configured: Set<string>, seen: Set<string>): { bot: string; count: number }[] {
+  const counts = new Map<string, number>();
   for (const [path, entry] of Object.entries(manifest.files)) {
-    if (entry.bot !== bot || entry.source !== source || seen.has(path)) continue;
-    if (!existsSync(path)) count++;
+    const key = `${entry.source}/${entry.bot}`;
+    const botGone = !configured.has(key);
+    const sourceGone = !botGone && !seen.has(path) && !existsSync(path);
+    if (!botGone && !sourceGone) continue;
+    counts.set(entry.bot, (counts.get(entry.bot) ?? 0) + 1);
   }
-  return count;
+  return [...counts.entries()].map(([bot, count]) => ({ bot, count }));
 }

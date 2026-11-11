@@ -36,11 +36,14 @@ export interface LoaderConfig {
   csvMaxRows: number;
   boxExportMaxAgeHours: number;
   boxExportDir: string;
+  /** Set when the file still contains example bot ids or __SET_ME__. */
+  placeholder: string | null;
   groups: GroupConfig[];
 }
 
 const PERSONAL_EXTENSIONS = ['.md', '.txt', '.json', '.yaml', '.yml'];
 const FINANCE_EXTENSIONS = [...PERSONAL_EXTENSIONS, '.csv'];
+const PLACEHOLDER_BOTS = new Set(['bot-a', 'bot-b', 'fin-bot']);
 
 interface RawInput {
   path?: unknown;
@@ -113,7 +116,8 @@ function parseExtensions(raw: unknown, source: string): string[] {
 }
 
 export function loadConfig(path: string, home: string): LoaderConfig {
-  const parsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+  const raw = readFileSync(path, 'utf8');
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
   const shareRoot = resolve(expandHome(asString(parsed.share_root, 'share_root'), home));
   const groupsRaw = parsed.groups;
   if (!Array.isArray(groupsRaw) || groupsRaw.length === 0) throw new Error('config: groups must be a non-empty list');
@@ -159,6 +163,12 @@ export function loadConfig(path: string, home: string): LoaderConfig {
     }
   }
   assertRoutes(groups);
+  const placeholderBot = groups.flatMap((group) => group.bots).find((bot) => PLACEHOLDER_BOTS.has(bot.id));
+  const placeholder = placeholderBot
+    ? `bot id ${placeholderBot.id} is an example placeholder`
+    : raw.includes('__SET_ME__')
+      ? 'config contains __SET_ME__'
+      : null;
   return {
     shareRoot,
     statePath: resolve(expandHome(typeof parsed.state_path === 'string' ? parsed.state_path : '~/.gbrain/bot-loader/state.json', home)),
@@ -170,6 +180,7 @@ export function loadConfig(path: string, home: string): LoaderConfig {
     csvMaxRows: typeof parsed.csv_max_rows === 'number' && parsed.csv_max_rows > 0 ? parsed.csv_max_rows : 500,
     boxExportMaxAgeHours: typeof parsed.box_export_max_age_hours === 'number' && parsed.box_export_max_age_hours > 0 ? parsed.box_export_max_age_hours : 36,
     boxExportDir: resolve(expandShare(typeof parsed.box_export_dir === 'string' ? parsed.box_export_dir : '<share>/personalgrok/gbrain/_box-export', shareRoot, home)),
+    placeholder,
     groups,
   };
 }
