@@ -12,6 +12,8 @@ import { authorizeRoute, evaluateMcpBody, queryTargetsSharedWrite, routeClass } 
 import { authenticate, pathInside, redactSecrets, type ClientRecord, type FunnelConfig } from './tokens.ts';
 
 export const BODY_LIMIT = 1_048_576;
+/** How long a request may take to finish sending its body before the gate answers 408. */
+export const BODY_READ_TIMEOUT_MS = 10_000;
 
 export interface GateOptions {
   config: FunnelConfig;
@@ -33,8 +35,21 @@ export function assertLoopbackUpstream(url: string): URL {
   return parsed;
 }
 
-function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+function declaredContentLength(req: IncomingMessage): number | null {
+  const raw = req.headers['content-length'];
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+function readBody(req: IncomingMessage, limit: number, timeoutMs: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
+    const declared = declaredContentLength(req);
+    if (declared !== null && declared > limit) {
+      // Do not read. A client can declare a huge length and then stall.
+      reject(Object.assign(new Error('too_large'), { code: 'too_large', close: true }));
+      return;
+    }
     const chunks: Buffer[] = [];
     let size = 0;
     let tooLarge = false;
@@ -42,12 +57,16 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
     const fail = (error: Error) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
       reject(error);
     };
-    // Read the body to completion and answer 413. Do not destroy the socket:
-    // destroying it drops the connection before the client can read the status.
+    const timer = setTimeout(() => {
+      fail(Object.assign(new Error('body_timeout'), { code: 'body_timeout' }));
+    }, timeoutMs);
+    // Chunked or undeclared bodies are counted as they arrive. The status is
+    // sent after the client finishes, so the socket is still readable.
     req.on('data', (chunk: Buffer) => {
-      if (tooLarge) return;
+      if (tooLarge || settled) return;
       size += chunk.length;
       if (size > limit) {
         tooLarge = true;
@@ -60,6 +79,7 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
       if (tooLarge) fail(Object.assign(new Error('too_large'), { code: 'too_large' }));
       else if (!settled) {
         settled = true;
+        clearTimeout(timer);
         resolve(Buffer.concat(chunks));
       }
     });
@@ -67,9 +87,14 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
   });
 }
 
-function sendJson(res: ServerResponse, status: number, body: Record<string, unknown>): void {
+function sendJson(res: ServerResponse, status: number, body: Record<string, unknown>, headers?: Record<string, string>, after?: () => void): void {
   const payload = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(payload) });
+  if (after) res.once('finish', after);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(payload),
+    ...headers,
+  });
   res.end(payload);
 }
 
@@ -158,10 +183,17 @@ export function createFunnelGate(options: GateOptions): Server {
   const limiter = new WindowLimiter(rate.windowMs, rate.max, now);
   return createServer((req, res) => {
     void handle(req, res).catch(error => {
-      if (!res.headersSent) {
-        const code = (error as NodeJS.ErrnoException).code;
-        sendJson(res, code === 'too_large' ? 413 : 400, { error: code === 'too_large' ? 'too_large' : 'bad_request' });
+      if (res.headersSent) return;
+      const coded = error as NodeJS.ErrnoException & { close?: boolean };
+      if (coded.code === 'too_large') {
+        sendJson(res, 413, { error: 'too_large' }, coded.close ? { connection: 'close' } : undefined, coded.close ? () => req.destroy() : undefined);
+        return;
       }
+      if (coded.code === 'body_timeout') {
+        sendJson(res, 408, { error: 'request_timeout' }, { connection: 'close' }, () => req.destroy());
+        return;
+      }
+      sendJson(res, 400, { error: 'bad_request' });
     });
   });
 
@@ -200,7 +232,7 @@ export function createFunnelGate(options: GateOptions): Server {
       sendJson(res, 403, { error: 'forbidden', code: 'shared_write_forbidden' });
       return;
     }
-    const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req, BODY_LIMIT);
+    const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req, BODY_LIMIT, BODY_READ_TIMEOUT_MS);
     if (route === 'mcp' && method !== 'GET' && method !== 'HEAD' && method !== 'DELETE') {
       if (body.length === 0) {
         finish(400, auth.client);

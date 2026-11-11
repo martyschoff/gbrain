@@ -9,7 +9,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { BODY_LIMIT, createFunnelGate, listenGate } from '../scripts/grok-shared-brain/gate.ts';
+import { BODY_LIMIT, BODY_READ_TIMEOUT_MS, createFunnelGate, listenGate } from '../scripts/grok-shared-brain/gate.ts';
 import { clearStaleIndexLock, gitIsRunning, isGitComm, listLocalProcesses, parsePs, REFUSED_WITHOUT_FORCE, STALE_INDEX_LOCK_MS } from '../scripts/grok-shared-brain/index-lock.ts';
 import { evaluateMcpBody } from '../scripts/grok-shared-brain/mcp-policy.ts';
 import { findFunnelEnableInvocations, FUNNEL_ENABLE_COMMAND, readScriptTree, requestFunnelEnable } from '../scripts/grok-shared-brain/funnel-policy.ts';
@@ -287,7 +287,7 @@ describe('funnel gate', () => {
     }
   });
 
-  test('an oversize body is 413 and the socket stays open', async () => {
+  test('a chunked oversize body is 413 and the socket stays open', async () => {
     const payload = Buffer.alloc(BODY_LIMIT + 32, 0x61);
     const result = await new Promise<{ status: number; body: string; error: string }>((resolve, reject) => {
       const req = httpRequest({
@@ -298,7 +298,7 @@ describe('funnel gate', () => {
         headers: {
           authorization: `Bearer ${tokens.personal}`,
           'content-type': 'application/json',
-          'content-length': payload.length,
+          'transfer-encoding': 'chunked',
         },
       }, response => {
         const chunks: Buffer[] = [];
@@ -315,6 +315,82 @@ describe('funnel gate', () => {
     expect(result.error).toBe('');
     expect(result.status).toBe(413);
     expect(result.body).toContain('too_large');
+  });
+
+  test('a declared oversize Content-Length with no body is 413 promptly', async () => {
+    const started = Date.now();
+    const result = await new Promise<{ status: number; body: string; connection: string }>((resolve, reject) => {
+      let status = 0;
+      let connection = '';
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port,
+        path: '/mcp',
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${tokens.personal}`,
+          'content-type': 'application/json',
+          'content-length': String(BODY_LIMIT + 1),
+        },
+      }, response => {
+        status = response.statusCode ?? 0;
+        connection = String(response.headers.connection ?? '');
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve({ status, body: Buffer.concat(chunks).toString('utf8'), connection }));
+      });
+      req.on('error', error => {
+        if (status !== 0) resolve({ status, body: '', connection });
+        else reject(error);
+      });
+      req.flushHeaders();
+    });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(result.status).toBe(413);
+    expect(result.body).toContain('too_large');
+    expect(result.connection).toBe('close');
+  });
+
+  test('a stalled body is 408 when the read times out', async () => {
+    const started = Date.now();
+    const result = await new Promise<{ status: number; body: string; connection: string }>((resolve, reject) => {
+      let status = 0;
+      let connection = '';
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port,
+        path: '/mcp',
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${tokens.personal}`,
+          'content-type': 'application/json',
+          'content-length': '64',
+        },
+      }, response => {
+        status = response.statusCode ?? 0;
+        connection = String(response.headers.connection ?? '');
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve({ status, body: Buffer.concat(chunks).toString('utf8'), connection }));
+      });
+      req.on('error', error => {
+        if (status !== 0) resolve({ status, body: '', connection });
+        else reject(error);
+      });
+      req.flushHeaders();
+    });
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(BODY_READ_TIMEOUT_MS - 500);
+    expect(elapsed).toBeLessThan(BODY_READ_TIMEOUT_MS + 3_000);
+    expect(result.status).toBe(408);
+    expect(result.body).toContain('request_timeout');
+    expect(result.connection).toBe('close');
+  }, BODY_READ_TIMEOUT_MS + 5_000);
+
+  test('a small body still proxies', async () => {
+    const response = await call(port, 'POST', '/mcp', tokens.personal, remember('personal'));
+    expect(response.status).toBe(200);
+    expect(response.text).toContain('upstream');
   });
 
   test('query-string bearers are not accepted and tokens never appear in logs', async () => {

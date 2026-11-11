@@ -36,7 +36,8 @@ Sources: `personal`, `business`, `hermes` (`--no-federated`) and `shared` (`--fe
 
 ```bash
 export GBRAIN_MLSFS_ROOT="/Volumes/<share>/personalgrok/gbrain"   # replace <share> locally; do not commit the real name
-GBRAIN_SHARED_BRAIN_TEST=1 GBRAIN_SHARED_APPLY_STEP4=1 bash scripts/grok-shared-brain/setup.sh
+# Create ~/.gbrain/serve/host.env first, one untracked line: GBRAIN_EXPECTED_HOST=<MAC_HOSTNAME>
+GBRAIN_SHARED_APPLY_STEP4=1 bash scripts/grok-shared-brain/setup.sh
 ```
 
 `setup.sh` reads the expected hostname from an untracked file outside the repo, `~/.gbrain/serve/host.env`. It refuses to run when that file or `GBRAIN_EXPECTED_HOST` is missing. The file is one assignment and is not committed:
