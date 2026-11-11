@@ -1,0 +1,105 @@
+#!/bin/bash
+# Hostname guard first. A mismatch refuses the install.
+# The expected hostname is one untracked line in ~/.gbrain/serve/host.env:
+#   GBRAIN_EXPECTED_HOST=<MAC_HOSTNAME>
+set -euo pipefail
+
+HOST_ENV="${HOME}/.gbrain/serve/host.env"
+if [ ! -f "$HOST_ENV" ]; then
+  echo "refusing: missing ${HOST_ENV}. Create it with one line: GBRAIN_EXPECTED_HOST=<MAC_HOSTNAME>" >&2
+  exit 1
+fi
+
+expected=""
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    ''|'#'*) continue ;;
+    GBRAIN_EXPECTED_HOST=*) expected=${line#GBRAIN_EXPECTED_HOST=} ;;
+  esac
+done < "$HOST_ENV"
+case "$expected" in
+  \"*\") expected=${expected#\"}; expected=${expected%\"} ;;
+  \'*\') expected=${expected#\'}; expected=${expected%\'} ;;
+esac
+if [ -z "$expected" ]; then
+  echo "refusing: GBRAIN_EXPECTED_HOST is missing from ${HOST_ENV}" >&2
+  exit 1
+fi
+
+host=$(hostname -s)
+if [ "$host" != "$expected" ]; then
+  echo "refusing: this machine does not match GBRAIN_EXPECTED_HOST in ${HOST_ENV}" >&2
+  exit 1
+fi
+
+if [ -n "${GBRAIN_REPO:-}" ]; then
+  REPO=$GBRAIN_REPO
+elif [ -f "$0" ] && [ "$(basename "$0")" = "install.sh" ]; then
+  REPO=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
+else
+  REPO="${HOME}/personalgrok/gbrain"
+fi
+
+CFG="${HOME}/.gbrain/bot-loader/config.json"
+if [ ! -f "$CFG" ]; then
+  mkdir -p "${HOME}/.gbrain/bot-loader"
+  cp "$REPO/docs/grok/bot-loader/config.example.json" "$CFG"
+  chmod 600 "$CFG"
+fi
+
+SHARE=$(python3 -c 'import json,os,sys
+c=json.load(open(sys.argv[1], encoding="utf-8"))
+p=c["share_root"]
+print(os.path.expanduser(p) if isinstance(p, str) and p.startswith("~") else p)' "$CFG")
+if [ -z "$SHARE" ] || [ ! -d "$SHARE" ]; then
+  echo "bot-loader: share root is not a mounted filesystem; nothing else was changed" >&2
+  exit 1
+fi
+dev=$(stat -c %d "$SHARE" 2>/dev/null || stat -f %d "$SHARE")
+parent=$(stat -c %d "$(dirname "$SHARE")" 2>/dev/null || stat -f %d "$(dirname "$SHARE")")
+if [ "$dev" = "$parent" ]; then
+  echo "bot-loader: share root is not a mounted filesystem; nothing else was changed" >&2
+  exit 1
+fi
+
+BUN="${HOME}/.bun/bin/bun"
+if [ ! -x "$BUN" ]; then
+  echo "refusing: bun is not executable at ${BUN}" >&2
+  exit 1
+fi
+export PATH="${HOME}/.bun/bin:${PATH}"
+
+FIN="${SHARE}/personalgrok/gbrain/finance"
+if [ -e "${FIN}/.git" ]; then
+  echo "refusing: finance directory has git metadata; not registering it" >&2
+  exit 1
+fi
+mkdir -p "$FIN"
+set +e
+add_out=$(gbrain sources add finance --path "$FIN" --name finance --no-federated --force --json 2>&1)
+add_status=$?
+set -e
+if [ "$add_status" -ne 0 ]; then
+  case "$add_out" in
+    *"already registered"*|*"already exists"*) ;;
+    *) printf '%s\n' "$add_out" >&2; exit 1 ;;
+  esac
+fi
+
+AGENT="${HOME}/Library/LaunchAgents"
+mkdir -p "$AGENT" "${HOME}/Library/Logs"
+RENDERED="${AGENT}/com.gbrain.bot-loader.plist"
+sed \
+  -e "s|__BUN__|${BUN}|g" \
+  -e "s|__REPO__|${REPO}|g" \
+  -e "s|__HOME__|${HOME}|g" \
+  "$REPO/scripts/bot-loader/com.gbrain.bot-loader.plist" > "$RENDERED"
+if grep -q '__' "$RENDERED"; then
+  echo "refusing: rendered plist still has placeholders" >&2
+  exit 1
+fi
+plutil -lint "$RENDERED"
+uid=$(id -u)
+launchctl bootout "gui/${uid}/com.gbrain.bot-loader" || true
+launchctl bootstrap "gui/${uid}" "$RENDERED"
+"$BUN" "$REPO/scripts/bot-loader/cli.ts" --config "$CFG"
