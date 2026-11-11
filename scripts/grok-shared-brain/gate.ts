@@ -141,6 +141,15 @@ const FORWARDED_REQUEST_HEADERS = new Set([
   'last-event-id',
 ]);
 
+function rejectsContentEncoding(value: string | string[] | undefined): boolean {
+  if (value === undefined) return false;
+  const parts = (Array.isArray(value) ? value.join(',') : value).split(',');
+  return parts.some(part => {
+    const token = part.trim().toLowerCase();
+    return token.length > 0 && token !== 'identity';
+  });
+}
+
 function proxy(
   upstream: URL,
   req: IncomingMessage,
@@ -190,9 +199,15 @@ function proxy(
     res.writeHead(upstreamRes.statusCode ?? 502, out);
     upstreamRes.pipe(res);
   });
+  // Five seconds covers connect and the response headers only. MCP SSE stays
+  // open and can be quiet for longer than that; leaving the timer on would
+  // cut the body. Clearing it once headers arrive keeps the stream intact.
   upstreamReq.setTimeout(5_000, () => {
     upstreamReq.destroy();
     fail(502);
+  });
+  upstreamReq.on('response', () => {
+    upstreamReq.setTimeout(0);
   });
   upstreamReq.on('error', () => {
     fail(502);
@@ -259,6 +274,11 @@ export function createFunnelGate(options: GateOptions): Server {
     if (!routeDecision.ok) {
       finish(routeDecision.status, auth.client);
       sendJson(res, routeDecision.status, { error: routeDecision.error, code: routeDecision.code });
+      return;
+    }
+    if (rejectsContentEncoding(req.headers['content-encoding'])) {
+      finish(415, auth.client);
+      sendJson(res, 415, { error: 'unsupported_content_encoding' });
       return;
     }
     const sourceHeader = typeof req.headers['x-gbrain-source'] === 'string' ? req.headers['x-gbrain-source'] : undefined;

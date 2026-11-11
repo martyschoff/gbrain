@@ -463,7 +463,7 @@ describe('funnel gate', () => {
       upstreamBaseUrl: `http://127.0.0.1:${(localUpstream.address() as { port: number }).port}`,
     });
     const localPort = await listenGate(localGate);
-    const spoofed = [
+    const dropped = [
       ['Connection', 'x-via-connection'],
       ['TE', 'spoof-te'],
       ['Upgrade', 'spoof-upgrade'],
@@ -478,7 +478,22 @@ describe('funnel gate', () => {
       ['X-Real-Ip', '203.0.113.51'],
       ['Forwarded', 'for=203.0.113.52;proto=https;host=spoof.example'],
       ['X-Via-Connection', 'spoof-connection-named'],
-      ['X-Gbrain-Keep', 'kept-marker'],
+      ['True-Client-IP', '203.0.113.60'],
+      ['CF-Connecting-IP', '203.0.113.61'],
+      ['X-Client-IP', '203.0.113.62'],
+      ['X-Original-Forwarded-For', '203.0.113.63'],
+      ['X-Forwarded-Scheme', 'https'],
+      ['X-Forwarded-Prefix', '/spoof-prefix'],
+      ['Forwarded-For', '203.0.113.64'],
+      ['Via', 'spoof-via'],
+      ['Cookie', 'session=spoof'],
+      ['Origin', 'https://spoof.example'],
+      ['If-None-Match', '"spoof-etag"'],
+      ['X-Gbrain-Client', 'spoof-client'],
+      ['X-Gbrain-On-Behalf-Of', 'spoof-behalf'],
+      ['X-Gbrain-Agent-Label', 'spoof-label'],
+      ['x-qm-actor', 'spoof-actor'],
+      ['x-qm-audience', 'spoof-audience'],
     ];
     const raw = (headerLines: string[]) => new Promise<string>((resolve, reject) => {
       const sock = connectTcp(localPort, '127.0.0.1', () => {
@@ -510,52 +525,108 @@ describe('funnel gate', () => {
         reject(error);
       });
     });
+    const allowed = [
+      ['Content-Type', 'application/json'],
+      ['Accept', 'application/json, text/event-stream'],
+      ['Accept-Encoding', 'gzip'],
+      ['User-Agent', 'mcp-client-test'],
+      ['Mcp-Session-Id', 'session-keep'],
+      ['Mcp-Protocol-Version', '2025-06-18'],
+      ['Last-Event-ID', 'event-keep'],
+    ];
     try {
-      const response = await raw(spoofed.map(([name, value]) => `${name}: ${value}`));
-      expect(response.startsWith('HTTP/1.1 200')).toBe(true);
-      expect(seen.length).toBe(1);
-      const forwarded = JSON.stringify(seen[0]).toLowerCase();
-      for (const [, value] of spoofed) {
-        expect(forwarded.includes(value.toLowerCase())).toBe(false);
-      }
-      expect(seen[0]?.['x-forwarded-for']).toBeUndefined();
-      expect(seen[0]?.['x-forwarded-proto']).toBeUndefined();
-      const transfer = await raw(['Transfer-Encoding: spoof-transfer']);
-      expect(transfer.startsWith('HTTP/1.1')).toBe(true);
-      expect(JSON.stringify(seen).toLowerCase().includes('spoof-transfer')).toBe(false);
-      const dropped = [
-        ['True-Client-IP', '203.0.113.60'],
-        ['CF-Connecting-IP', '203.0.113.61'],
-        ['X-Client-IP', '203.0.113.62'],
-        ['X-Original-Forwarded-For', '203.0.113.63'],
-        ['X-Forwarded-Scheme', 'https'],
-        ['X-Forwarded-Prefix', '/spoof-prefix'],
-        ['Forwarded-For', '203.0.113.64'],
-        ['Via', 'spoof-via'],
-      ];
-      const allowed = [
-        ['Content-Type', 'application/json'],
-        ['Accept', 'application/json, text/event-stream'],
-        ['Accept-Encoding', 'gzip'],
-        ['User-Agent', 'mcp-client-test'],
-        ['Mcp-Session-Id', 'session-keep'],
-        ['Mcp-Protocol-Version', '2025-06-18'],
-        ['Last-Event-ID', 'event-keep'],
-      ];
-      const passed = await raw([
+      const response = await raw([
         ...dropped.map(([name, value]) => `${name}: ${value}`),
         ...allowed.map(([name, value]) => `${name}: ${value}`),
       ]);
-      expect(passed.startsWith('HTTP/1.1 200')).toBe(true);
-      const hit = seen[seen.length - 1] ?? {};
-      const forwardedAgain = JSON.stringify(hit).toLowerCase();
-      for (const [, value] of dropped) expect(forwardedAgain.includes(value.toLowerCase())).toBe(false);
+      expect(response.startsWith('HTTP/1.1 200')).toBe(true);
+      expect(seen.length).toBe(1);
+      const hit = seen[0] ?? {};
+      for (const [name] of dropped) {
+        const key = name.toLowerCase();
+        // The gate's own HTTP client sets Connection. The client's value is not copied.
+        if (key === 'connection') {
+          expect(hit.connection).not.toBe('x-via-connection');
+          expect(String(hit.connection ?? '').includes('x-via-connection')).toBe(false);
+          continue;
+        }
+        expect(hit[key]).toBeUndefined();
+      }
       for (const [name, value] of allowed) expect(hit[name.toLowerCase()]).toBe(value);
-      expect(hit['x-forwarded-proto']).toBeUndefined();
+      const transfer = await raw(['Transfer-Encoding: spoof-transfer']);
+      expect(transfer.startsWith('HTTP/1.1')).toBe(true);
+      for (const item of seen) expect(item['transfer-encoding']).toBeUndefined();
     } finally {
       await new Promise<void>(resolve => localGate.close(() => resolve()));
       await new Promise<void>(resolve => localUpstream.close(() => resolve()));
     }
+  });
+
+  test('an SSE body that stays quiet past the upstream timeout is not cut', async () => {
+    const upstream = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.flushHeaders();
+      setTimeout(() => {
+        res.write('data: still-open\n\n');
+        res.end();
+      }, 6_000);
+    });
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    const localGate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${(upstream.address() as { port: number }).port}`,
+    });
+    const localPort = await listenGate(localGate);
+    const started = Date.now();
+    try {
+      const text = await new Promise<string>((resolve, reject) => {
+        const req = httpRequest({
+          hostname: '127.0.0.1',
+          port: localPort,
+          path: '/health',
+          method: 'GET',
+          headers: { authorization: `Bearer ${tokens.personal}` },
+        }, response => {
+          const chunks: Buffer[] = [];
+          response.on('data', (chunk: Buffer) => chunks.push(chunk));
+          response.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        });
+        req.on('error', reject);
+        req.end();
+      });
+      expect(Date.now() - started).toBeGreaterThan(5_000);
+      expect(text).toContain('data: still-open');
+    } finally {
+      await new Promise<void>(resolve => localGate.close(() => resolve()));
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
+  }, 12_000);
+
+  test('a content-encoding other than identity is 415', async () => {
+    const once = (encoding: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port,
+        path: '/health',
+        method: 'GET',
+        headers: {
+          authorization: `Bearer ${tokens.personal}`,
+          'content-encoding': encoding,
+        },
+      }, response => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    const gzip = await once('gzip');
+    expect(gzip.status).toBe(415);
+    expect(gzip.body).toContain('unsupported_content_encoding');
+    expect(gzip.body.length).toBeLessThan(80);
+    const identity = await once('identity');
+    expect(identity.status).toBe(200);
   });
 
   test('forwards a grant access_token from outside the repo and does not log it', async () => {
