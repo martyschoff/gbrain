@@ -81,6 +81,8 @@ bun scripts/grok-shared-brain/cli-gate.ts \
 
 Missing or unknown bearers are 401, including `/health`. A token for the wrong route or source is 403. `/admin` and a write to `shared` are 403 with a valid token. Over the per-token limit the response is 429. The process listens even when nothing is on port 8766. A proxied call then returns 502, and the next request tries the upstream again.
 
+The gate forwards only the headers the loopback serve reads for a normal MCP call: `Content-Type`, `Accept`, `Accept-Encoding`, `User-Agent`, `Mcp-Session-Id`, `Mcp-Protocol-Version`, and `Last-Event-ID`. It sets `Authorization` from the grant file and `Content-Length` from the body it read. It does not send `X-Forwarded-Proto`. Funnel terminates HTTPS, and the gate only sees HTTP on loopback, so it cannot honestly set that header.
+
 Expose gbrain without Funnel (design step 5). Do not add `--funnel`:
 
 ```bash

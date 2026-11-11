@@ -224,7 +224,22 @@ export function writeTokenFile(destination: string, config: FunnelConfig, repoRo
     try { unlinkSync(temporary); } catch { /* the temp is not the token file */ }
     throw error;
   }
+  fsyncDirectory(directory);
   try { chmodSync(destination, 0o600); } catch { /* the temp file was created mode 0600 */ }
+}
+
+/** Make the rename durable. Directory fsync returns EINVAL or EISDIR on some platforms. */
+export function fsyncDirectory(directory: string, sync: (fd: number) => void = fsyncSync): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(directory, 'r');
+    sync(fd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'EINVAL' && code !== 'EISDIR') throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 export interface AuthOk { ok: true; client: string; record: ClientRecord }

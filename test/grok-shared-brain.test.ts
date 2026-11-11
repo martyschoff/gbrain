@@ -15,7 +15,7 @@ import { clearStaleIndexLock, gitIsRunning, isGitComm, listLocalProcesses, parse
 import { evaluateMcpBody } from '../scripts/grok-shared-brain/mcp-policy.ts';
 import { findFunnelEnableInvocations, FUNNEL_ENABLE_COMMAND, readScriptTree, requestFunnelEnable } from '../scripts/grok-shared-brain/funnel-policy.ts';
 import { evaluateHostGuard, guardThisHost, parseExpectedHost, shortHostname } from '../scripts/grok-shared-brain/host-guard.ts';
-import { authenticate, configContainsPlaintext, generateTokens, parseFunnelConfig, pathInside, repoRootFrom, sha256Hex, tokenMatchesHash, withUpstreamTokenFiles, writeTokenFile, type FunnelConfig } from '../scripts/grok-shared-brain/tokens.ts';
+import { authenticate, configContainsPlaintext, fsyncDirectory, generateTokens, parseFunnelConfig, pathInside, repoRootFrom, sha256Hex, tokenMatchesHash, withUpstreamTokenFiles, writeTokenFile, type FunnelConfig } from '../scripts/grok-shared-brain/tokens.ts';
 
 const DESIGN_SHA = 'f84e310bb49af8f4449406053cbcff357f74253a993304e577966ac8667444b4';
 const SCRIPT_DIR = join(import.meta.dir, '../scripts/grok-shared-brain');
@@ -114,6 +114,17 @@ describe('funnel tokens', () => {
     expect(second.mode & 0o777).toBe(0o600);
     expect(readFileSync(destination, 'utf8')).toContain('"max": 7');
     expect(readdirSync(scratch).filter(name => name.endsWith('.tmp'))).toEqual([]);
+  });
+
+  test('directory fsync ignores EINVAL and EISDIR', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-fsync-dir-'));
+    const refuse = (code: string) => () => {
+      throw Object.assign(new Error(code), { code });
+    };
+    expect(() => fsyncDirectory(dir, refuse('EINVAL'))).not.toThrow();
+    expect(() => fsyncDirectory(dir, refuse('EISDIR'))).not.toThrow();
+    expect(() => fsyncDirectory(dir, refuse('EIO'))).toThrow();
+    expect(() => fsyncDirectory(dir)).not.toThrow();
   });
 
   test('compare uses timingSafeEqual', () => {
@@ -504,18 +515,43 @@ describe('funnel gate', () => {
       expect(response.startsWith('HTTP/1.1 200')).toBe(true);
       expect(seen.length).toBe(1);
       const forwarded = JSON.stringify(seen[0]).toLowerCase();
-      for (const [name, value] of spoofed) {
-        if (name === 'X-Gbrain-Keep') {
-          expect(seen[0]?.['x-gbrain-keep']).toBe(value);
-          continue;
-        }
+      for (const [, value] of spoofed) {
         expect(forwarded.includes(value.toLowerCase())).toBe(false);
       }
-      expect(String(seen[0]?.['x-forwarded-for'] ?? '')).not.toContain('203.0.113.50');
-      expect(seen[0]?.['x-forwarded-proto']).toBe('http');
+      expect(seen[0]?.['x-forwarded-for']).toBeUndefined();
+      expect(seen[0]?.['x-forwarded-proto']).toBeUndefined();
       const transfer = await raw(['Transfer-Encoding: spoof-transfer']);
       expect(transfer.startsWith('HTTP/1.1')).toBe(true);
       expect(JSON.stringify(seen).toLowerCase().includes('spoof-transfer')).toBe(false);
+      const dropped = [
+        ['True-Client-IP', '203.0.113.60'],
+        ['CF-Connecting-IP', '203.0.113.61'],
+        ['X-Client-IP', '203.0.113.62'],
+        ['X-Original-Forwarded-For', '203.0.113.63'],
+        ['X-Forwarded-Scheme', 'https'],
+        ['X-Forwarded-Prefix', '/spoof-prefix'],
+        ['Forwarded-For', '203.0.113.64'],
+        ['Via', 'spoof-via'],
+      ];
+      const allowed = [
+        ['Content-Type', 'application/json'],
+        ['Accept', 'application/json, text/event-stream'],
+        ['Accept-Encoding', 'gzip'],
+        ['User-Agent', 'mcp-client-test'],
+        ['Mcp-Session-Id', 'session-keep'],
+        ['Mcp-Protocol-Version', '2025-06-18'],
+        ['Last-Event-ID', 'event-keep'],
+      ];
+      const passed = await raw([
+        ...dropped.map(([name, value]) => `${name}: ${value}`),
+        ...allowed.map(([name, value]) => `${name}: ${value}`),
+      ]);
+      expect(passed.startsWith('HTTP/1.1 200')).toBe(true);
+      const hit = seen[seen.length - 1] ?? {};
+      const forwardedAgain = JSON.stringify(hit).toLowerCase();
+      for (const [, value] of dropped) expect(forwardedAgain.includes(value.toLowerCase())).toBe(false);
+      for (const [name, value] of allowed) expect(hit[name.toLowerCase()]).toBe(value);
+      expect(hit['x-forwarded-proto']).toBeUndefined();
     } finally {
       await new Promise<void>(resolve => localGate.close(() => resolve()));
       await new Promise<void>(resolve => localUpstream.close(() => resolve()));
