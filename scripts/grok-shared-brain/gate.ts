@@ -126,18 +126,61 @@ function upstreamAuthorization(record: ClientRecord): { header: string | null; s
   return { header: `Bearer ${parsed.access_token}`, secret: parsed.access_token };
 }
 
-function proxy(upstream: URL, req: IncomingMessage, body: Buffer, res: ServerResponse, authorization: string | null): void {
+/**
+ * Headers the loopback serve reads for a normal MCP call.
+ * Authorization and content-length are set below from the gate, not copied.
+ * X-Forwarded-Proto is omitted: Funnel terminates HTTPS, and this process only sees HTTP.
+ */
+const FORWARDED_REQUEST_HEADERS = new Set([
+  'content-type',
+  'accept',
+  'accept-encoding',
+  'user-agent',
+  'mcp-session-id',
+  'mcp-protocol-version',
+  'last-event-id',
+]);
+
+function rejectsContentEncoding(value: string | string[] | undefined): boolean {
+  if (value === undefined) return false;
+  const parts = (Array.isArray(value) ? value.join(',') : value).split(',');
+  return parts.some(part => {
+    const token = part.trim().toLowerCase();
+    return token.length > 0 && token !== 'identity';
+  });
+}
+
+function proxy(
+  upstream: URL,
+  req: IncomingMessage,
+  body: Buffer,
+  res: ServerResponse,
+  authorization: string | null,
+  onStatus: (status: number) => void,
+): void {
   const target = new URL(req.url ?? '/', upstream);
   const headers: Record<string, string | number> = {};
   for (const [key, value] of Object.entries(req.headers)) {
     if (value === undefined) continue;
-    const lower = key.toLowerCase();
-    if (lower === 'authorization' || lower === 'cookie' || lower === 'proxy-authorization' || lower === 'host' || lower === 'content-length') continue;
+    if (!FORWARDED_REQUEST_HEADERS.has(key.toLowerCase())) continue;
     headers[key] = Array.isArray(value) ? value.join(', ') : value;
   }
   if (authorization) headers.authorization = authorization;
   headers.host = upstream.host;
   headers['content-length'] = body.length;
+  let reported = false;
+  const report = (status: number) => {
+    if (reported) return;
+    reported = true;
+    onStatus(status);
+  };
+  const fail = (status: number) => {
+    if (res.headersSent) return;
+    report(status);
+    sendJson(res, status, { error: 'bad_gateway' });
+  };
+  // One attempt per request. A down upstream is 502; the process keeps listening
+  // and the next request tries again. Nothing here is logged, including authorization.
   const upstreamReq = httpRequest({
     protocol: upstream.protocol,
     hostname: upstream.hostname,
@@ -146,6 +189,7 @@ function proxy(upstream: URL, req: IncomingMessage, body: Buffer, res: ServerRes
     path: `${target.pathname}${target.search}`,
     headers,
   }, upstreamRes => {
+    report(upstreamRes.statusCode ?? 502);
     const out: Record<string, string | number | string[]> = {};
     for (const [key, value] of Object.entries(upstreamRes.headers)) {
       if (value === undefined) continue;
@@ -155,12 +199,35 @@ function proxy(upstream: URL, req: IncomingMessage, body: Buffer, res: ServerRes
     res.writeHead(upstreamRes.statusCode ?? 502, out);
     upstreamRes.pipe(res);
   });
-  upstreamReq.setTimeout(5_000, () => {
+  // Five seconds covers connect and the response headers only. MCP SSE stays
+  // open and can be quiet for longer than that; leaving the timer on would
+  // cut the body. Drop the timer and its listener once headers arrive, the
+  // upstream errors, or the client aborts or closes, so it cannot fire later.
+  const onTimeout = () => {
     upstreamReq.destroy();
-    if (!res.headersSent) sendJson(res, 502, { error: 'bad_gateway' });
-  });
+    fail(502);
+  };
+  upstreamReq.setTimeout(5_000, onTimeout);
+  let clientGone = false;
+  const disarm = () => {
+    upstreamReq.setTimeout(0);
+    upstreamReq.removeListener('timeout', onTimeout);
+  };
+  const onClientGone = () => {
+    if (clientGone) return;
+    clientGone = true;
+    disarm();
+    if (!res.writableFinished) upstreamReq.destroy();
+  };
+  upstreamReq.on('response', disarm);
   upstreamReq.on('error', () => {
-    if (!res.headersSent) sendJson(res, 502, { error: 'bad_gateway' });
+    disarm();
+    if (!clientGone) fail(502);
+  });
+  req.on('aborted', onClientGone);
+  res.on('close', () => {
+    disarm();
+    if (!res.writableFinished) onClientGone();
   });
   upstreamReq.end(body);
 }
@@ -206,7 +273,7 @@ export function createFunnelGate(options: GateOptions): Server {
     const auth = authenticate(presented, options.config);
     const secret = presented?.replace(/^Bearer\s+/i, '').trim();
     const finish = (status: number, client: string, upstreamSecret?: string | null) => {
-      const extras = [secret ?? '', upstreamSecret ?? ''].filter(item => item.length > 0);
+      const extras = [presented ?? '', secret ?? '', upstreamSecret ?? ''].filter(item => item.length > 0);
       log(redactSecrets(`${method} ${url.pathname} client=${client} status=${status}`, extras));
     };
     if (!auth.ok) {
@@ -224,6 +291,11 @@ export function createFunnelGate(options: GateOptions): Server {
     if (!routeDecision.ok) {
       finish(routeDecision.status, auth.client);
       sendJson(res, routeDecision.status, { error: routeDecision.error, code: routeDecision.code });
+      return;
+    }
+    if (rejectsContentEncoding(req.headers['content-encoding'])) {
+      finish(415, auth.client);
+      sendJson(res, 415, { error: 'unsupported_content_encoding' });
       return;
     }
     const sourceHeader = typeof req.headers['x-gbrain-source'] === 'string' ? req.headers['x-gbrain-source'] : undefined;
@@ -258,8 +330,7 @@ export function createFunnelGate(options: GateOptions): Server {
       sendJson(res, 502, { error: 'bad_gateway' });
       return;
     }
-    finish(200, auth.client, upstreamSecret);
-    proxy(upstream, req, body, res, authorization);
+    proxy(upstream, req, body, res, authorization, status => finish(status, auth.client, upstreamSecret));
   }
 }
 

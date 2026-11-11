@@ -5,7 +5,8 @@
 import { createHash } from 'node:crypto';
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { connect as connectTcp } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
@@ -13,7 +14,8 @@ import { BODY_LIMIT, BODY_READ_TIMEOUT_MS, createFunnelGate, listenGate } from '
 import { clearStaleIndexLock, gitIsRunning, isGitComm, listLocalProcesses, parsePs, REFUSED_WITHOUT_FORCE, STALE_INDEX_LOCK_MS } from '../scripts/grok-shared-brain/index-lock.ts';
 import { evaluateMcpBody } from '../scripts/grok-shared-brain/mcp-policy.ts';
 import { findFunnelEnableInvocations, FUNNEL_ENABLE_COMMAND, readScriptTree, requestFunnelEnable } from '../scripts/grok-shared-brain/funnel-policy.ts';
-import { authenticate, configContainsPlaintext, generateTokens, parseFunnelConfig, pathInside, repoRootFrom, sha256Hex, tokenMatchesHash, writeTokenFile, type FunnelConfig } from '../scripts/grok-shared-brain/tokens.ts';
+import { evaluateHostGuard, guardThisHost, parseExpectedHost, shortHostname } from '../scripts/grok-shared-brain/host-guard.ts';
+import { authenticate, configContainsPlaintext, fsyncDirectory, generateTokens, parseFunnelConfig, pathInside, repoRootFrom, sha256Hex, tokenMatchesHash, withUpstreamTokenFiles, writeTokenFile, type FunnelConfig } from '../scripts/grok-shared-brain/tokens.ts';
 
 const DESIGN_SHA = 'f84e310bb49af8f4449406053cbcff357f74253a993304e577966ac8667444b4';
 const SCRIPT_DIR = join(import.meta.dir, '../scripts/grok-shared-brain');
@@ -82,6 +84,47 @@ describe('funnel tokens', () => {
     const generated = generateTokens();
     generated.config.clients.personal!.write = ['personal', 'shared'];
     expect(() => parseFunnelConfig(generated.config)).toThrow(/must not write shared/);
+  });
+
+  test('parser rejects a duplicate token hash and does not show the hash', () => {
+    const generated = generateTokens();
+    const hash = generated.config.clients.personal!.token_sha256;
+    generated.config.clients.business!.token_sha256 = hash.toUpperCase();
+    expect(() => parseFunnelConfig(generated.config)).toThrow(/duplicate token_sha256 for clients personal, business/);
+    try {
+      parseFunnelConfig(generated.config);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      expect(message.includes(hash.toLowerCase())).toBe(false);
+      expect(message.includes(hash.toUpperCase())).toBe(false);
+    }
+  });
+
+  test('writeTokenFile replaces via a 0600 temp file in the same directory', () => {
+    const generated = generateTokens();
+    const destination = join(scratch, 'atomic.json');
+    const repo = repoRootFrom(import.meta.dir);
+    writeTokenFile(destination, generated.config, repo);
+    const first = statSync(destination);
+    expect(first.mode & 0o777).toBe(0o600);
+    generated.config.rate_limit.max = 7;
+    writeTokenFile(destination, generated.config, repo);
+    const second = statSync(destination);
+    expect(second.ino).not.toBe(first.ino);
+    expect(second.mode & 0o777).toBe(0o600);
+    expect(readFileSync(destination, 'utf8')).toContain('"max": 7');
+    expect(readdirSync(scratch).filter(name => name.endsWith('.tmp'))).toEqual([]);
+  });
+
+  test('directory fsync ignores EINVAL and EISDIR', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-fsync-dir-'));
+    const refuse = (code: string) => () => {
+      throw Object.assign(new Error(code), { code });
+    };
+    expect(() => fsyncDirectory(dir, refuse('EINVAL'))).not.toThrow();
+    expect(() => fsyncDirectory(dir, refuse('EISDIR'))).not.toThrow();
+    expect(() => fsyncDirectory(dir, refuse('EIO'))).toThrow();
+    expect(() => fsyncDirectory(dir)).not.toThrow();
   });
 
   test('compare uses timingSafeEqual', () => {
@@ -406,6 +449,300 @@ describe('funnel gate', () => {
     expect(authenticate(undefined, config).ok).toBe(false);
   });
 
+  test('forwarding and hop-by-hop headers from the client do not reach upstream', async () => {
+    const seen: Record<string, string | string[] | undefined>[] = [];
+    const localUpstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+      seen.push(req.headers);
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+    await new Promise<void>(resolve => localUpstream.listen(0, '127.0.0.1', resolve));
+    const localGate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${(localUpstream.address() as { port: number }).port}`,
+    });
+    const localPort = await listenGate(localGate);
+    const dropped = [
+      ['Connection', 'x-via-connection'],
+      ['TE', 'spoof-te'],
+      ['Upgrade', 'spoof-upgrade'],
+      ['Keep-Alive', 'spoof-keep-alive'],
+      ['Proxy-Connection', 'spoof-proxy-connection'],
+      ['Proxy-Authorization', 'spoof-proxy-authorization'],
+      ['Trailer', 'spoof-trailer'],
+      ['X-Forwarded-For', '203.0.113.50'],
+      ['X-Forwarded-Proto', 'https'],
+      ['X-Forwarded-Host', 'spoof.example'],
+      ['X-Forwarded-Port', '444'],
+      ['X-Real-Ip', '203.0.113.51'],
+      ['Forwarded', 'for=203.0.113.52;proto=https;host=spoof.example'],
+      ['X-Via-Connection', 'spoof-connection-named'],
+      ['True-Client-IP', '203.0.113.60'],
+      ['CF-Connecting-IP', '203.0.113.61'],
+      ['X-Client-IP', '203.0.113.62'],
+      ['X-Original-Forwarded-For', '203.0.113.63'],
+      ['X-Forwarded-Scheme', 'https'],
+      ['X-Forwarded-Prefix', '/spoof-prefix'],
+      ['Forwarded-For', '203.0.113.64'],
+      ['Via', 'spoof-via'],
+      ['Cookie', 'session=spoof'],
+      ['Origin', 'https://spoof.example'],
+      ['If-None-Match', '"spoof-etag"'],
+      ['X-Gbrain-Client', 'spoof-client'],
+      ['X-Gbrain-On-Behalf-Of', 'spoof-behalf'],
+      ['X-Gbrain-Agent-Label', 'spoof-label'],
+      ['x-qm-actor', 'spoof-actor'],
+      ['x-qm-audience', 'spoof-audience'],
+    ];
+    const raw = (headerLines: string[]) => new Promise<string>((resolve, reject) => {
+      const sock = connectTcp(localPort, '127.0.0.1', () => {
+        sock.write([
+          'GET /health HTTP/1.1',
+          `Host: 127.0.0.1:${localPort}`,
+          `Authorization: Bearer ${tokens.personal}`,
+          ...headerLines,
+          '',
+          '',
+        ].join('\r\n'));
+      });
+      const chunks: Buffer[] = [];
+      const timer = setTimeout(() => {
+        sock.destroy();
+        reject(new Error('spoof request timed out'));
+      }, 3_000);
+      sock.on('data', (chunk: Buffer) => {
+        chunks.push(chunk);
+        const text = Buffer.concat(chunks).toString('utf8');
+        if (text.includes('\r\n\r\n')) {
+          clearTimeout(timer);
+          sock.end();
+          resolve(text);
+        }
+      });
+      sock.on('error', error => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+    const allowed = [
+      ['Content-Type', 'application/json'],
+      ['Accept', 'application/json, text/event-stream'],
+      ['Accept-Encoding', 'gzip'],
+      ['User-Agent', 'mcp-client-test'],
+      ['Mcp-Session-Id', 'session-keep'],
+      ['Mcp-Protocol-Version', '2025-06-18'],
+      ['Last-Event-ID', 'event-keep'],
+    ];
+    try {
+      const response = await raw([
+        ...dropped.map(([name, value]) => `${name}: ${value}`),
+        ...allowed.map(([name, value]) => `${name}: ${value}`),
+      ]);
+      expect(response.startsWith('HTTP/1.1 200')).toBe(true);
+      expect(seen.length).toBe(1);
+      const hit = seen[0] ?? {};
+      for (const [name] of dropped) {
+        const key = name.toLowerCase();
+        // The gate's own HTTP client sets Connection. The client's value is not copied.
+        if (key === 'connection') {
+          expect(hit.connection).not.toBe('x-via-connection');
+          expect(String(hit.connection ?? '').includes('x-via-connection')).toBe(false);
+          continue;
+        }
+        expect(hit[key]).toBeUndefined();
+      }
+      for (const [name, value] of allowed) expect(hit[name.toLowerCase()]).toBe(value);
+      const transfer = await raw(['Transfer-Encoding: spoof-transfer']);
+      expect(transfer.startsWith('HTTP/1.1')).toBe(true);
+      for (const item of seen) expect(item['transfer-encoding']).toBeUndefined();
+    } finally {
+      await new Promise<void>(resolve => localGate.close(() => resolve()));
+      await new Promise<void>(resolve => localUpstream.close(() => resolve()));
+    }
+  });
+
+  test('an SSE body that stays quiet past the upstream timeout is not cut', async () => {
+    const upstream = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.flushHeaders();
+      setTimeout(() => {
+        res.write('data: still-open\n\n');
+        res.end();
+      }, 6_000);
+    });
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    const localGate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${(upstream.address() as { port: number }).port}`,
+    });
+    const localPort = await listenGate(localGate);
+    const started = Date.now();
+    try {
+      const text = await new Promise<string>((resolve, reject) => {
+        const req = httpRequest({
+          hostname: '127.0.0.1',
+          port: localPort,
+          path: '/health',
+          method: 'GET',
+          headers: { authorization: `Bearer ${tokens.personal}` },
+        }, response => {
+          const chunks: Buffer[] = [];
+          response.on('data', (chunk: Buffer) => chunks.push(chunk));
+          response.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        });
+        req.on('error', reject);
+        req.end();
+      });
+      expect(Date.now() - started).toBeGreaterThan(5_000);
+      expect(text).toContain('data: still-open');
+    } finally {
+      await new Promise<void>(resolve => localGate.close(() => resolve()));
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
+  }, 12_000);
+
+  test('a client abort clears the upstream timeout', async () => {
+    const opens: number[] = [];
+    const closes: number[] = [];
+    const upstream = createServer((req) => {
+      opens.push(Date.now());
+      req.socket.on('close', () => closes.push(Date.now()));
+    });
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    const localGate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${(upstream.address() as { port: number }).port}`,
+    });
+    const writes: { at: number; status: number }[] = [];
+    localGate.on('request', (_req, res) => {
+      const writeHead = res.writeHead.bind(res);
+      res.writeHead = ((...args: Parameters<typeof writeHead>) => {
+        writes.push({ at: Date.now(), status: Number(args[0]) });
+        return writeHead(...args);
+      }) as typeof res.writeHead;
+    });
+    const localPort = await listenGate(localGate);
+    const started = Date.now();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const client = httpRequest({
+          hostname: '127.0.0.1',
+          port: localPort,
+          path: '/health',
+          method: 'GET',
+          headers: { authorization: `Bearer ${tokens.personal}` },
+        });
+        client.on('error', () => {});
+        client.end();
+        const wait = setInterval(() => {
+          if (opens.length === 0) return;
+          clearInterval(wait);
+          client.destroy();
+          resolve();
+        }, 10);
+        setTimeout(() => {
+          clearInterval(wait);
+          reject(new Error('upstream never saw the request'));
+        }, 2_000);
+      });
+      const aborted = Date.now();
+      await new Promise(resolve => setTimeout(resolve, 5_500));
+      expect(opens.length).toBe(1);
+      expect(closes.length).toBe(1);
+      expect(closes[0]! - aborted).toBeLessThan(1_000);
+      expect(writes.filter(write => write.status === 502 && write.at >= aborted)).toEqual([]);
+      expect(Date.now() - started).toBeGreaterThan(5_000);
+    } finally {
+      await new Promise<void>(resolve => localGate.close(() => resolve()));
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
+  }, 12_000);
+
+  test('a content-encoding other than identity is 415', async () => {
+    const once = (encoding: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port,
+        path: '/health',
+        method: 'GET',
+        headers: {
+          authorization: `Bearer ${tokens.personal}`,
+          'content-encoding': encoding,
+        },
+      }, response => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    const gzip = await once('gzip');
+    expect(gzip.status).toBe(415);
+    expect(gzip.body).toContain('unsupported_content_encoding');
+    expect(gzip.body.length).toBeLessThan(80);
+    const upper = await once('GZIP');
+    expect(upper.status).toBe(415);
+    expect(upper.body).toContain('unsupported_content_encoding');
+    const mixed = await once('identity, gzip');
+    expect(mixed.status).toBe(415);
+    expect(mixed.body).toContain('unsupported_content_encoding');
+    const identity = await once('identity');
+    expect(identity.status).toBe(200);
+    const before = hits.length;
+    const posted = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const payload = '{"ping":true}';
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port,
+        path: '/mcp',
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${tokens.personal}`,
+          'content-type': 'application/json',
+          'content-encoding': 'gzip',
+          'content-length': String(Buffer.byteLength(payload)),
+        },
+      }, response => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+      req.on('error', reject);
+      req.end(payload);
+    });
+    expect(posted.status).toBe(415);
+    expect(posted.body).toContain('unsupported_content_encoding');
+    expect(hits.length).toBe(before);
+  });
+
+  test('mixed-case identity content-encoding is forwarded', async () => {
+    const once = (encoding: string) => new Promise<{ status: number }>((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port,
+        path: '/health',
+        method: 'GET',
+        headers: {
+          authorization: `Bearer ${tokens.personal}`,
+          'content-encoding': encoding,
+        },
+      }, response => {
+        response.resume();
+        response.on('end', () => resolve({ status: response.statusCode ?? 0 }));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    for (const encoding of ['Identity', 'IDENTITY', 'IDENTITY, identity']) {
+      const before = hits.length;
+      const response = await once(encoding);
+      expect(response.status).toBe(200);
+      expect(hits.length).toBe(before + 1);
+    }
+  });
+
   test('forwards a grant access_token from outside the repo and does not log it', async () => {
     const grant = 'gbrain-grant-test-token';
     const dir = mkdtempSync(join(tmpdir(), 'gbrain-grant-'));
@@ -642,6 +979,350 @@ describe('step 4', () => {
     });
     expect(placeholder.status).toBe(1);
     expect(pathInside(join(root, 'personal'), root)).toBe(true);
+  });
+});
+
+interface XmlNode { tag: string; text: string; children: XmlNode[] }
+
+function parseXml(source: string): XmlNode {
+  const xml = source.replace(/<\?xml[^?]*\?>/, '').replace(/<!DOCTYPE[^>]*>/, '').trim();
+  let index = 0;
+  const skip = () => {
+    while (xml[index] === ' ' || xml[index] === '\n' || xml[index] === '\r' || xml[index] === '\t') index += 1;
+  };
+  const parseNode = (): XmlNode => {
+    skip();
+    if (xml[index] !== '<') throw new Error(`expected a tag at ${index}`);
+    index += 1;
+    let tag = '';
+    while (xml[index] && xml[index] !== '>' && xml[index] !== '/' && xml[index] !== ' ' && xml[index] !== '\n') {
+      tag += xml[index];
+      index += 1;
+    }
+    while (xml[index] && xml[index] !== '>' && xml[index] !== '/') index += 1;
+    if (xml[index] === '/') {
+      if (xml[index + 1] !== '>') throw new Error(`unclosed empty tag ${tag}`);
+      index += 2;
+      return { tag, text: '', children: [] };
+    }
+    if (xml[index] !== '>') throw new Error(`unclosed tag ${tag}`);
+    index += 1;
+    const children: XmlNode[] = [];
+    let text = '';
+    while (index < xml.length) {
+      if (xml[index] === '<') {
+        if (xml[index + 1] === '/') {
+          const end = xml.indexOf('>', index + 2);
+          const close = xml.slice(index + 2, end);
+          if (close !== tag) throw new Error(`mismatched ${tag} and ${close}`);
+          index = end + 1;
+          return { tag, text: text.trim(), children };
+        }
+        children.push(parseNode());
+        continue;
+      }
+      text += xml[index];
+      index += 1;
+    }
+    throw new Error(`unclosed ${tag}`);
+  };
+  const root = parseNode();
+  skip();
+  if (index !== xml.length) throw new Error('trailing markup');
+  return root;
+}
+
+function plistDict(root: XmlNode): Map<string, XmlNode> {
+  const dict = root.children.find(node => node.tag === 'dict');
+  if (!dict) throw new Error('plist dict missing');
+  const map = new Map<string, XmlNode>();
+  for (let cursor = 0; cursor < dict.children.length; cursor += 2) {
+    const key = dict.children[cursor];
+    const value = dict.children[cursor + 1];
+    if (!key || key.tag !== 'key' || !value) throw new Error('plist key/value pair is incomplete');
+    map.set(key.text, value);
+  }
+  return map;
+}
+
+describe('launchd plist', () => {
+  const template = readFileSync(join(SCRIPT_DIR, 'launchd', 'com.gbrain.funnel-gate.plist'), 'utf8');
+
+  test('the template is well-formed and keeps absolute-path placeholders', () => {
+    const dict = plistDict(parseXml(template));
+    expect(dict.get('Label')?.text).toBe('com.gbrain.funnel-gate');
+    expect(dict.get('RunAtLoad')?.tag).toBe('true');
+    const keepAlive = dict.get('KeepAlive');
+    expect(keepAlive?.tag).toBe('dict');
+    const keepAliveKeys = new Map<string, XmlNode>();
+    for (let cursor = 0; cursor < (keepAlive?.children.length ?? 0); cursor += 2) {
+      const key = keepAlive?.children[cursor];
+      const value = keepAlive?.children[cursor + 1];
+      if (key?.tag === 'key' && value) keepAliveKeys.set(key.text, value);
+    }
+    expect(keepAliveKeys.get('SuccessfulExit')?.tag).toBe('false');
+    expect(Number(dict.get('ThrottleInterval')?.text)).toBeGreaterThanOrEqual(10);
+    expect(Number(dict.get('ThrottleInterval')?.text)).toBeLessThanOrEqual(30);
+    expect(dict.get('WorkingDirectory')?.text).toBe('__REPO__');
+    const args = dict.get('ProgramArguments')?.children.filter(node => node.tag === 'string').map(node => node.text);
+    expect(args).toEqual([
+      '__BUN__',
+      '__REPO__/scripts/grok-shared-brain/cli-gate.ts',
+      '--tokens',
+      '__HOME__/.gbrain/serve/funnel-tokens.json',
+      '--upstream',
+      'http://127.0.0.1:8766',
+      '--port',
+      '8767',
+    ]);
+    expect(dict.get('StandardOutPath')?.text).toBe('__HOME__/Library/Logs/com.gbrain.funnel-gate.log');
+    expect(dict.get('StandardErrorPath')?.text).toBe('__HOME__/Library/Logs/com.gbrain.funnel-gate.err');
+    expect(template.includes('/bin/bash')).toBe(false);
+    expect(template.includes('tailscale')).toBe(false);
+    expect(template.includes('/Users/')).toBe(false);
+  });
+
+  test('filling the placeholders leaves a parseable agent with no leftovers', () => {
+    const filled = template
+      .split('__BUN__').join('/opt/bun/bun')
+      .split('__REPO__').join('/opt/gbrain')
+      .split('__HOME__').join('/opt/home');
+    expect(filled.includes('__BUN__') || filled.includes('__REPO__') || filled.includes('__HOME__')).toBe(false);
+    const dict = plistDict(parseXml(filled));
+    const args = dict.get('ProgramArguments')?.children.filter(node => node.tag === 'string').map(node => node.text) ?? [];
+    expect(args[0]).toBe('/opt/bun/bun');
+    expect(args[1]).toBe('/opt/gbrain/scripts/grok-shared-brain/cli-gate.ts');
+    expect(dict.get('WorkingDirectory')?.text).toBe('/opt/gbrain');
+    expect(dict.get('StandardErrorPath')?.text.startsWith('/opt/home/Library/Logs/')).toBe(true);
+  });
+});
+
+describe('host guard', () => {
+  const short = shortHostname();
+
+  test('parses host.env the way setup.sh does and names the machine on a mismatch', () => {
+    expect(parseExpectedHost('# comment\n\nGBRAIN_EXPECTED_HOST="quoted-host"\n')).toBe('quoted-host');
+    expect(parseExpectedHost('# only a comment\n')).toBeNull();
+    expect(evaluateHostGuard(null, short).ok).toBe(false);
+    const missingVar = evaluateHostGuard('GBRAIN_EXPECTED_HOST=\n', short);
+    expect(missingVar.ok).toBe(false);
+    if (!missingVar.ok) expect(missingVar.message).toContain('GBRAIN_EXPECTED_HOST is missing');
+    const wrong = evaluateHostGuard('GBRAIN_EXPECTED_HOST=not-this-machine\n', short);
+    expect(wrong).toEqual({ ok: false, status: 0, message: `Wrong machine: ${short}` });
+    expect(evaluateHostGuard(`GBRAIN_EXPECTED_HOST=${short}\n`, short)).toEqual({ ok: true });
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-host-env-'));
+    mkdirSync(join(home, '.gbrain', 'serve'), { recursive: true });
+    const hostEnv = join(home, '.gbrain', 'serve', 'host.env');
+    writeFileSync(hostEnv, `GBRAIN_EXPECTED_HOST=${short}\n`);
+    expect(guardThisHost(home, short)).toEqual({ ok: true });
+    writeFileSync(hostEnv, 'GBRAIN_EXPECTED_HOST=not-this-machine\n');
+    expect(guardThisHost(home, short)).toEqual({ ok: false, status: 0, message: `Wrong machine: ${short}` });
+  });
+
+  test('cli-gate exits on the wrong machine before it listens', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-gate-host-'));
+    mkdirSync(join(home, '.gbrain', 'serve'), { recursive: true });
+    writeFileSync(join(home, '.gbrain', 'serve', 'host.env'), 'GBRAIN_EXPECTED_HOST=not-this-machine\n');
+    const ran = spawnSync(process.execPath, [join(SCRIPT_DIR, 'cli-gate.ts'), '--tokens', join(home, 'missing.json')], {
+      encoding: 'utf8',
+      timeout: 8_000,
+      env: { ...process.env, HOME: home },
+    });
+    expect(ran.status).toBe(0);
+    expect(ran.stderr).toContain(`Wrong machine: ${short}`);
+    expect(ran.stderr.includes('listening')).toBe(false);
+  });
+
+  test('an unreadable host.env is status 1 and does not throw a stack', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-host-unreadable-'));
+    mkdirSync(join(home, '.gbrain', 'serve', 'host.env'), { recursive: true });
+    const result = guardThisHost(home, short);
+    expect(result).toEqual({ ok: false, status: 1, message: 'refusing: unreadable ~/.gbrain/serve/host.env' });
+    expect(JSON.stringify(result).includes('\n')).toBe(false);
+  });
+});
+
+describe('upstream token files', () => {
+  test('the setter writes absolute paths, mode 0600, and the gate forwards access_token without logging it', async () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'gbrain-upstream-files-'));
+    const repo = repoRootFrom(import.meta.dir);
+    const generated = generateTokens();
+    const destination = join(scratch, 'funnel-tokens.json');
+    writeTokenFile(destination, generated.config, repo);
+    const grants = join(scratch, 'grants');
+    mkdirSync(grants, { mode: 0o700 });
+    const ran = spawnSync(process.execPath, [
+      join(SCRIPT_DIR, 'cli-set-upstream-tokens.ts'),
+      '--tokens', destination,
+      '--grants', grants,
+    ], { encoding: 'utf8' });
+    expect(ran.status).toBe(0);
+    expect(ran.stdout).toContain('updated upstream_token_file for personal, business, hermes');
+    expect(ran.stdout.includes('access_token')).toBe(false);
+    expect(ran.stderr.includes('access_token')).toBe(false);
+    expect(statSync(destination).mode & 0o777).toBe(0o600);
+    const parsed = parseFunnelConfig(JSON.parse(readFileSync(destination, 'utf8')));
+    expect(parsed.clients.personal?.upstream_token_file).toBe(join(grants, 'personal.json'));
+    expect(parsed.clients.business?.upstream_token_file).toBe(join(grants, 'business.json'));
+    expect(parsed.clients.hermes?.upstream_token_file).toBe(join(grants, 'hermes.json'));
+    expect(() => withUpstreamTokenFiles(generated.config, repo, repo)).toThrow(/outside the repo/);
+
+    const grant = 'grant-credential-do-not-log';
+    writeFileSync(join(grants, 'personal.json'), JSON.stringify({ access_token: grant }), { mode: 0o600 });
+    const logs: string[] = [];
+    const hits: string[] = [];
+    const upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+      hits.push(String(req.headers.authorization ?? ''));
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    const server = createFunnelGate({
+      config: parsed,
+      upstreamBaseUrl: `http://127.0.0.1:${(upstream.address() as { port: number }).port}`,
+      log: line => logs.push(line),
+      repoRoot: repo,
+    });
+    const port = await listenGate(server);
+    const response = await call(port, 'GET', '/health', generated.plaintext.personal);
+    expect(response.status).toBe(200);
+    expect(hits).toEqual([`Bearer ${grant}`]);
+    const joined = logs.join('\n');
+    expect(joined.includes(grant)).toBe(false);
+    expect(joined.includes(generated.plaintext.personal)).toBe(false);
+    expect(joined.toLowerCase().includes('authorization')).toBe(false);
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await new Promise<void>(resolve => upstream.close(() => resolve()));
+  });
+});
+
+describe('gate stays up when upstream is down', () => {
+  test('a bearer request is 502, the token is not logged, and the next request is proxied', async () => {
+    const generated = generateTokens();
+    const bearer = generated.plaintext.personal;
+    const closed = createServer((_req, res) => { res.end(); });
+    await new Promise<void>(resolve => closed.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (closed.address() as { port: number }).port;
+    await new Promise<void>(resolve => closed.close(() => resolve()));
+    const logs: string[] = [];
+    const gate = createFunnelGate({
+      config: generated.config,
+      upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}`,
+      log: line => logs.push(line),
+    });
+    const port = await listenGate(gate);
+    const down = await call(port, 'GET', '/health', bearer);
+    expect(down.status).toBe(502);
+    expect(down.text).toContain('bad_gateway');
+    const joined = logs.join('\n');
+    expect(joined.includes(bearer)).toBe(false);
+    expect(joined.toLowerCase().includes('authorization')).toBe(false);
+    expect(joined).toContain('status=502');
+
+    const hits: string[] = [];
+    const upstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+      hits.push(String(req.headers.authorization ?? ''));
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    await new Promise<void>((resolve, reject) => {
+      upstream.once('error', reject);
+      upstream.listen(upstreamPort, '127.0.0.1', resolve);
+    });
+    const again = await call(port, 'GET', '/health', bearer);
+    expect(again.status).toBe(200);
+    expect(hits).toEqual(['']);
+    expect(logs.join('\n').includes(bearer)).toBe(false);
+    await new Promise<void>(resolve => gate.close(() => resolve()));
+    await new Promise<void>(resolve => upstream.close(() => resolve()));
+  });
+
+  test('cli-gate listens while the upstream is down and does not log the bearer', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-gate-up-'));
+    const repo = repoRootFrom(import.meta.dir);
+    mkdirSync(join(home, '.gbrain', 'serve'), { recursive: true });
+    const short = shortHostname();
+    writeFileSync(join(home, '.gbrain', 'serve', 'host.env'), `GBRAIN_EXPECTED_HOST=${short}\n`);
+    const generated = generateTokens();
+    const destination = join(home, 'funnel-tokens.json');
+    writeTokenFile(destination, generated.config, repo);
+    const closed = createServer((_req, res) => { res.end(); });
+    await new Promise<void>(resolve => closed.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = (closed.address() as { port: number }).port;
+    await new Promise<void>(resolve => closed.close(() => resolve()));
+    const child = spawn(process.execPath, [
+      join(SCRIPT_DIR, 'cli-gate.ts'),
+      '--tokens', destination,
+      '--upstream', `http://127.0.0.1:${upstreamPort}`,
+      '--port', '0',
+    ], { env: { ...process.env, HOME: home }, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    const started = Date.now();
+    while (!stderr.includes('listening on 127.0.0.1:') && Date.now() - started < 10_000) {
+      if (child.exitCode !== null) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    try {
+      expect(child.exitCode).toBeNull();
+      const match = /listening on 127\.0\.0\.1:(\d+)/.exec(stderr);
+      expect(match?.[1]).toBeTruthy();
+      const response = await call(Number(match?.[1]), 'GET', '/health', generated.plaintext.personal);
+      expect(response.status).toBe(502);
+      expect(stderr.includes(generated.plaintext.personal)).toBe(false);
+      expect(stderr.toLowerCase().includes('authorization')).toBe(false);
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+});
+
+describe('launch agent docs', () => {
+  test('install blocks are guarded and do not publish a hostname or a token', () => {
+    const readme = readFileSync(join(import.meta.dir, '../docs/grok/shared-brain/README.md'), 'utf8');
+    const section = readme.split('## LaunchAgent')[1]?.split('## Turn Funnel on')[0] ?? '';
+    expect(section.length).toBeGreaterThan(0);
+    const blocks = [...section.matchAll(/```bash\n([\s\S]*?)```/g)].map(match => match[1] ?? '');
+    expect(blocks.length).toBeGreaterThanOrEqual(8);
+    for (const block of blocks) {
+      expect(block.startsWith('(\n. ~/.gbrain/serve/host.env || exit 1\n')).toBe(true);
+      expect(block.trimEnd().endsWith(')')).toBe(true);
+      expect(block).toContain('hostname -s');
+      expect(block).toContain('"$host" != "$GBRAIN_EXPECTED_HOST"');
+      expect(block).toContain('Wrong machine: $host');
+      expect(block.indexOf('. ~/.gbrain/serve/host.env')).toBeLessThan(block.indexOf('set -euo pipefail') === -1 ? block.length : block.indexOf('set -euo pipefail'));
+    }
+    expect(section).toContain('REPO="$HOME/personalgrok/gbrain"');
+    expect(section).toContain('checkout not found: $REPO/scripts/grok-shared-brain/cli-gate.ts');
+    expect(section).toContain('cd "$REPO"');
+    expect(section).toContain('--json >/dev/null');
+    expect(section).toContain('echo "granted personal; private handoff is $HOME/.gbrain/serve/grants/personal.json"');
+    expect(section.includes('Create that file first')).toBe(false);
+    expect(section.includes('REPO="$HOME/gbrain"')).toBe(false);
+    expect(section).toContain('gbrain mcp grant personal --harness grok-bot --profile memory-writer');
+    expect(section).toContain('gbrain mcp grant business --harness grok-bot --profile memory-writer');
+    expect(section).toContain('gbrain mcp grant hermes --harness grok-bot --profile memory-writer');
+    expect(section).toContain('--credentials-out "$HOME/.gbrain/serve/grants/personal.json"');
+    expect(section).toContain('chmod 700 "$HOME/.gbrain/serve/grants"');
+    expect(section).toContain('chmod 600 "$HOME/.gbrain/serve/grants/personal.json"');
+    expect(section).toContain('bun scripts/grok-shared-brain/cli-set-upstream-tokens.ts');
+    expect(section).toContain("s#__BUN__#${BUN}#g");
+    expect(section).toContain('FAIL: leftover placeholders');
+    expect(section).toContain('plutil -lint');
+    expect(section).toContain('launchctl bootout gui/$(id -u)/com.gbrain.funnel-gate || true');
+    expect(section).toContain('launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.gbrain.funnel-gate.plist"');
+    expect(section).toContain("launchctl print gui/$(id -u)/com.gbrain.funnel-gate | grep -E 'state|pid'");
+    expect(section).toContain("curl -s -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8767/health");
+    expect(section).toContain('Full Disk Access');
+    expect(section).toContain('Network Volumes');
+    expect(section.includes('/Users/')).toBe(false);
+    for (const block of blocks) expect(block.includes('tailscale')).toBe(false);
+    for (const file of readScriptTree(SCRIPT_DIR)) {
+      expect(file.text.includes('tailscale serve')).toBe(false);
+    }
   });
 });
 

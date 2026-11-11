@@ -79,11 +79,13 @@ File shape:
 
 After `gbrain mcp grant` writes a credential JSON, set `upstream_token_file` on that client to the absolute path of the JSON (outside the repo). The gate reads `access_token` from that file when it proxies to `127.0.0.1:8766` and does not write the grant token into the funnel file or the log. Loopback thin CLIs in the design still talk to port 8766 directly and do not use this gate.
 
-Start the gate (still does not run Tailscale):
+Start the gate (still does not run Tailscale). The process listens even when port 8766 is down; a proxied call then returns 502 and the next request tries again:
 
 ```bash
 bun scripts/grok-shared-brain/cli-gate.ts --tokens "$HOME/.gbrain/serve/funnel-tokens.json" --upstream http://127.0.0.1:8766 --port 8767
 ```
+
+Login and reboot use the LaunchAgent `com.gbrain.funnel-gate` (`scripts/grok-shared-brain/launchd/com.gbrain.funnel-gate.plist`, `RunAtLoad`, `KeepAlive` with `SuccessfulExit` false, `ThrottleInterval` 15). Copyable install and uninstall steps are in `docs/grok/shared-brain/README.md`. The gate reads `GBRAIN_EXPECTED_HOST` from `~/.gbrain/serve/host.env` and, on a mismatch, logs `Wrong machine:` plus the short hostname and exits 0 so launchd does not restart it. A non-zero exit still restarts. The plist stores no token and no hostname. Nothing in the kit runs `tailscale funnel` or `tailscale serve`.
 
 ## QA lows
 
