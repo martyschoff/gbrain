@@ -840,4 +840,36 @@ describe('install and verify scripts', () => {
     expect(again.status).toBe(0);
     expect(readFileSync(join(home, '.gbrain/bot-loader/config.json'), 'utf8')).toContain('bot-a');
   });
+
+  test('install skips a symlink to the example share root before starting the loader', () => {
+    const home = temp('gbrain-install-link-');
+    const example = join(home, 'mnt/netfs');
+    const link = join(home, 'share-link');
+    mkdirSync(example, { recursive: true });
+    symlinkSync(example, link);
+    mkdirSync(join(home, '.gbrain/serve'), { recursive: true });
+    mkdirSync(join(home, '.gbrain/bot-loader'), { recursive: true });
+    mkdirSync(join(home, '.bun/bin'), { recursive: true });
+    writeFileSync(join(home, '.gbrain/serve/host.env'), `GBRAIN_EXPECTED_HOST=${hostName()}\n`);
+    const cfg = join(home, '.gbrain/bot-loader/config.json');
+    writeFileSync(cfg, JSON.stringify({
+      share_root: link,
+      groups: [{ id: 'personal', source: 'personal', target_root: join(link, 'personal'), bots: [{ id: 'test-bot-one', inputs: [] }] }],
+    }));
+    const bin = join(home, 'bin');
+    mkdirSync(bin, { recursive: true });
+    const gbrain = join(bin, 'gbrain');
+    writeFileSync(gbrain, '#!/bin/sh\nexit 0\n');
+    writeFileSync(join(home, '.bun/bin/bun'), '#!/bin/sh\necho ran-loader >> "$HOME/loader-ran"\nexit 0\n');
+    writeFileSync(join(bin, 'plutil'), '#!/bin/sh\nexit 0\n');
+    writeFileSync(join(bin, 'launchctl'), '#!/bin/sh\nexit 0\n');
+    for (const file of [gbrain, join(home, '.bun/bin/bun'), join(bin, 'plutil'), join(bin, 'launchctl')]) chmodSync(file, 0o755);
+    const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, GBRAIN_REPO: REPO, GBRAIN_INSTALL: INSTALL };
+    const result = spawnSync('unshare', ['--user', '--map-root-user', '--mount', 'bash', '-c', 'mount -t tmpfs tmpfs "$HOME/mnt/netfs" && exec bash "$GBRAIN_INSTALL"'], { encoding: 'utf8', env });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`edit ${cfg}, then rerun this block`);
+    expect(existsSync(join(home, 'loader-ran'))).toBe(false);
+    expect(readFileSync(cfg, 'utf8')).toContain('test-bot-one');
+    expect(readFileSync(cfg, 'utf8')).not.toContain('bot-a');
+  });
 });

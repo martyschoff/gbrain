@@ -55,8 +55,8 @@ if [ -z "$SHARE" ] || [ ! -d "$SHARE" ]; then
   echo "bot-loader: share root is not a mounted filesystem; nothing else was changed" >&2
   exit 1
 fi
-dev=$(stat -c %d "$SHARE" 2>/dev/null || stat -f %d "$SHARE")
-parent=$(stat -c %d "$(dirname "$SHARE")" 2>/dev/null || stat -f %d "$(dirname "$SHARE")")
+dev=$(stat -L -c %d "$SHARE" 2>/dev/null || stat -L -f %d "$SHARE")
+parent=$(stat -L -c %d "$(dirname "$SHARE")" 2>/dev/null || stat -L -f %d "$(dirname "$SHARE")")
 if [ "$dev" = "$parent" ]; then
   echo "bot-loader: share root is not a mounted filesystem; nothing else was changed" >&2
   exit 1

@@ -69,8 +69,8 @@ if [ -z "$SHARE" ] || [ ! -d "$SHARE" ]; then
   echo "bot-loader: share root is not a mounted filesystem; nothing else was changed" >&2
   exit 1
 fi
-dev=$(stat -c %d "$SHARE" 2>/dev/null || stat -f %d "$SHARE")
-parent=$(stat -c %d "$(dirname "$SHARE")" 2>/dev/null || stat -f %d "$(dirname "$SHARE")")
+dev=$(stat -L -c %d "$SHARE" 2>/dev/null || stat -L -f %d "$SHARE")
+parent=$(stat -L -c %d "$(dirname "$SHARE")" 2>/dev/null || stat -L -f %d "$(dirname "$SHARE")")
 if [ "$dev" = "$parent" ]; then
   echo "bot-loader: share root is not a mounted filesystem; nothing else was changed" >&2
   exit 1
@@ -249,7 +249,7 @@ The finance source is a plain directory (`sources add --force`, no remote). A gr
 
 | Field | Meaning |
 | --- | --- |
-| `share_root` | Mount that must be a real filesystem mount. The example value `~/mnt/netfs`, and the same path expanded under the home directory, refuses the run unless `share_root_confirmed` is true. |
+| `share_root` | Mount that must be a real filesystem mount. An unconfirmed example share root (`~/mnt/netfs`, including a path whose realpath is that directory) refuses the run unless `share_root_confirmed` is true. |
 | `state_path` | Manifest. Default `~/.gbrain/bot-loader/state.json`. |
 | `summary_path` | Last summary. Default `~/.gbrain/bot-loader/last-summary.txt`. |
 | `lock_path` | Overlap lock. Default `~/.gbrain/bot-loader/run.lock`. |
