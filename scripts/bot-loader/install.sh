@@ -150,7 +150,11 @@ share = cfg.get("share_root")
 if not isinstance(share, str):
     sys.exit(1)
 expanded = os.path.abspath(os.path.expanduser(share))
-if share == "~/mnt/netfs" or expanded == os.path.abspath(os.path.join(home, "mnt/netfs")):
+example = os.path.abspath(os.path.join(home, "mnt/netfs"))
+same = False
+if os.path.exists(expanded) and os.path.exists(example):
+    same = os.path.realpath(expanded) == os.path.realpath(example)
+if share == "~/mnt/netfs" or expanded == example or same:
     sys.exit(0)
 sys.exit(1)
 PY

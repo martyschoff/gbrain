@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { expandHome } from './files.ts';
 
@@ -65,6 +65,16 @@ interface RawGroup {
   ensure_source?: unknown;
   forbid_git?: unknown;
   bots?: unknown;
+}
+
+/** True when both paths exist and name the same directory after symlinks. */
+function sameRealpath(left: string, right: string): boolean {
+  if (!existsSync(left) || !existsSync(right)) return false;
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    return false;
+  }
 }
 
 function asString(value: unknown, label: string): string {
@@ -167,7 +177,8 @@ export function loadConfig(path: string, home: string): LoaderConfig {
   }
   assertRoutes(groups);
   const placeholderBot = groups.flatMap((group) => group.bots).find((bot) => PLACEHOLDER_BOTS.has(bot.id));
-  const exampleShare = !shareConfirmed && (rawShare === EXAMPLE_SHARE || shareRoot === resolve(join(home, 'mnt/netfs')));
+  const exampleRoot = resolve(join(home, 'mnt/netfs'));
+  const exampleShare = !shareConfirmed && (rawShare === EXAMPLE_SHARE || shareRoot === exampleRoot || sameRealpath(shareRoot, exampleRoot));
   const placeholder = placeholderBot
     ? `bot id ${placeholderBot.id} is an example placeholder`
     : raw.includes('__SET_ME__')

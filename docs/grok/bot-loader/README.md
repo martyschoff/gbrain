@@ -8,7 +8,7 @@ Hosted GBrain is at [gbrain.io](https://gbrain.io/cli?ref=agents-md). This loade
 
 ## Install or upgrade
 
-Upgrade is this same block after `git pull` on this branch. It runs in a subshell. The first check is the hostname guard. It copies the example config only when `~/.gbrain/bot-loader/config.json` is missing, and it never replaces an existing config with the example. It resolves `gbrain` with `command -v gbrain`, otherwise `~/.bun/bin/gbrain`, writes that absolute path into `gbrain_bin`, and stops if neither exists. When the config still contains `bot-a`, `bot-b`, `fin-bot`, or `__SET_ME__`, the block skips the immediate run and prints `edit <config path>, then rerun this block`.
+Upgrade is this same block after `git pull` on this branch. It runs in a subshell. The first check is the hostname guard. It copies the example config only when `~/.gbrain/bot-loader/config.json` is missing, and it never replaces an existing config with the example. It resolves `gbrain` with `command -v gbrain`, otherwise `~/.bun/bin/gbrain`, writes that absolute path into `gbrain_bin`, and stops if neither exists. When the config still contains `bot-a`, `bot-b`, `fin-bot`, `__SET_ME__`, or an unconfirmed example share root (`~/mnt/netfs`, including a path whose realpath is that directory), the block skips the immediate run and prints `edit <config path>, then rerun this block`.
 
 ```bash
 (
@@ -164,7 +164,11 @@ share = cfg.get("share_root")
 if not isinstance(share, str):
     sys.exit(1)
 expanded = os.path.abspath(os.path.expanduser(share))
-if share == "~/mnt/netfs" or expanded == os.path.abspath(os.path.join(home, "mnt/netfs")):
+example = os.path.abspath(os.path.join(home, "mnt/netfs"))
+same = False
+if os.path.exists(expanded) and os.path.exists(example):
+    same = os.path.realpath(expanded) == os.path.realpath(example)
+if share == "~/mnt/netfs" or expanded == example or same:
     sys.exit(0)
 sys.exit(1)
 PY
@@ -185,7 +189,7 @@ fi
 bash "$HOME/personalgrok/gbrain/scripts/bot-loader/verify.sh"
 ```
 
-That runs the hostname guard first, then prints `PASS` or `FAIL` for the launchd job, a successful status file newer than 36 hours, and an empty `git -C <finance> remote` (or no `.git`). It prints the count lines and exits non-zero if any check failed. A host mismatch leaves `bot-loader: skipped: wrong host` in the status file, so the status check fails.
+That runs the hostname guard first, then prints `PASS` or `FAIL` for the launchd job, a successful status file newer than 36 hours, an empty `git -C <finance> remote` (or no `.git`), and stuck pendings. `FAIL stuck pending` means the status file contains `WARN stuck pending`. It prints the count lines and exits non-zero if any check failed. A host mismatch leaves `bot-loader: skipped: wrong host` in the status file, so the status check fails.
 
 ## Uninstall
 

@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
@@ -542,6 +542,59 @@ describe('counts, placeholders, and the lock', () => {
     const allowed = await runLoader({ config: confirmed, hostname: 'test-host', isMounted: () => true, brain: fakeBrain().brain });
     expect(allowed.exitCode).toBe(0);
     expect(existsSync(join(home, 'personal/alpha/note.md'))).toBe(true);
+  });
+
+  test('a symlink to the example share root is refused unless it is confirmed', async () => {
+    const home = temp('gbrain-share-link-');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const example = join(home, 'mnt/netfs');
+    const other = join(home, 'real-share');
+    mkdirSync(example, { recursive: true });
+    mkdirSync(other, { recursive: true });
+    const toExample = join(home, 'link-example');
+    const toOther = join(home, 'link-other');
+    symlinkSync(example, toExample);
+    symlinkSync(other, toOther);
+    write(join(home, 'in/note.md'), 'hello\n');
+    const writeCfg = (share: string, confirmed: boolean) => {
+      const path = join(home, `cfg-${confirmed ? 'yes' : 'no'}-${share.split('/').pop()}.json`);
+      writeFileSync(path, JSON.stringify({
+        share_root: share,
+        ...(confirmed ? { share_root_confirmed: true } : {}),
+        state_path: join(home, `state-${confirmed ? 'yes' : 'no'}-${share.split('/').pop()}.json`),
+        summary_path: join(home, 'summary.txt'),
+        lock_path: join(home, `lock-${share.split('/').pop()}.lock`),
+        host_env: join(home, 'host.env'),
+        gbrain_bin: '/usr/bin/gbrain',
+        groups: [{
+          id: 'personal',
+          source: 'personal',
+          target_root: join(share, 'personal'),
+          ensure_source: false,
+          forbid_git: false,
+          extensions: ['.md'],
+          bots: [{ id: 'alpha', inputs: [{ path: join(home, 'in'), required: false }] }],
+        }],
+      }));
+      return loadConfig(path, home);
+    };
+    const linked = writeCfg(toExample, false);
+    expect(linked.placeholder).toContain('share_root is the example');
+    const refused = await runLoader({ config: linked, hostname: 'test-host', isMounted: () => true, brain: fakeBrain().brain });
+    expect(refused.exitCode).toBe(1);
+    expect(existsSync(join(example, 'personal/alpha/note.md'))).toBe(false);
+
+    const confirmed = writeCfg(toExample, true);
+    expect(confirmed.placeholder).toBeNull();
+    const allowed = await runLoader({ config: confirmed, hostname: 'test-host', isMounted: () => true, brain: fakeBrain().brain });
+    expect(allowed.exitCode).toBe(0);
+    expect(existsSync(join(example, 'personal/alpha/note.md'))).toBe(true);
+
+    const different = writeCfg(toOther, false);
+    expect(different.placeholder).toBeNull();
+    const elsewhere = await runLoader({ config: different, hostname: 'test-host', isMounted: () => true, brain: fakeBrain().brain });
+    expect(elsewhere.exitCode).toBe(0);
+    expect(existsSync(join(other, 'personal/alpha/note.md'))).toBe(true);
   });
 
   test('sources add is recorded and not spawned again', async () => {
