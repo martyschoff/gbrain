@@ -717,6 +717,32 @@ describe('funnel gate', () => {
     expect(hits.length).toBe(before);
   });
 
+  test('mixed-case identity content-encoding is forwarded', async () => {
+    const once = (encoding: string) => new Promise<{ status: number }>((resolve, reject) => {
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port,
+        path: '/health',
+        method: 'GET',
+        headers: {
+          authorization: `Bearer ${tokens.personal}`,
+          'content-encoding': encoding,
+        },
+      }, response => {
+        response.resume();
+        response.on('end', () => resolve({ status: response.statusCode ?? 0 }));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    for (const encoding of ['Identity', 'IDENTITY', 'IDENTITY, identity']) {
+      const before = hits.length;
+      const response = await once(encoding);
+      expect(response.status).toBe(200);
+      expect(hits.length).toBe(before + 1);
+    }
+  });
+
   test('forwards a grant access_token from outside the repo and does not log it', async () => {
     const grant = 'gbrain-grant-test-token';
     const dir = mkdtempSync(join(tmpdir(), 'gbrain-grant-'));
