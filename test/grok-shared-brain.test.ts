@@ -602,6 +602,63 @@ describe('funnel gate', () => {
     }
   }, 12_000);
 
+  test('a client abort clears the upstream timeout', async () => {
+    const opens: number[] = [];
+    const closes: number[] = [];
+    const upstream = createServer((req) => {
+      opens.push(Date.now());
+      req.socket.on('close', () => closes.push(Date.now()));
+    });
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    const localGate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${(upstream.address() as { port: number }).port}`,
+    });
+    const writes: { at: number; status: number }[] = [];
+    localGate.on('request', (_req, res) => {
+      const writeHead = res.writeHead.bind(res);
+      res.writeHead = ((...args: Parameters<typeof writeHead>) => {
+        writes.push({ at: Date.now(), status: Number(args[0]) });
+        return writeHead(...args);
+      }) as typeof res.writeHead;
+    });
+    const localPort = await listenGate(localGate);
+    const started = Date.now();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const client = httpRequest({
+          hostname: '127.0.0.1',
+          port: localPort,
+          path: '/health',
+          method: 'GET',
+          headers: { authorization: `Bearer ${tokens.personal}` },
+        });
+        client.on('error', () => {});
+        client.end();
+        const wait = setInterval(() => {
+          if (opens.length === 0) return;
+          clearInterval(wait);
+          client.destroy();
+          resolve();
+        }, 10);
+        setTimeout(() => {
+          clearInterval(wait);
+          reject(new Error('upstream never saw the request'));
+        }, 2_000);
+      });
+      const aborted = Date.now();
+      await new Promise(resolve => setTimeout(resolve, 5_500));
+      expect(opens.length).toBe(1);
+      expect(closes.length).toBe(1);
+      expect(closes[0]! - aborted).toBeLessThan(1_000);
+      expect(writes.filter(write => write.status === 502 && write.at >= aborted)).toEqual([]);
+      expect(Date.now() - started).toBeGreaterThan(5_000);
+    } finally {
+      await new Promise<void>(resolve => localGate.close(() => resolve()));
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
+  }, 12_000);
+
   test('a content-encoding other than identity is 415', async () => {
     const once = (encoding: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
       const req = httpRequest({
@@ -625,8 +682,39 @@ describe('funnel gate', () => {
     expect(gzip.status).toBe(415);
     expect(gzip.body).toContain('unsupported_content_encoding');
     expect(gzip.body.length).toBeLessThan(80);
+    const upper = await once('GZIP');
+    expect(upper.status).toBe(415);
+    expect(upper.body).toContain('unsupported_content_encoding');
+    const mixed = await once('identity, gzip');
+    expect(mixed.status).toBe(415);
+    expect(mixed.body).toContain('unsupported_content_encoding');
     const identity = await once('identity');
     expect(identity.status).toBe(200);
+    const before = hits.length;
+    const posted = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const payload = '{"ping":true}';
+      const req = httpRequest({
+        hostname: '127.0.0.1',
+        port,
+        path: '/mcp',
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${tokens.personal}`,
+          'content-type': 'application/json',
+          'content-encoding': 'gzip',
+          'content-length': String(Buffer.byteLength(payload)),
+        },
+      }, response => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer) => chunks.push(chunk));
+        response.on('end', () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
+      });
+      req.on('error', reject);
+      req.end(payload);
+    });
+    expect(posted.status).toBe(415);
+    expect(posted.body).toContain('unsupported_content_encoding');
+    expect(hits.length).toBe(before);
   });
 
   test('forwards a grant access_token from outside the repo and does not log it', async () => {

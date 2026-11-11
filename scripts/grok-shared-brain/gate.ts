@@ -201,16 +201,33 @@ function proxy(
   });
   // Five seconds covers connect and the response headers only. MCP SSE stays
   // open and can be quiet for longer than that; leaving the timer on would
-  // cut the body. Clearing it once headers arrive keeps the stream intact.
-  upstreamReq.setTimeout(5_000, () => {
+  // cut the body. Drop the timer and its listener once headers arrive, the
+  // upstream errors, or the client aborts or closes, so it cannot fire later.
+  const onTimeout = () => {
     upstreamReq.destroy();
     fail(502);
-  });
-  upstreamReq.on('response', () => {
+  };
+  upstreamReq.setTimeout(5_000, onTimeout);
+  let clientGone = false;
+  const disarm = () => {
     upstreamReq.setTimeout(0);
-  });
+    upstreamReq.removeListener('timeout', onTimeout);
+  };
+  const onClientGone = () => {
+    if (clientGone) return;
+    clientGone = true;
+    disarm();
+    if (!res.writableFinished) upstreamReq.destroy();
+  };
+  upstreamReq.on('response', disarm);
   upstreamReq.on('error', () => {
-    fail(502);
+    disarm();
+    if (!clientGone) fail(502);
+  });
+  req.on('aborted', onClientGone);
+  res.on('close', () => {
+    disarm();
+    if (!res.writableFinished) onClientGone();
   });
   upstreamReq.end(body);
 }
