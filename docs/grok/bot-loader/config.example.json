@@ -1,0 +1,58 @@
+{
+  "share_root": "~/mnt/netfs",
+  "state_path": "~/.gbrain/bot-loader/state.json",
+  "summary_path": "~/.gbrain/bot-loader/last-summary.txt",
+  "lock_path": "~/.gbrain/bot-loader/run.lock",
+  "host_env": "~/.gbrain/serve/host.env",
+  "operator": "__SET_ME__",
+  "gbrain_bin": "gbrain",
+  "max_bytes": 1048576,
+  "csv_max_rows": 500,
+  "box_export_max_age_hours": 36,
+  "box_export_dir": "<share>/personalgrok/gbrain/_box-export",
+  "groups": [
+    {
+      "id": "personal",
+      "source": "personal",
+      "target_root": "<share>/personalgrok/gbrain/personal",
+      "ensure_source": false,
+      "forbid_git": false,
+      "extensions": [".md", ".txt", ".json", ".yaml", ".yml"],
+      "bots": [
+        {
+          "id": "bot-a",
+          "inputs": [
+            { "path": "<share>/personalgrok/bot-a", "required": false },
+            { "path": "<share>/personalgrok/gbrain/_box-export/bot-a", "required": false, "role": "box-export" },
+            { "path": "<share>/personalgrok/bot-a/legacy", "required": false }
+          ]
+        },
+        {
+          "id": "bot-b",
+          "inputs": [
+            { "path": "<share>/personalgrok/bot-b", "required": false },
+            { "path": "<share>/personalgrok/gbrain/_box-export/bot-b", "required": false, "role": "box-export" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "finance",
+      "source": "finance",
+      "target_root": "<share>/personalgrok/gbrain/finance",
+      "ensure_source": true,
+      "forbid_git": true,
+      "extensions": [".md", ".txt", ".json", ".yaml", ".yml", ".csv"],
+      "bots": [
+        {
+          "id": "fin-bot",
+          "inputs": [
+            { "path": "<share>/personalgrok/fin-bot", "required": false },
+            { "path": "<share>/personalgrok/gbrain/_box-export/fin-bot", "required": false, "role": "box-export" },
+            { "path": "<share>/personalgrok/fin-bot/feeds", "required": false }
+          ]
+        }
+      ]
+    }
+  ]
+}

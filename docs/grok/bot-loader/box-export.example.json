@@ -1,0 +1,7 @@
+{
+  "bots": {
+    "bot-a": "/var/lib/agent-data/bot-a",
+    "bot-b": "/var/lib/agent-data/bot-b",
+    "fin-bot": "/var/lib/agent-data/fin-bot"
+  }
+}
