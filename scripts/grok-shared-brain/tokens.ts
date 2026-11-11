@@ -7,7 +7,7 @@
  * digests so length and mismatch do not short-circuit on the secret.
  */
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, fchmodSync, fsyncSync, mkdirSync, openSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fchmodSync, fsyncSync, mkdirSync, openSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
@@ -147,6 +147,13 @@ export function parseFunnelConfig(raw: unknown): FunnelConfig {
       throw new Error(`client ${id} must be allowed health and mcp`);
     }
   }
+  const hashes = new Map<string, string>();
+  for (const [name, row] of Object.entries(clients)) {
+    const digest = row.token_sha256.toLowerCase();
+    const prior = hashes.get(digest);
+    if (prior) throw new Error(`duplicate token_sha256 for clients ${prior}, ${name}`);
+    hashes.set(digest, name);
+  }
   return {
     version: 1,
     funnel_enabled: doc.funnel_enabled,
@@ -196,16 +203,28 @@ export function writeTokenFile(destination: string, config: FunnelConfig, repoRo
   if (!isAbsolute(destination)) throw new Error('token file path must be absolute');
   if (pathInside(destination, repoRoot)) throw new Error('refusing to write funnel tokens inside the repo');
   const serialized = `${JSON.stringify(config, null, 2)}\n`;
-  mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
-  try { chmodSync(dirname(destination), 0o700); } catch { /* the create above sets the mode when the directory is new */ }
-  const fd = openSync(destination, 'w', 0o600);
+  const directory = dirname(destination);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try { chmodSync(directory, 0o700); } catch { /* the create above sets the mode when the directory is new */ }
+  const temporary = join(directory, `.funnel-tokens.${randomBytes(8).toString('hex')}.tmp`);
+  const fd = openSync(temporary, 'wx', 0o600);
   try {
     fchmodSync(fd, 0o600);
     writeSync(fd, serialized);
     fsyncSync(fd);
-  } finally {
+  } catch (error) {
     closeSync(fd);
+    try { unlinkSync(temporary); } catch { /* the temp is not the token file */ }
+    throw error;
   }
+  closeSync(fd);
+  try {
+    renameSync(temporary, destination);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* the temp is not the token file */ }
+    throw error;
+  }
+  try { chmodSync(destination, 0o600); } catch { /* the temp file was created mode 0600 */ }
 }
 
 export interface AuthOk { ok: true; client: string; record: ClientRecord }

@@ -5,7 +5,8 @@
 import { createHash } from 'node:crypto';
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { connect as connectTcp } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
@@ -83,6 +84,36 @@ describe('funnel tokens', () => {
     const generated = generateTokens();
     generated.config.clients.personal!.write = ['personal', 'shared'];
     expect(() => parseFunnelConfig(generated.config)).toThrow(/must not write shared/);
+  });
+
+  test('parser rejects a duplicate token hash and does not show the hash', () => {
+    const generated = generateTokens();
+    const hash = generated.config.clients.personal!.token_sha256;
+    generated.config.clients.business!.token_sha256 = hash.toUpperCase();
+    expect(() => parseFunnelConfig(generated.config)).toThrow(/duplicate token_sha256 for clients personal, business/);
+    try {
+      parseFunnelConfig(generated.config);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      expect(message.includes(hash.toLowerCase())).toBe(false);
+      expect(message.includes(hash.toUpperCase())).toBe(false);
+    }
+  });
+
+  test('writeTokenFile replaces via a 0600 temp file in the same directory', () => {
+    const generated = generateTokens();
+    const destination = join(scratch, 'atomic.json');
+    const repo = repoRootFrom(import.meta.dir);
+    writeTokenFile(destination, generated.config, repo);
+    const first = statSync(destination);
+    expect(first.mode & 0o777).toBe(0o600);
+    generated.config.rate_limit.max = 7;
+    writeTokenFile(destination, generated.config, repo);
+    const second = statSync(destination);
+    expect(second.ino).not.toBe(first.ino);
+    expect(second.mode & 0o777).toBe(0o600);
+    expect(readFileSync(destination, 'utf8')).toContain('"max": 7');
+    expect(readdirSync(scratch).filter(name => name.endsWith('.tmp'))).toEqual([]);
   });
 
   test('compare uses timingSafeEqual', () => {
@@ -405,6 +436,90 @@ describe('funnel gate', () => {
     expect(joined.includes('authorization')).toBe(false);
     expect(authenticate(`Bearer ${sneaky}`, config).ok).toBe(true);
     expect(authenticate(undefined, config).ok).toBe(false);
+  });
+
+  test('forwarding and hop-by-hop headers from the client do not reach upstream', async () => {
+    const seen: Record<string, string | string[] | undefined>[] = [];
+    const localUpstream = createServer((req: IncomingMessage, res: ServerResponse) => {
+      seen.push(req.headers);
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+    await new Promise<void>(resolve => localUpstream.listen(0, '127.0.0.1', resolve));
+    const localGate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${(localUpstream.address() as { port: number }).port}`,
+    });
+    const localPort = await listenGate(localGate);
+    const spoofed = [
+      ['Connection', 'x-via-connection'],
+      ['TE', 'spoof-te'],
+      ['Upgrade', 'spoof-upgrade'],
+      ['Keep-Alive', 'spoof-keep-alive'],
+      ['Proxy-Connection', 'spoof-proxy-connection'],
+      ['Proxy-Authorization', 'spoof-proxy-authorization'],
+      ['Trailer', 'spoof-trailer'],
+      ['X-Forwarded-For', '203.0.113.50'],
+      ['X-Forwarded-Proto', 'https'],
+      ['X-Forwarded-Host', 'spoof.example'],
+      ['X-Forwarded-Port', '444'],
+      ['X-Real-Ip', '203.0.113.51'],
+      ['Forwarded', 'for=203.0.113.52;proto=https;host=spoof.example'],
+      ['X-Via-Connection', 'spoof-connection-named'],
+      ['X-Gbrain-Keep', 'kept-marker'],
+    ];
+    const raw = (headerLines: string[]) => new Promise<string>((resolve, reject) => {
+      const sock = connectTcp(localPort, '127.0.0.1', () => {
+        sock.write([
+          'GET /health HTTP/1.1',
+          `Host: 127.0.0.1:${localPort}`,
+          `Authorization: Bearer ${tokens.personal}`,
+          ...headerLines,
+          '',
+          '',
+        ].join('\r\n'));
+      });
+      const chunks: Buffer[] = [];
+      const timer = setTimeout(() => {
+        sock.destroy();
+        reject(new Error('spoof request timed out'));
+      }, 3_000);
+      sock.on('data', (chunk: Buffer) => {
+        chunks.push(chunk);
+        const text = Buffer.concat(chunks).toString('utf8');
+        if (text.includes('\r\n\r\n')) {
+          clearTimeout(timer);
+          sock.end();
+          resolve(text);
+        }
+      });
+      sock.on('error', error => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+    try {
+      const response = await raw(spoofed.map(([name, value]) => `${name}: ${value}`));
+      expect(response.startsWith('HTTP/1.1 200')).toBe(true);
+      expect(seen.length).toBe(1);
+      const forwarded = JSON.stringify(seen[0]).toLowerCase();
+      for (const [name, value] of spoofed) {
+        if (name === 'X-Gbrain-Keep') {
+          expect(seen[0]?.['x-gbrain-keep']).toBe(value);
+          continue;
+        }
+        expect(forwarded.includes(value.toLowerCase())).toBe(false);
+      }
+      expect(String(seen[0]?.['x-forwarded-for'] ?? '')).not.toContain('203.0.113.50');
+      expect(seen[0]?.['x-forwarded-proto']).toBe('http');
+      const transfer = await raw(['Transfer-Encoding: spoof-transfer']);
+      expect(transfer.startsWith('HTTP/1.1')).toBe(true);
+      expect(JSON.stringify(seen).toLowerCase().includes('spoof-transfer')).toBe(false);
+    } finally {
+      await new Promise<void>(resolve => localGate.close(() => resolve()));
+      await new Promise<void>(resolve => localUpstream.close(() => resolve()));
+    }
   });
 
   test('forwards a grant access_token from outside the repo and does not log it', async () => {
@@ -795,6 +910,14 @@ describe('host guard', () => {
     expect(ran.status).toBe(0);
     expect(ran.stderr).toContain(`Wrong machine: ${short}`);
     expect(ran.stderr.includes('listening')).toBe(false);
+  });
+
+  test('an unreadable host.env is status 1 and does not throw a stack', () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-host-unreadable-'));
+    mkdirSync(join(home, '.gbrain', 'serve', 'host.env'), { recursive: true });
+    const result = guardThisHost(home, short);
+    expect(result).toEqual({ ok: false, status: 1, message: 'refusing: unreadable ~/.gbrain/serve/host.env' });
+    expect(JSON.stringify(result).includes('\n')).toBe(false);
   });
 });
 

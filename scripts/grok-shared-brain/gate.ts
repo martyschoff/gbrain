@@ -126,6 +126,29 @@ function upstreamAuthorization(record: ClientRecord): { header: string | null; s
   return { header: `Bearer ${parsed.access_token}`, secret: parsed.access_token };
 }
 
+/** Hop-by-hop and forwarding headers. A Funnel client must not set what the loopback serve trusts. */
+const STRIPPED_REQUEST_HEADERS = new Set([
+  'connection',
+  'te',
+  'upgrade',
+  'keep-alive',
+  'transfer-encoding',
+  'proxy-connection',
+  'proxy-authorization',
+  'trailer',
+  'x-forwarded-for',
+  'x-forwarded-proto',
+  'x-forwarded-host',
+  'x-forwarded-port',
+  'x-real-ip',
+  'forwarded',
+]);
+
+function headerList(value: string | string[] | undefined): string[] {
+  const raw = Array.isArray(value) ? value.join(',') : value ?? '';
+  return raw.split(',').map(part => part.trim().toLowerCase()).filter(part => part.length > 0);
+}
+
 function proxy(
   upstream: URL,
   req: IncomingMessage,
@@ -135,16 +158,22 @@ function proxy(
   onStatus: (status: number) => void,
 ): void {
   const target = new URL(req.url ?? '/', upstream);
+  const namedInConnection = new Set(headerList(req.headers.connection));
   const headers: Record<string, string | number> = {};
   for (const [key, value] of Object.entries(req.headers)) {
     if (value === undefined) continue;
     const lower = key.toLowerCase();
-    if (lower === 'authorization' || lower === 'cookie' || lower === 'proxy-authorization' || lower === 'host' || lower === 'content-length') continue;
+    if (lower === 'authorization' || lower === 'cookie' || lower === 'host' || lower === 'content-length') continue;
+    if (STRIPPED_REQUEST_HEADERS.has(lower) || namedInConnection.has(lower)) continue;
     headers[key] = Array.isArray(value) ? value.join(', ') : value;
   }
   if (authorization) headers.authorization = authorization;
   headers.host = upstream.host;
   headers['content-length'] = body.length;
+  // The gate's own socket, never the client's forwarded headers.
+  const remote = req.socket?.remoteAddress;
+  if (remote) headers['x-forwarded-for'] = remote;
+  headers['x-forwarded-proto'] = 'http';
   let reported = false;
   const report = (status: number) => {
     if (reported) return;

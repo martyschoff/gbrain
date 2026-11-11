@@ -57,5 +57,11 @@ export function evaluateHostGuard(text: string | null, shortName: string): HostG
 export function guardThisHost(home: string, shortName = shortHostname()): HostGuard {
   const path = hostEnvPath(home);
   if (!existsSync(path)) return evaluateHostGuard(null, shortName);
-  return evaluateHostGuard(readFileSync(path, 'utf8'), shortName);
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    return { ok: false, status: 1, message: 'refusing: unreadable ~/.gbrain/serve/host.env' };
+  }
+  return evaluateHostGuard(text, shortName);
 }
