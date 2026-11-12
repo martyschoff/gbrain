@@ -35,6 +35,8 @@ export interface UpstreamAuthorization {
   secret: string | null;
   /** Values the gate log must redact. Never written to the response. */
   redactions: string[];
+  /** True only when the grant file can mint another access token. */
+  refreshable: boolean;
 }
 
 export function accessTokenExpiring(expiresAt: number | null, nowMs: number, marginSeconds = UPSTREAM_REFRESH_MARGIN_SECONDS): boolean {
@@ -183,24 +185,36 @@ export function createUpstreamTokens(options: UpstreamTokenOptions): UpstreamTok
     const expiresIn = typeof payload.expires_in === 'number' && Number.isFinite(payload.expires_in) && payload.expires_in > 0
       ? Math.floor(payload.expires_in)
       : DEFAULT_ACCESS_TTL_SECONDS;
-    const next = { ...doc, access_token: minted, expires_at: Math.floor(options.now() / 1000) + expiresIn };
+    const expiresAt = Math.floor(options.now() / 1000) + expiresIn;
     try {
-      writePrivateJsonAtomic(path, next);
+      commitMintedToken(path, doc, minted, expiresAt);
     } catch {
       throw new UpstreamTokenError(502, 'upstream_token_refresh_failed');
     }
-    return { header: `Bearer ${minted}`, secret: minted, redactions: redactionsFrom(doc, [minted]) };
+    return { header: `Bearer ${minted}`, secret: minted, redactions: redactionsFrom(doc, [minted]), refreshable: true };
+  }
+
+  /** Write the minted token into the file as it is now. A replaced client is left unchanged. */
+  function commitMintedToken(path: string, mintedFor: Record<string, unknown>, minted: string, expiresAt: number): void {
+    let latest: Record<string, unknown>;
+    try {
+      latest = readGrant(path);
+    } catch {
+      return;
+    }
+    if (latest.client_id !== mintedFor.client_id || latest.client_secret !== mintedFor.client_secret) return;
+    writePrivateJsonAtomic(path, { ...latest, access_token: minted, expires_at: expiresAt });
   }
 
   function current(doc: Record<string, unknown>): UpstreamAuthorization | null {
     const token = accessTokenOf(doc);
     if (!token || accessTokenExpiring(expiresAtOf(doc), options.now())) return null;
-    return { header: `Bearer ${token}`, secret: token, redactions: redactionsFrom(doc, [token]) };
+    return { header: `Bearer ${token}`, secret: token, redactions: redactionsFrom(doc, [token]), refreshable: hasClientCredentials(doc) };
   }
 
   return {
     async resolve(record) {
-      if (!record.upstream_token_file) return { header: null, secret: null, redactions: [] };
+      if (!record.upstream_token_file) return { header: null, secret: null, redactions: [], refreshable: false };
       const doc = readGrant(record.upstream_token_file);
       const fresh = current(doc);
       if (fresh) return fresh;

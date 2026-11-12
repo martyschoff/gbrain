@@ -240,6 +240,133 @@ describe('upstream grant refresh', () => {
     await upstream.close();
   });
 
+  test('an empty grant file is bad_gateway and is not proxied', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-empty-'));
+    const path = join(dir, 'personal.json');
+    writeFileSync(path, '{}\n', { mode: 0o600 });
+    const { config, bearer } = gateConfig(path);
+    let tokenCalls = 0;
+    const upstream = await serveUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should-not-proxy');
+    });
+    const gate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${upstream.port}`,
+      now: () => NOW_MS,
+      fetchImpl: async () => {
+        tokenCalls += 1;
+        return tokenResponse(200, { access_token: MINTED_TOKEN, expires_in: 3600 });
+      },
+    });
+    const port = await listenGate(gate);
+    const response = await call(port, bearer);
+    expect(response.status).toBe(502);
+    expect(response.text).toContain('bad_gateway');
+    expect(response.text.includes('should-not-proxy')).toBe(false);
+    expect(tokenCalls).toBe(0);
+    await new Promise<void>(resolve => gate.close(() => resolve()));
+    await upstream.close();
+  });
+
+  test('a token-only grant forwards serve 401', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-forward-'));
+    const path = join(dir, 'personal.json');
+    writeFileSync(path, `${JSON.stringify({ access_token: STALE_TOKEN, expires_at: NOW_SEC + 3600 })}\n`, { mode: 0o600 });
+    const { config, bearer } = gateConfig(path);
+    let tokenCalls = 0;
+    const upstream = await serveUpstream((_req, res) => {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"invalid_token"}');
+    });
+    const gate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${upstream.port}`,
+      now: () => NOW_MS,
+      fetchImpl: async () => {
+        tokenCalls += 1;
+        return tokenResponse(200, { access_token: MINTED_TOKEN, expires_in: 3600, token_type: 'bearer' });
+      },
+    });
+    const port = await listenGate(gate);
+    const response = await call(port, bearer);
+    expect(response.status).toBe(401);
+    expect(response.text).toContain('invalid_token');
+    expect(response.text.includes('upstream_unauthorized')).toBe(false);
+    expect(tokenCalls).toBe(0);
+    await new Promise<void>(resolve => gate.close(() => resolve()));
+    await upstream.close();
+  });
+
+  test('a grant replaced during refresh keeps the replacement client', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-replace-'));
+    const path = writeGrant(dir, NOW_SEC - 5);
+    const { config, bearer } = gateConfig(path);
+    const replacementSecret = 'replacement-secret-do-not-log';
+    const replacementAccess = 'replacement-access-do-not-log';
+    const upstream = await serveUpstream((req, res) => {
+      expect(String(req.headers.authorization ?? '')).toBe(`Bearer ${MINTED_TOKEN}`);
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+    const gate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${upstream.port}`,
+      now: () => NOW_MS,
+      fetchImpl: async () => {
+        writeFileSync(path, `${JSON.stringify({
+          client_id: 'replacement-client',
+          client_secret: replacementSecret,
+          access_token: replacementAccess,
+          expires_at: NOW_SEC + 7200,
+          profile: 'kept',
+        })}\n`, { mode: 0o600 });
+        return tokenResponse(200, { access_token: MINTED_TOKEN, expires_in: 3600, token_type: 'bearer' });
+      },
+    });
+    const port = await listenGate(gate);
+    const response = await call(port, bearer);
+    expect(response.status).toBe(200);
+    const saved = JSON.parse(readFileSync(path, 'utf8')) as { client_id: string; access_token: string; profile: string; client_secret: string };
+    expect(saved.client_id).toBe('replacement-client');
+    expect(saved.access_token).toBe(replacementAccess);
+    expect(saved.client_secret).toBe(replacementSecret);
+    expect(saved.profile).toBe('kept');
+    await new Promise<void>(resolve => gate.close(() => resolve()));
+    await upstream.close();
+  });
+
+  test('a same-client edit during refresh keeps the new fields and the minted token', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-merge-'));
+    const path = writeGrant(dir, NOW_SEC - 5);
+    const { config, bearer } = gateConfig(path);
+    const upstream = await serveUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
+    const gate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${upstream.port}`,
+      now: () => NOW_MS,
+      fetchImpl: async () => {
+        const current = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+        writeFileSync(path, `${JSON.stringify({ ...current, profile: 'replaced-profile' })}\n`, { mode: 0o600 });
+        return tokenResponse(200, { access_token: MINTED_TOKEN, expires_in: 3600, token_type: 'bearer' });
+      },
+    });
+    const port = await listenGate(gate);
+    const response = await call(port, bearer);
+    expect(response.status).toBe(200);
+    const saved = JSON.parse(readFileSync(path, 'utf8')) as { access_token: string; expires_at: number; profile: string; client_secret: string };
+    expect(saved.access_token).toBe(MINTED_TOKEN);
+    expect(saved.expires_at).toBe(NOW_SEC + 3600);
+    expect(saved.profile).toBe('replaced-profile');
+    expect(saved.client_secret).toBe(CLIENT_SECRET);
+    await new Promise<void>(resolve => gate.close(() => resolve()));
+    await upstream.close();
+  });
+
   test('a failed refresh is 502 or 401 and includes no secret', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-fail-'));
     mkdirSync(join(dir, 'second'));
