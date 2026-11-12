@@ -6,7 +6,7 @@ import { isInside, toPosix } from './files.ts';
 import { classifyScannedFile } from './scan.ts';
 import { contentHasSecret, isSecretFileName } from './secrets.ts';
 
-const STAMP_LINE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$/;
+const STAMP_LINE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?Z$/;
 const FINANCE_RE = /holding|holdings|brokerage|positions|portfolio|1099|tax-lot/i;
 const FILE_CAP = 500;
 const BYTE_CAP = 50 * 1024 * 1024;
@@ -254,11 +254,12 @@ export function checkFailClosed(group: GroupConfig, ctx: FailClosedContext): Fai
   let denied = 0;
   for (const file of listed) {
     const kind = classifyScannedFile(file.rel, file.bytes, allow, ctx.maxBytes);
-    if (kind === 'ok') allowed.push(file);
-    else denied++;
+    if (kind === 'oversize') return skip('oversized');
+    if (kind === 'denied') denied++;
+    else allowed.push(file);
   }
   if (allowed.length === 0 && listed.length > 0) return skip('empty after allowlist');
-  if (denied > 0 && allowed.length > 0) return skip('denied path in manifest');
+  if (denied > 0) return skip('denied path in manifest');
   if (allowed.some((file) => isSecretFileName(file.rel) || contentHasSecret(file.bytes.toString('utf8')))) {
     return skip('secret-bearing');
   }

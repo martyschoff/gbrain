@@ -1,8 +1,10 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { describe, expect, test } from 'bun:test';
+import { join, resolve, sep } from 'node:path';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import * as files from '../scripts/bot-loader/files.ts';
 import { loadConfig, assertRoutes } from '../scripts/bot-loader/config.ts';
 import { createGbrainClient, manifestCounts, putArgv, addSourceArgv } from '../scripts/bot-loader/gbrain-client.ts';
 import { shareIsMounted } from '../scripts/bot-loader/host.ts';
@@ -989,7 +991,56 @@ async function runAt(config: LoaderConfig, brain: BrainClient): Promise<{ exitCo
   return runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: NOW, serveLockHeld: true });
 }
 
+const realWriteAtomic = files.writeAtomic;
+const realMkdir = fs.mkdirSync;
+const realWriteFile = fs.writeFileSync;
+const destWrites: string[] = [];
+const destMkdirs: string[] = [];
+const destFileWrites: string[] = [];
+
+function underPath(root: string, path: string): boolean {
+  const base = resolve(root);
+  const child = resolve(path);
+  return child === base || child.startsWith(base.endsWith(sep) ? base : base + sep);
+}
+
+function expectNoDestination(target: string): void {
+  const hits = [...destWrites, ...destMkdirs, ...destFileWrites].filter((path) => underPath(target, path));
+  expect(hits).toEqual([]);
+}
+
 describe('fail-closed feeds', () => {
+  let writeSpy: { mockRestore: () => void } | null = null;
+  let mkdirSpy: { mockRestore: () => void } | null = null;
+  let fileSpy: { mockRestore: () => void } | null = null;
+
+  beforeEach(() => {
+    destWrites.length = 0;
+    destMkdirs.length = 0;
+    destFileWrites.length = 0;
+    writeSpy = spyOn(files, 'writeAtomic').mockImplementation((path: string, data: string, mode: number) => {
+      destWrites.push(path);
+      realWriteAtomic(path, data, mode);
+    });
+    mkdirSpy = spyOn(fs, 'mkdirSync').mockImplementation(((path: fs.PathLike, mode?: fs.MakeDirectoryOptions) => {
+      destMkdirs.push(String(path));
+      return realMkdir(path, mode);
+    }) as typeof fs.mkdirSync);
+    fileSpy = spyOn(fs, 'writeFileSync').mockImplementation(((path: fs.PathLike, data: string | NodeJS.ArrayBufferView, options?: fs.WriteFileOptions) => {
+      destFileWrites.push(String(path));
+      realWriteFile(path, data, options);
+    }) as typeof fs.writeFileSync);
+  });
+
+  afterEach(() => {
+    writeSpy?.mockRestore();
+    mkdirSpy?.mockRestore();
+    fileSpy?.mockRestore();
+    writeSpy = null;
+    mkdirSpy = null;
+    fileSpy = null;
+  });
+
   test('old configs load and fail-closed parse rejects a bad group', () => {
     const home = temp('gbrain-feed-cfg-');
     const share = join(home, 'share');
@@ -1061,6 +1112,7 @@ describe('fail-closed feeds', () => {
     expect(staleResult.exitCode).toBe(0);
     expect(staleResult.summaryText).toContain('bot-loader: ok');
     expect(staleResult.summaryText).toContain('SKIP hermes: feed stale');
+    expectNoDestination(join(share, 'personalgrok/gbrain/hermes'));
     expect(staleResult.summaryText).not.toContain('WARN box-export stale');
     expect(staleResult.summaryText).not.toContain('SKIP personal');
     expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
@@ -1087,6 +1139,7 @@ describe('fail-closed feeds', () => {
     const missing = feedConfig(missingHome, missingShare, [personalGroup(missingShare), hermesGroup(missingShare, join(missingHome, 'absent-feed'))]);
     const missingResult = await runAt(missing, brainSpy().brain);
     expect(missingResult.summaryText).toContain('SKIP hermes: input missing');
+    expectNoDestination(join(missingShare, 'personalgrok/gbrain/hermes'));
     expect(missingResult.summaryText).not.toContain('SKIP hermes: feed stale');
     expect(existsSync(join(missingShare, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
 
@@ -1099,6 +1152,7 @@ describe('fail-closed feeds', () => {
     const unsigned = feedConfig(unsignedHome, unsignedShare, [personalGroup(unsignedShare), hermesGroup(unsignedShare, unsignedStamp)]);
     const unsignedResult = await runAt(unsigned, brainSpy().brain);
     expect(unsignedResult.summaryText).toContain('SKIP hermes: unsigned');
+    expectNoDestination(join(unsignedShare, 'personalgrok/gbrain/hermes'));
     expect(existsSync(join(unsignedShare, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
 
     const hashHome = temp('gbrain-feed-hash-');
@@ -1110,6 +1164,7 @@ describe('fail-closed feeds', () => {
     const hashed = feedConfig(hashHome, hashShare, [personalGroup(hashShare), hermesGroup(hashShare, hashStamp)]);
     const hashResult = await runAt(hashed, brainSpy().brain);
     expect(hashResult.summaryText).toContain('SKIP hermes: hash mismatch');
+    expectNoDestination(join(hashShare, 'personalgrok/gbrain/hermes'));
     expect(existsSync(join(hashShare, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
 
     const partialHome = temp('gbrain-feed-partial-');
@@ -1120,6 +1175,7 @@ describe('fail-closed feeds', () => {
     const partial = feedConfig(partialHome, partialShare, [personalGroup(partialShare), hermesGroup(partialShare, partialStamp)]);
     const partialResult = await runAt(partial, brainSpy().brain);
     expect(partialResult.summaryText).toContain('SKIP hermes: partial copy');
+    expectNoDestination(join(partialShare, 'personalgrok/gbrain/hermes'));
     expect(existsSync(join(partialShare, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
     expect(existsSync(join(partialShare, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
 
@@ -1131,6 +1187,7 @@ describe('fail-closed feeds', () => {
     const heldResult = await runAt(held, brainSpy().brain);
     expect(heldResult.exitCode).toBe(0);
     expect(heldResult.summaryText).toContain('SKIP hermes: finance-data');
+    expectNoDestination(join(holdShare, 'personalgrok/gbrain/hermes'));
     expect(heldResult.summaryText).not.toContain('empty after allowlist');
     expect(existsSync(join(holdShare, 'personalgrok/gbrain/hermes/hermes/Holdings.md'))).toBe(false);
 
@@ -1166,6 +1223,7 @@ describe('fail-closed feeds', () => {
     const routeResult = await runAt(routed, routeSpy.brain);
     expect(routeResult.exitCode).toBe(0);
     expect(routeResult.summaryText).toContain('SKIP hermes: route');
+    expectNoDestination(linked);
     expect(routeSpy.puts.some((put) => put.source === 'hermes')).toBe(false);
     expect(routeSpy.ensured).toEqual([]);
     expect(existsSync(join(personalTarget, 'alpha/local.md'))).toBe(true);
@@ -1192,6 +1250,7 @@ describe('fail-closed feeds', () => {
     expect(result.exitCode).toBe(0);
     expect(result.summaryText.startsWith('bot-loader: ok\n')).toBe(true);
     expect(result.summaryText).toContain('SKIP business: source not created');
+    expectNoDestination(join(share, 'personalgrok/gbrain/business'));
     expect(result.summaryText).not.toContain('SKIP hermes');
     expect(result.summaryText).not.toContain('SKIP personal');
     expect(result.summaryText).toContain('secrets_skipped=1');
@@ -1212,6 +1271,7 @@ describe('fail-closed feeds', () => {
     const emptyResult = await runAt(empty, emptySpy.brain);
     expect(emptyResult.exitCode).toBe(0);
     expect(emptyResult.summaryText).toContain('SKIP business: no bots named');
+    expectNoDestination(join(emptyShare, 'personalgrok/gbrain/business'));
     expect(emptySpy.ensured).toEqual([]);
     expect(existsSync(join(emptyShare, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
   });
@@ -1224,6 +1284,7 @@ describe('fail-closed feeds', () => {
     const mixed = feedConfig(home, share, [hermesGroup(share, stamp)]);
     const mixedResult = await runAt(mixed, brainSpy().brain);
     expect(mixedResult.summaryText).toContain('SKIP hermes: denied path in manifest');
+    expectNoDestination(join(share, 'personalgrok/gbrain/hermes'));
     expect(mixedResult.summaryText).not.toContain('empty after allowlist');
     expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
 
@@ -1234,6 +1295,7 @@ describe('fail-closed feeds', () => {
     const only = feedConfig(onlyHome, onlyShare, [hermesGroup(onlyShare, onlyStamp)]);
     const onlyResult = await runAt(only, brainSpy().brain);
     expect(onlyResult.summaryText).toContain('SKIP hermes: empty after allowlist');
+    expectNoDestination(join(onlyShare, 'personalgrok/gbrain/hermes'));
     expect(existsSync(join(onlyShare, 'personalgrok/gbrain/hermes/hermes/picture.md'))).toBe(false);
 
     const extraHome = temp('gbrain-feed-extra-');
@@ -1259,6 +1321,7 @@ describe('fail-closed feeds', () => {
     const wrongResult = await runAt(wrong, brainSpy().brain);
     expect(wrongResult.exitCode).toBe(0);
     expect(wrongResult.summaryText).toContain('SKIP hermes: wrong source');
+    expectNoDestination(join(share, 'personalgrok/gbrain/hermes'));
     expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
     expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
 
@@ -1269,7 +1332,103 @@ describe('fail-closed feeds', () => {
     const big = feedConfig(bigHome, bigShare, [hermesGroup(bigShare, bigStamp)]);
     const bigResult = await runAt(big, brainSpy().brain);
     expect(bigResult.summaryText).toContain('SKIP hermes: oversized');
+    expectNoDestination(join(bigShare, 'personalgrok/gbrain/hermes'));
     expect(existsSync(join(bigShare, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
+  });
+
+  test('a 37h business stamp is box-export stale and a fresh hermes feed still writes', async () => {
+    const home = temp('gbrain-feed-biz-stale-');
+    const share = join(home, 'share');
+    const business = join(share, 'businessgrok/gbrain/_box-export');
+    const hermes = join(home, 'hermes-feed');
+    write(join(share, 'personalgrok/alpha/local.md'), 'from personal\n');
+    write(join(business, 'EXPORTED_AT'), `${stampAt(37)}\nexample-bot 0\n`);
+    writeFeed(hermes, stampAt(1), 'hermes', 'hermes', { 'note.md': 'fresh hermes\n' });
+    const config = feedConfig(home, share, [
+      personalGroup(share),
+      businessGroup(share, business, [{
+        id: 'example-bot',
+        inputs: [{ path: join(business, 'example-bot'), required: false, role: 'box-export' }],
+      }]),
+      hermesGroup(share, hermes),
+    ]);
+    const result = await runAt(config, brainSpy().brain);
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).toContain('SKIP business: box-export stale');
+    expect(result.summaryText).not.toContain('SKIP business: feed stale');
+    expect(result.summaryText).not.toContain('SKIP hermes');
+    expectNoDestination(join(share, 'personalgrok/gbrain/business'));
+    expect(existsSync(join(share, 'personalgrok/gbrain/business/example-bot'))).toBe(false);
+    expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(true);
+    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
+  });
+
+  test('a Zulu stamp with fractional seconds is parseable and still ages out', async () => {
+    const home = temp('gbrain-feed-millis-');
+    const share = join(home, 'share');
+    const stamp = join(home, 'hermes-feed');
+    const freshMillis = new Date(NOW.getTime() - 60 * 60 * 1000).toISOString();
+    expect(freshMillis).toMatch(/\.000Z$/);
+    writeFeed(stamp, freshMillis, 'hermes', 'hermes', { 'note.md': 'millis fresh\n' });
+    const fresh = feedConfig(home, share, [hermesGroup(share, stamp)]);
+    const freshResult = await runAt(fresh, brainSpy().brain);
+    expect(freshResult.exitCode).toBe(0);
+    expect(freshResult.summaryText).not.toContain('SKIP hermes');
+    expect(readFileSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'), 'utf8')).toContain('millis fresh');
+
+    const oldHome = temp('gbrain-feed-millis-old-');
+    const oldShare = join(oldHome, 'share');
+    const oldStamp = join(oldHome, 'hermes-feed');
+    const staleMillis = new Date(NOW.getTime() - 37 * 60 * 60 * 1000).toISOString();
+    writeFeed(oldStamp, staleMillis, 'hermes', 'hermes', { 'note.md': 'millis old\n' });
+    const old = feedConfig(oldHome, oldShare, [hermesGroup(oldShare, oldStamp)]);
+    const oldResult = await runAt(old, brainSpy().brain);
+    expect(oldResult.summaryText).toContain('SKIP hermes: feed stale');
+    expectNoDestination(join(oldShare, 'personalgrok/gbrain/hermes'));
+    expect(existsSync(join(oldShare, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
+
+    const badHome = temp('gbrain-feed-not-utc-');
+    const badShare = join(badHome, 'share');
+    const badStamp = join(badHome, 'hermes-feed');
+    writeFeed(badStamp, stampAt(1), 'hermes', 'hermes', { 'note.md': 'offset\n' });
+    write(join(badStamp, 'EXPORTED_AT'), '2026-11-12T11:00:00+00:00\nhermes 1\n');
+    const bad = feedConfig(badHome, badShare, [hermesGroup(badShare, badStamp)]);
+    const badResult = await runAt(bad, brainSpy().brain);
+    expect(badResult.summaryText).toContain('SKIP hermes: feed stale');
+    expectNoDestination(join(badShare, 'personalgrok/gbrain/hermes'));
+    write(join(badStamp, 'EXPORTED_AT'), 'not-a-timestamp\nhermes 1\n');
+    const garbage = await runAt(bad, brainSpy().brain);
+    expect(garbage.summaryText).toContain('SKIP hermes: feed stale');
+    expectNoDestination(join(badShare, 'personalgrok/gbrain/hermes'));
+  });
+
+  test('a secret file skips the whole hermes group', async () => {
+    const secret = 'sk-abcdefghijklmnopqrstuvwxyz\n';
+    const aloneHome = temp('gbrain-feed-secret-one-');
+    const aloneShare = join(aloneHome, 'share');
+    const aloneStamp = join(aloneHome, 'hermes-feed');
+    writeFeed(aloneStamp, stampAt(1), 'hermes', 'hermes', { 'note.md': secret });
+    const alone = feedConfig(aloneHome, aloneShare, [hermesGroup(aloneShare, aloneStamp)]);
+    const aloneResult = await runAt(alone, brainSpy().brain);
+    expect(aloneResult.exitCode).toBe(0);
+    expect(aloneResult.summaryText).toContain('SKIP hermes: secret-bearing');
+    expect(aloneResult.summaryText).not.toContain('empty after allowlist');
+    expect(aloneResult.summaryText).not.toContain('denied path in manifest');
+    expectNoDestination(join(aloneShare, 'personalgrok/gbrain/hermes'));
+    expect(existsSync(join(aloneShare, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
+
+    const mixedHome = temp('gbrain-feed-secret-mix-');
+    const mixedShare = join(mixedHome, 'share');
+    const mixedStamp = join(mixedHome, 'hermes-feed');
+    writeFeed(mixedStamp, stampAt(1), 'hermes', 'hermes', { 'note.md': secret, 'keep.md': 'clean note\n' });
+    const mixed = feedConfig(mixedHome, mixedShare, [hermesGroup(mixedShare, mixedStamp)]);
+    const mixedResult = await runAt(mixed, brainSpy().brain);
+    expect(mixedResult.exitCode).toBe(0);
+    expect(mixedResult.summaryText).toContain('SKIP hermes: secret-bearing');
+    expect(mixedResult.summaryText).not.toContain('denied path in manifest');
+    expectNoDestination(join(mixedShare, 'personalgrok/gbrain/hermes'));
+    expect(existsSync(join(mixedShare, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
+    expect(existsSync(join(mixedShare, 'personalgrok/gbrain/hermes/hermes/keep.md'))).toBe(false);
   });
 
   test('verify accepts a fresh personal status that also skips business', () => {
