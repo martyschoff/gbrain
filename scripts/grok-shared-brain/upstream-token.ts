@@ -35,6 +35,8 @@ export interface UpstreamAuthorization {
   secret: string | null;
   /** Values the gate log must redact. Never written to the response. */
   redactions: string[];
+  /** True only when this file has client_id and client_secret, so a 401 can be retried. */
+  refreshable: boolean;
 }
 
 export function accessTokenExpiring(expiresAt: number | null, nowMs: number, marginSeconds = UPSTREAM_REFRESH_MARGIN_SECONDS): boolean {
@@ -183,24 +185,39 @@ export function createUpstreamTokens(options: UpstreamTokenOptions): UpstreamTok
     const expiresIn = typeof payload.expires_in === 'number' && Number.isFinite(payload.expires_in) && payload.expires_in > 0
       ? Math.floor(payload.expires_in)
       : DEFAULT_ACCESS_TTL_SECONDS;
-    const next = { ...doc, access_token: minted, expires_at: Math.floor(options.now() / 1000) + expiresIn };
+    let latest: Record<string, unknown>;
+    try {
+      latest = readGrant(path);
+    } catch {
+      throw new UpstreamTokenError(502, 'upstream_token_refresh_failed');
+    }
+    if (latest.client_id !== clientId || latest.client_secret !== clientSecret) {
+      return fromFile(latest);
+    }
+    const next = { ...latest, access_token: minted, expires_at: Math.floor(options.now() / 1000) + expiresIn };
     try {
       writePrivateJsonAtomic(path, next);
     } catch {
       throw new UpstreamTokenError(502, 'upstream_token_refresh_failed');
     }
-    return { header: `Bearer ${minted}`, secret: minted, redactions: redactionsFrom(doc, [minted]) };
+    return { header: `Bearer ${minted}`, secret: minted, redactions: redactionsFrom(latest, [minted]), refreshable: true };
+  }
+
+  function fromFile(doc: Record<string, unknown>): UpstreamAuthorization {
+    const token = accessTokenOf(doc);
+    if (!token) return { header: null, secret: null, redactions: redactionsFrom(doc), refreshable: hasClientCredentials(doc) };
+    return { header: `Bearer ${token}`, secret: token, redactions: redactionsFrom(doc, [token]), refreshable: hasClientCredentials(doc) };
   }
 
   function current(doc: Record<string, unknown>): UpstreamAuthorization | null {
     const token = accessTokenOf(doc);
     if (!token || accessTokenExpiring(expiresAtOf(doc), options.now())) return null;
-    return { header: `Bearer ${token}`, secret: token, redactions: redactionsFrom(doc, [token]) };
+    return fromFile(doc);
   }
 
   return {
     async resolve(record) {
-      if (!record.upstream_token_file) return { header: null, secret: null, redactions: [] };
+      if (!record.upstream_token_file) return { header: null, secret: null, redactions: [], refreshable: false };
       const doc = readGrant(record.upstream_token_file);
       const fresh = current(doc);
       if (fresh) return fresh;

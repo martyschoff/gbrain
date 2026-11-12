@@ -281,4 +281,110 @@ describe('upstream grant refresh', () => {
     expect(joined.includes(MINTED_TOKEN)).toBe(false);
     await upstream.close();
   });
+
+  test('a token-only grant file forwards serve 401 and does not call /token', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-token-only-'));
+    const path = join(dir, 'personal.json');
+    writeFileSync(path, `${JSON.stringify({ access_token: STALE_TOKEN })}\n`, { mode: 0o600 });
+    const { config, bearer } = gateConfig(path);
+    let tokenCalls = 0;
+    let upstreamHits = 0;
+    const upstream = await serveUpstream((_req, res) => {
+      upstreamHits += 1;
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"invalid_token","source":"serve"}');
+    });
+    const gate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${upstream.port}`,
+      now: () => NOW_MS,
+      fetchImpl: async () => {
+        tokenCalls += 1;
+        return tokenResponse(200, { access_token: MINTED_TOKEN, expires_in: 3600, token_type: 'bearer' });
+      },
+    });
+    const port = await listenGate(gate);
+    const response = await call(port, bearer);
+    expect(response.status).toBe(401);
+    expect(response.text).toContain('invalid_token');
+    expect(response.text).toContain('serve');
+    expect(response.text.includes('upstream_unauthorized')).toBe(false);
+    expect(tokenCalls).toBe(0);
+    expect(upstreamHits).toBe(1);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ access_token: STALE_TOKEN });
+    await new Promise<void>(resolve => gate.close(() => resolve()));
+    await upstream.close();
+  });
+
+  test('an in-flight refresh does not clobber a grant file replaced while /token is running', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-replace-'));
+    const sameCreds = join(dir, 'same.json');
+    const changedCreds = join(dir, 'changed.json');
+    writeFileSync(sameCreds, `${JSON.stringify({
+      client_id: 'client-test',
+      client_secret: CLIENT_SECRET,
+      access_token: STALE_TOKEN,
+      expires_at: NOW_SEC - 5,
+      profile: 'memory-writer',
+      generation: 1,
+    })}\n`, { mode: 0o600 });
+    writeFileSync(changedCreds, readFileSync(sameCreds));
+    const replacement = {
+      client_id: 'client-test',
+      client_secret: CLIENT_SECRET,
+      access_token: 'replaced-access-token',
+      expires_at: NOW_SEC + 7200,
+      profile: 'memory-reader',
+      generation: 2,
+    };
+    const swapped = {
+      client_id: 'client-replaced',
+      client_secret: 'secret-replaced-do-not-log',
+      access_token: 'swapped-access-token',
+      expires_at: NOW_SEC + 7200,
+      profile: 'memory-reader',
+      generation: 9,
+    };
+    const run = async (path: string, during: () => void) => {
+      const { config, bearer } = gateConfig(path);
+      const hits: string[] = [];
+      const local = await serveUpstream((req, res) => {
+        hits.push(String(req.headers.authorization ?? ''));
+        req.resume();
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{}');
+      });
+      const gate = createFunnelGate({
+        config,
+        upstreamBaseUrl: `http://127.0.0.1:${local.port}`,
+        now: () => NOW_MS,
+        fetchImpl: async () => {
+          during();
+          return tokenResponse(200, { access_token: MINTED_TOKEN, expires_in: 3600, token_type: 'bearer' });
+        },
+      });
+      const port = await listenGate(gate);
+      const response = await call(port, bearer);
+      await new Promise<void>(resolve => gate.close(() => resolve()));
+      await local.close();
+      return { response, hits, file: JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown> };
+    };
+    const merged = await run(sameCreds, () => writePrivateJsonAtomic(sameCreds, replacement));
+    expect(merged.response.status).toBe(200);
+    expect(merged.hits).toEqual([`Bearer ${MINTED_TOKEN}`]);
+    expect(merged.file.profile).toBe('memory-reader');
+    expect(merged.file.generation).toBe(2);
+    expect(merged.file.access_token).toBe(MINTED_TOKEN);
+    expect(merged.file.expires_at).toBe(NOW_SEC + 3600);
+    expect(merged.file.client_id).toBe('client-test');
+    expect(merged.file.client_secret).toBe(CLIENT_SECRET);
+
+    const kept = await run(changedCreds, () => writePrivateJsonAtomic(changedCreds, swapped));
+    expect(kept.response.status).toBe(200);
+    expect(kept.hits).toEqual(['Bearer swapped-access-token']);
+    expect(kept.file).toEqual(swapped);
+    expect(kept.file.access_token).not.toBe(MINTED_TOKEN);
+    expect(statSync(sameCreds).mode & 0o777).toBe(0o600);
+    expect(statSync(changedCreds).mode & 0o777).toBe(0o600);
+  });
 });

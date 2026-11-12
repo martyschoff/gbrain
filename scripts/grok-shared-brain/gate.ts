@@ -396,7 +396,7 @@ export function createFunnelGate(options: GateOptions): Server {
       return;
     }
     hidden.push(...authz.redactions);
-    const canRefresh = authz.secret !== null && Boolean(auth.record.upstream_token_file);
+    const canRefresh = authz.refreshable;
     const first = await proxy(
       upstream, req, body, res, authz.header,
       status => finish(status, auth.client, authz.secret),
