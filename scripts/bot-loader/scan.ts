@@ -45,6 +45,25 @@ function extensionOf(name: string): string {
   return dot >= 0 ? name.slice(dot).toLowerCase() : '';
 }
 
+export type ScanClass = 'ok' | 'secret' | 'denied' | 'oversize';
+
+/** Same accept/refuse rules as a walk, for one regular file already in memory. */
+export function classifyScannedFile(relativePosix: string, bytes: Buffer, allow: ReadonlySet<string>, maxBytes: number): ScanClass {
+  const parts = relativePosix.split('/').filter((part) => part.length > 0);
+  if (parts.length === 0 || parts.some((part) => part === '.' || part === '..')) return 'denied';
+  const name = parts[parts.length - 1]!;
+  for (const dir of parts.slice(0, -1)) {
+    if (dir.startsWith('.') || DENY_DIR_NAMES.has(dir.toLowerCase())) return 'denied';
+  }
+  if (isSecretFileName(name)) return 'secret';
+  const ext = extensionOf(name);
+  if (!allow.has(ext) || deniedName(name)) return 'denied';
+  if (bytes.length > maxBytes) return 'oversize';
+  if (bytes.includes(0)) return 'denied';
+  if (contentHasSecret(bytes.toString('utf8'))) return 'secret';
+  return 'ok';
+}
+
 export function scanTree(root: string, allow: ReadonlySet<string>, maxBytes: number): ScanResult {
   const files: ScannedFile[] = [];
   const counts: ScanCounts = { scanned: 0, skipped: 0, secrets: 0 };

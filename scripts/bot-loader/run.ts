@@ -9,6 +9,7 @@ import type { BrainClient } from './gbrain-client.ts';
 import { createGbrainClient } from './gbrain-client.ts';
 import { readManifest, writeManifest, type Manifest, type ManifestEntry } from './manifest.ts';
 import { bodyForExtension, pageSlug, renderPage, sha256 } from './render.ts';
+import { checkFailClosed, type PlannedFile } from './fail-closed.ts';
 import { scanTree } from './scan.ts';
 import { formatSummary, type BotSummary, type RunSummary } from './summary.ts';
 
@@ -133,10 +134,18 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
   const manifest = readManifest(config.statePath);
   const seen = new Set<string>();
   const bots: BotSummary[] = [];
+  const skips: string[] = [];
   let ok = true;
   const allowCache = new Map<string, Set<string>>();
 
   for (const group of config.groups) {
+    if (group.failClosed) {
+      const closed = await runFailClosedGroup(config, group, brain, manifest, seen, now);
+      bots.push(...closed.bots);
+      if (closed.skip) skips.push(`SKIP ${group.source}: ${closed.skip}`);
+      if (!closed.putOk) ok = false;
+      continue;
+    }
     const remoteRefusal = gitRemoteRefusal(group);
     if (remoteRefusal) {
       warnings.push(remoteRefusal);
@@ -252,10 +261,92 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
     sources: [...new Set(config.groups.map((group) => group.source))].map((id) => ({ id, pages: counts.sources[id] ?? 0, via: counts.via })),
     orphans: orphanLines,
     warnings: warnings.filter((warning) => !warning.startsWith('orphaned ')),
+    skips,
   };
   const text = formatSummary(summary);
   writeAtomic(config.summaryPath, text, 0o600);
   return { exitCode: ok ? 0 : 1, summaryText: text };
+}
+
+async function runFailClosedGroup(
+  config: LoaderConfig,
+  group: GroupConfig,
+  brain: BrainClient,
+  manifest: Manifest,
+  seen: Set<string>,
+  now: Date,
+): Promise<{ bots: BotSummary[]; skip: string | null; putOk: boolean }> {
+  const blanks = () => group.bots.map((bot) => emptyBot(bot.id, group.source));
+  if (group.bots.length === 0) return { bots: [], skip: 'no bots named', putOk: true };
+  const checked = checkFailClosed(group, {
+    groups: config.groups,
+    now,
+    maxBytes: config.maxBytes,
+    maxAgeHours: config.boxExportMaxAgeHours,
+  });
+  if (!checked.ok) return { bots: blanks(), skip: checked.skip, putOk: true };
+  if (group.ensureSource && !manifest.sources?.[group.source]?.added) {
+    const ensured = await brain.ensureSource(group.source, group.targetRoot);
+    if (!ensured.ok) return { bots: blanks(), skip: 'source not created', putOk: true };
+    manifest.sources = { ...manifest.sources, [group.source]: { added: true } };
+  }
+  const summaries = new Map(group.bots.map((bot) => [bot.id, emptyBot(bot.id, group.source)]));
+  let putOk = true;
+  for (const file of checked.files) {
+    const summary = summaries.get(file.botId);
+    if (!summary) return { bots: blanks(), skip: 'route', putOk: true };
+    summary.scanned++;
+    const wrote = await commitPlanned(config, group, brain, manifest, seen, summary, file);
+    if (!wrote) putOk = false;
+  }
+  return { bots: group.bots.map((bot) => summaries.get(bot.id)!), skip: null, putOk };
+}
+
+async function commitPlanned(
+  config: LoaderConfig,
+  group: GroupConfig,
+  brain: BrainClient,
+  manifest: Manifest,
+  seen: Set<string>,
+  summary: BotSummary,
+  file: PlannedFile,
+): Promise<boolean> {
+  const digest = sha256(file.bytes);
+  seen.add(file.absolute);
+  const prior = manifest.files[file.absolute];
+  const slug = `${file.botId}/${pageSlug(file.outputRel)}`;
+  if (prior && prior.sha256 === digest && prior.inBrain && prior.output === file.outputPath && prior.slug === slug) {
+    summary.unchanged++;
+    return true;
+  }
+  const ext = file.relativePosix.includes('.') ? file.relativePosix.slice(file.relativePosix.lastIndexOf('.')) : '';
+  const page = renderPage({
+    relativeMd: `${file.botId}/${file.outputRel}`,
+    title: basename(file.outputRel).replace(/\.md$/, ''),
+    originRelpath: originOf(config.shareRoot, file.absolute, file.botId, file.inputIndex, file.relativePosix),
+    originSha256: digest,
+    body: bodyForExtension(ext, file.bytes.toString('utf8'), config.csvMaxRows),
+  });
+  if (pageSlug(`${file.botId}/${file.outputRel}`) !== slug) throw new Error('slug drifted from the output path');
+  writeAtomic(file.outputPath, page, 0o644);
+  const put = await brain.putPage(group.source, slug, file.outputPath);
+  const attempts = put.pending ? (prior && prior.sha256 === digest ? (prior.pendingAttempts ?? 0) : 0) + 1 : 0;
+  const entry: ManifestEntry = {
+    sha256: digest,
+    bot: file.botId,
+    source: group.source,
+    slug,
+    output: file.outputPath,
+    originRelpath: originOf(config.shareRoot, file.absolute, file.botId, file.inputIndex, file.relativePosix),
+    inBrain: put.ok,
+    pending: put.pending,
+    ...(put.pending ? { pendingAttempts: attempts } : {}),
+  };
+  manifest.files[file.absolute] = entry;
+  if (put.pending) return true;
+  if (!put.ok) return false;
+  summary.written++;
+  return true;
 }
 
 function emptyBot(id: string, source: string): BotSummary {

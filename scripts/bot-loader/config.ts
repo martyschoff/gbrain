@@ -1,12 +1,12 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
-import { expandHome } from './files.ts';
+import { expandHome, isInside } from './files.ts';
 
 export interface InputFolder {
   path: string;
   required: boolean;
   /** box-export inputs are still read when the stamp is stale; the run only warns. */
-  role?: 'box-export';
+  role?: 'box-export' | 'local-feed';
 }
 
 export interface BotConfig {
@@ -23,6 +23,14 @@ export interface GroupConfig {
   /** finance must stay a plain directory: no git metadata. */
   forbidGit: boolean;
   bots: BotConfig[];
+  /** Whole-group checks. Omitted or false keeps today's per-file warn path. */
+  failClosed: boolean;
+  /** Required when failClosed. Compared to the feed manifest. */
+  account?: string;
+  /** Required when failClosed. Stamp checks read only this directory. */
+  stampRoot?: string;
+  /** Business feeds set this and it must be the same directory as stampRoot. */
+  boxExportDir?: string;
 }
 
 export interface LoaderConfig {
@@ -65,6 +73,10 @@ interface RawGroup {
   ensure_source?: unknown;
   forbid_git?: unknown;
   bots?: unknown;
+  fail_closed?: unknown;
+  account?: unknown;
+  stamp_root?: unknown;
+  box_export_dir?: unknown;
 }
 
 /** True when both paths exist and name the same directory after symlinks. */
@@ -100,23 +112,31 @@ function defaultInputs(shareRoot: string, botId: string): InputFolder[] {
   ];
 }
 
-function parseInputs(raw: unknown, shareRoot: string, home: string, botId: string): InputFolder[] {
-  if (raw === undefined) return defaultInputs(shareRoot, botId);
+function parseInputs(raw: unknown, shareRoot: string, home: string, botId: string, failClosed: boolean): InputFolder[] {
+  if (raw === undefined) {
+    if (failClosed) throw new Error(`config: fail-closed bot ${botId} needs inputs`);
+    return defaultInputs(shareRoot, botId);
+  }
   if (!Array.isArray(raw)) throw new Error(`config: bot ${botId} inputs must be a list`);
+  if (failClosed && raw.length === 0) throw new Error(`config: fail-closed bot ${botId} needs inputs`);
   return raw.map((item, index) => {
     const row = item as RawInput;
     const role = row.role === undefined ? undefined : asString(row.role, `inputs[${index}].role`);
-    if (role !== undefined && role !== 'box-export') throw new Error(`config: unknown input role ${role}`);
+    if (role !== undefined && role !== 'box-export' && role !== 'local-feed') throw new Error(`config: unknown input role ${role}`);
     return {
       path: expandShare(asString(row.path, `bot ${botId} inputs[${index}].path`), shareRoot, home),
       required: asBool(row.required, false),
-      ...(role === 'box-export' ? { role: 'box-export' as const } : {}),
+      ...(role === 'box-export' || role === 'local-feed' ? { role } : {}),
     };
   });
 }
 
-function parseExtensions(raw: unknown, source: string): string[] {
-  const base = source === 'finance' ? FINANCE_EXTENSIONS : PERSONAL_EXTENSIONS;
+function parseExtensions(raw: unknown, source: string, failClosed: boolean): string[] {
+  const base = source === 'finance'
+    ? FINANCE_EXTENSIONS
+    : failClosed && source === 'hermes'
+      ? ['.md', '.txt']
+      : PERSONAL_EXTENSIONS;
   if (raw === undefined) return base;
   if (!Array.isArray(raw) || raw.length === 0) throw new Error(`config: extensions for source ${source} must be a non-empty list`);
   return raw.map((item, index) => {
@@ -126,21 +146,93 @@ function parseExtensions(raw: unknown, source: string): string[] {
   });
 }
 
+function pathsAreSame(left: string, right: string): boolean {
+  const a = resolve(left);
+  const b = resolve(right);
+  if (a === b) return true;
+  if (!existsSync(a) || !existsSync(b)) return false;
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+/** True when both sides name one directory. A missing side is equal only when neither exists and the resolved paths match. */
+function pathsConfirmedEqual(left: string, right: string): boolean {
+  const a = resolve(left);
+  const b = resolve(right);
+  const aExists = existsSync(a);
+  const bExists = existsSync(b);
+  if (aExists && bExists) {
+    try {
+      return realpathSync(a) === realpathSync(b);
+    } catch {
+      return false;
+    }
+  }
+  if (!aExists && !bExists) return a === b;
+  return false;
+}
+
+function validateFailClosed(group: GroupConfig, raw: RawGroup, personalBox: string, financeTargets: string[]): void {
+  if (!group.failClosed) return;
+  if (group.source === 'finance') throw new Error(`config: fail-closed group ${group.id} cannot be finance`);
+  if (group.source !== 'business' && group.source !== 'hermes') {
+    throw new Error(`config: fail-closed source ${group.source} is not business or hermes`);
+  }
+  if (!group.account || !group.stampRoot) throw new Error(`config: fail-closed group ${group.id} needs account and stamp_root`);
+  if (group.source === 'business' && group.account !== 'businessgrok') {
+    throw new Error(`config: business group ${group.id} account must be businessgrok`);
+  }
+  if (group.source === 'hermes' && group.account !== 'hermes') {
+    throw new Error(`config: hermes group ${group.id} account must be hermes`);
+  }
+  if (group.forbidGit) throw new Error(`config: fail-closed group ${group.id} cannot set forbid_git`);
+  if (group.extensions.includes('.csv')) throw new Error(`config: fail-closed group ${group.id} cannot list .csv`);
+  if (pathsAreSame(group.stampRoot, personalBox)) {
+    throw new Error(`config: fail-closed group ${group.id} stamp_root is the personal box export`);
+  }
+  if (financeTargets.some((target) => isInside(target, group.stampRoot!) || isInside(group.stampRoot!, target))) {
+    throw new Error(`config: fail-closed group ${group.id} stamp_root overlaps a finance target`);
+  }
+  const hasBox = Object.prototype.hasOwnProperty.call(raw, 'box_export_dir');
+  if (group.source === 'business') {
+    if (!group.boxExportDir || !pathsConfirmedEqual(group.boxExportDir, group.stampRoot)) {
+      throw new Error(`config: business group ${group.id} box_export_dir must match stamp_root`);
+    }
+  } else if (hasBox) {
+    throw new Error(`config: hermes group ${group.id} must not set box_export_dir`);
+  }
+  for (const bot of group.bots) {
+    for (const input of bot.inputs) {
+      if (!isInside(group.stampRoot, input.path)) {
+        throw new Error(`config: fail-closed bot ${bot.id} input is outside stamp_root`);
+      }
+      if (financeTargets.some((target) => isInside(target, input.path) || isInside(input.path, target))) {
+        throw new Error(`config: fail-closed bot ${bot.id} input is inside a finance target`);
+      }
+    }
+  }
+}
+
 export function loadConfig(path: string, home: string): LoaderConfig {
   const raw = readFileSync(path, 'utf8');
   const parsed = JSON.parse(raw) as Record<string, unknown>;
   const rawShare = asString(parsed.share_root, 'share_root');
   const shareRoot = resolve(expandHome(rawShare, home));
   const shareConfirmed = parsed.share_root_confirmed === true;
+  const personalBox = resolve(expandShare(typeof parsed.box_export_dir === 'string' ? parsed.box_export_dir : '<share>/personalgrok/gbrain/_box-export', shareRoot, home));
   const groupsRaw = parsed.groups;
   if (!Array.isArray(groupsRaw) || groupsRaw.length === 0) throw new Error('config: groups must be a non-empty list');
-  const groups: GroupConfig[] = groupsRaw.map((item, index) => {
+  const parsedGroups = groupsRaw.map((item, index) => {
     const group = item as RawGroup;
     const id = asString(group.id, `groups[${index}].id`);
     const source = asString(group.source, `groups[${index}].source`);
     if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(id) || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(source)) {
       throw new Error(`config: group ${id} source ${source} must be a lowercase slug`);
     }
+    const failClosed = asBool(group.fail_closed, false);
     const targetRoot = resolve(expandShare(asString(group.target_root, `group ${id} target_root`), shareRoot, home));
     const botsRaw = group.bots;
     if (!Array.isArray(botsRaw)) throw new Error(`config: group ${id} bots must be a list`);
@@ -148,18 +240,35 @@ export function loadConfig(path: string, home: string): LoaderConfig {
       const bot = botItem as RawBot;
       const botId = asString(bot.id, `group ${id} bots[${botIndex}].id`);
       if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(botId)) throw new Error(`config: bot id ${botId} must be a lowercase slug`);
-      return { id: botId, inputs: parseInputs(bot.inputs, shareRoot, home, botId) };
+      return { id: botId, inputs: parseInputs(bot.inputs, shareRoot, home, botId, failClosed) };
     });
     const forbidGit = asBool(group.forbid_git, source === 'finance');
-    return {
+    const account = group.account === undefined ? undefined : asString(group.account, `group ${id} account`);
+    const stampRoot = group.stamp_root === undefined
+      ? undefined
+      : resolve(expandShare(asString(group.stamp_root, `group ${id} stamp_root`), shareRoot, home));
+    const boxExportDir = group.box_export_dir === undefined
+      ? undefined
+      : resolve(expandShare(asString(group.box_export_dir, `group ${id} box_export_dir`), shareRoot, home));
+    const built: GroupConfig = {
       id,
       source,
       targetRoot,
-      extensions: parseExtensions(group.extensions, source),
+      extensions: parseExtensions(group.extensions, source, failClosed),
       ensureSource: asBool(group.ensure_source, source === 'finance'),
       forbidGit,
       bots,
+      failClosed,
+      ...(account ? { account } : {}),
+      ...(stampRoot ? { stampRoot } : {}),
+      ...(boxExportDir ? { boxExportDir } : {}),
     };
+    return { raw: group, built };
+  });
+  const financeTargets = parsedGroups.filter((item) => item.built.source === 'finance').map((item) => item.built.targetRoot);
+  const groups: GroupConfig[] = parsedGroups.map((item) => {
+    validateFailClosed(item.built, item.raw, personalBox, financeTargets);
+    return item.built;
   });
   const seenBots = new Set<string>();
   const seenSources = new Map<string, string>();
@@ -196,7 +305,7 @@ export function loadConfig(path: string, home: string): LoaderConfig {
     maxBytes: typeof parsed.max_bytes === 'number' && parsed.max_bytes > 0 ? parsed.max_bytes : 1024 * 1024,
     csvMaxRows: typeof parsed.csv_max_rows === 'number' && parsed.csv_max_rows > 0 ? parsed.csv_max_rows : 500,
     boxExportMaxAgeHours: typeof parsed.box_export_max_age_hours === 'number' && parsed.box_export_max_age_hours > 0 ? parsed.box_export_max_age_hours : 36,
-    boxExportDir: resolve(expandShare(typeof parsed.box_export_dir === 'string' ? parsed.box_export_dir : '<share>/personalgrok/gbrain/_box-export', shareRoot, home)),
+    boxExportDir: personalBox,
     placeholder,
     groups,
   };

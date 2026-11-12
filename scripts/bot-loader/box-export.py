@@ -7,6 +7,7 @@ directory. --out defaults to ~/.gbrain/box-export. Sources are never modified.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -59,7 +60,7 @@ def load_bots(path):
     return mapping
 
 
-def export_tree(bots, out_dir, dry_run):
+def export_tree(bots, out_dir, dry_run, account=None, source=None):
     counts = {}
     files = []
     missing = []
@@ -75,9 +76,9 @@ def export_tree(bots, out_dir, dry_run):
             if secret_name(rel):
                 secrets += 1
                 continue
-            source = os.path.join(root, *rel.split("/"))
+            src_path = os.path.join(root, *rel.split("/"))
             try:
-                with open(source, "r", encoding="utf-8") as handle:
+                with open(src_path, "r", encoding="utf-8") as handle:
                     text = handle.read()
             except (OSError, UnicodeError):
                 secrets += 1
@@ -108,6 +109,25 @@ def export_tree(bots, out_dir, dry_run):
             lines.append("%s %s" % (name, copied))
         with open(os.path.join(staging, "EXPORTED_AT"), "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n")
+        if account is not None:
+            listed = {}
+            total = 0
+            for name, rel, text in files:
+                payload = text.encode("utf-8")
+                key = name + "/" + rel
+                listed[key] = hashlib.sha256(payload).hexdigest()
+                total += len(payload)
+            manifest = {
+                "version": 1,
+                "account": account,
+                "source": source,
+                "exported_at": stamp,
+                "files": dict(sorted(listed.items())),
+                "file_count": len(listed),
+                "byte_count": total,
+            }
+            with open(os.path.join(staging, "MANIFEST.json"), "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(manifest, indent=2) + "\n")
         backup = out_dir + ".bak"
         if os.path.isdir(backup):
             shutil.rmtree(backup)
@@ -130,9 +150,15 @@ def main(argv):
     parser.add_argument("config", help="JSON file mapping bot name to an agent-data directory")
     parser.add_argument("--out", default=DEFAULT_OUT, help="output directory (default: %s)" % DEFAULT_OUT)
     parser.add_argument("--dry-run", action="store_true", help="print counts only; write nothing")
+    parser.add_argument("--account", help="when set with --source, write MANIFEST.json")
+    parser.add_argument("--source", help="when set with --account, write MANIFEST.json")
     args = parser.parse_args(argv)
+    if (args.account is None) != (args.source is None):
+        raise SystemExit("config: --account and --source must be set together")
+    if args.account is not None and (args.account.strip() == "" or args.source.strip() == ""):
+        raise SystemExit("config: --account and --source must be non-empty")
     bots = load_bots(args.config)
-    return export_tree(bots, os.path.expanduser(args.out), args.dry_run)
+    return export_tree(bots, os.path.expanduser(args.out), args.dry_run, args.account, args.source)
 
 
 if __name__ == "__main__":
