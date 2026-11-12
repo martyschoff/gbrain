@@ -123,7 +123,13 @@ describe('multi-account export time', () => {
     expect(deniedExportContent('api_key=' + 'not-a-real-value')).toBe(true);
     expect(deniedExportContent('The holdings list stays offline.')).toBe(true);
     expect(deniedExportContent('9' + ' Example ' + 'Place')).toBe(true);
+    expect(deniedExportContent('9 items in place.')).toBe(false);
+    expect(deniedExportContent('call +1 ' + '555' + ' ' + '010' + ' ' + '0199')).toBe(true);
+    expect(deniedExportContent('We are holding the meeting on Friday.')).toBe(false);
+    expect(deniedExportContent('The api key is rotated quarterly.')).toBe(false);
     expect(deniedExportContent('From: ada\nSubject: hello\n\nA note.\n')).toBe(true);
+    expect(deniedExportContent('To: alice-example\nDate: Thu, 12 Nov 2026 02:00:00 -0500\n\nA note.\n')).toBe(true);
+    expect(deniedExportContent('Subject: weekly plan\n\nOrdinary notes from the meeting.\n')).toBe(false);
     expect(deniedExportContent('A fake fact.')).toBe(false);
   });
 });

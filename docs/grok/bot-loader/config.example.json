@@ -58,16 +58,16 @@
   "export_roots": [
     {
       "account": "account-a",
-      "path": "<share>/exports/_box-export",
+      "path": "<EXPORT-ROOT>/_box-export",
       "source": "account-a",
-      "target_root": "<share>/exports/pages-a",
+      "target_root": "<EXPORT-ROOT>/pages/account-a",
       "ensure_source": false
     },
     {
       "account": "account-b",
-      "path": "<share>/exports/_box-export-account-b",
+      "path": "<EXPORT-ROOT>/_box-export-<ACCOUNT-B>",
       "source": "account-b",
-      "target_root": "<share>/exports/pages-b",
+      "target_root": "<EXPORT-ROOT>/pages/account-b",
       "ensure_source": false
     }
   ]

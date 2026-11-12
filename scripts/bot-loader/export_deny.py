@@ -31,6 +31,15 @@ def load_denies():
 _FILE = load_denies()
 _NAMES = _compile(_FILE["names"])
 _CONTENT = _compile(_FILE["content"])
+_MAIL_HEADERS = _FILE.get("mail_headers") or []
+_MAIL_MIN = int(_FILE.get("mail_min_headers") or 2)
+_MAIL_SCAN = int(_FILE.get("mail_scan_lines") or 20)
+_MAIL_LINE = None
+if _MAIL_HEADERS:
+    _MAIL_LINE = re.compile(
+        r"^(?:" + "|".join(re.escape(name) for name in _MAIL_HEADERS) + r"):[ \t]+\S",
+        re.IGNORECASE,
+    )
 
 
 def denied_name(rel):
@@ -38,5 +47,18 @@ def denied_name(rel):
     return any(pattern.search(base) for pattern in _NAMES)
 
 
+def looks_like_mail(text):
+    """Several RFC 822 header lines near the top, with or without an address."""
+    if _MAIL_LINE is None:
+        return False
+    count = 0
+    for line in text.splitlines()[:_MAIL_SCAN]:
+        if _MAIL_LINE.match(line):
+            count += 1
+    return count >= _MAIL_MIN
+
+
 def denied_content(text):
+    if looks_like_mail(text):
+        return True
     return any(pattern.search(text) for pattern in _CONTENT)

@@ -378,7 +378,8 @@ function parseExportRoots(raw: unknown, shareRoot: string, home: string): Export
     const path = resolve(expandShare(asString(row.path, `export_roots[${index}].path`), shareRoot, home));
     const targetRoot = resolve(expandShare(asString(row.target_root, `export_roots[${index}].target_root`), shareRoot, home));
     const base = basename(path);
-    if (base !== '_box-export' && base !== `_box-export-${account}`) {
+    const placeholderBase = base === '_box-export-<ACCOUNT-B>';
+    if (base !== '_box-export' && base !== `_box-export-${account}` && !placeholderBase) {
       throw new Error(`config: export root ${account} path must be named _box-export or _box-export-${account}`);
     }
     if (source === 'finance' || basename(targetRoot) === 'finance') {

@@ -10,6 +10,7 @@ import { createGbrainClient, manifestCounts, putArgv, addSourceArgv } from '../s
 import { shareIsMounted } from '../scripts/bot-loader/host.ts';
 import { readManifest } from '../scripts/bot-loader/manifest.ts';
 import { csvToMarkdown, renderPage, sha256 } from '../scripts/bot-loader/render.ts';
+import { checkFailClosed } from '../scripts/bot-loader/fail-closed.ts';
 import { runLoader } from '../scripts/bot-loader/run.ts';
 import { contentHasSecret, isSecretFileName } from '../scripts/bot-loader/secrets.ts';
 import secretPatterns from '../scripts/bot-loader/secret-patterns.json';
@@ -1051,6 +1052,7 @@ describe('fail-closed feeds', () => {
     const home = temp('gbrain-feed-cfg-');
     const share = join(home, 'share');
     const example = loadConfig(join(REPO, 'docs/grok/bot-loader/config.example.json'), home);
+    expect(example.exportRoots.map((root) => root.account)).toEqual(['account-a', 'account-b']);
     expect(example.groups.every((group) => group.failClosed === false)).toBe(true);
     expect(example.groups.some((group) => group.stampRoot)).toBe(false);
     const stamp = join(share, 'businessgrok/gbrain/_box-export');
@@ -1528,5 +1530,43 @@ describe('fail-closed feeds', () => {
       expect(manifest.files[rel]!.size).toBe(body.length);
     }
     expect(existsSync(join(out, 'example-bot/attachments/note.txt'))).toBe(false);
+  });
+
+  test('a fail-closed export is accepted by the fail-closed reader', async () => {
+    const home = temp('gbrain-feed-produced-');
+    const share = join(home, 'share');
+    const agent = join(home, 'agent');
+    write(join(agent, 'profile.json'), '{"id":"example-bot"}\n');
+    write(join(agent, 'memory/profile.md'), '# profile\n\nA fake fact.\n');
+    write(join(agent, 'attachments/note.txt'), 'hello\n');
+    const cfg = join(home, 'box.json');
+    writeFileSync(cfg, JSON.stringify({ bots: { 'example-bot': agent } }));
+    const closed = join(share, 'businessgrok/gbrain/_box-export');
+    const signed = spawnSync('python3', [BOX, cfg, '--out', closed, '--account', 'businessgrok', '--source', 'business', '--fail-closed'], { encoding: 'utf8' });
+    expect(signed.status).toBe(0);
+    expect(existsSync(join(closed, 'EXPORTED_AT'))).toBe(true);
+    expect(existsSync(join(closed, 'MANIFEST.json'))).toBe(true);
+    const config = feedConfig(home, share, [
+      personalGroup(share),
+      businessGroup(share, closed, [{
+        id: 'example-bot',
+        inputs: [{ path: join(closed, 'example-bot'), required: false, role: 'box-export' }],
+      }]),
+    ]);
+    const group = config.groups.find((item) => item.source === 'business');
+    expect(group).toBeDefined();
+    const checked = checkFailClosed(group!, {
+      groups: config.groups,
+      now: new Date(),
+      maxBytes: config.maxBytes,
+      maxAgeHours: config.boxExportMaxAgeHours,
+    });
+    expect(checked.ok).toBe(true);
+    if (!checked.ok) return;
+    expect(checked.files.map((file) => file.relativePosix).sort()).toEqual(['attachments/note.txt', 'memory/profile.md', 'profile.json']);
+    const result = await runAt(config, brainSpy().brain);
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).not.toContain('SKIP business');
+    expect(readFileSync(join(share, 'personalgrok/gbrain/business/example-bot/memory/profile.md'), 'utf8')).toContain('A fake fact.');
   });
 });
