@@ -185,28 +185,53 @@ export function createUpstreamTokens(options: UpstreamTokenOptions): UpstreamTok
     const expiresIn = typeof payload.expires_in === 'number' && Number.isFinite(payload.expires_in) && payload.expires_in > 0
       ? Math.floor(payload.expires_in)
       : DEFAULT_ACCESS_TTL_SECONDS;
+    const expiresAt = Math.floor(options.now() / 1000) + expiresIn;
+    let committed: { replaced: true; doc: Record<string, unknown> } | { replaced: false; doc: Record<string, unknown> };
+    try {
+      committed = commitMintedToken(path, doc, minted, expiresAt);
+    } catch (error) {
+      if (error instanceof UpstreamTokenError) throw error;
+      throw new UpstreamTokenError(502, 'upstream_token_refresh_failed');
+    }
+    if (committed.replaced) return fromReplacedFile(committed.doc);
+    return { header: `Bearer ${minted}`, secret: minted, redactions: redactionsFrom(committed.doc, [minted]), refreshable: true };
+  }
+
+  /**
+   * Write the minted token into the file as it is now.
+   * A replaced client is left unchanged and the minted token is not used.
+   */
+  function commitMintedToken(
+    path: string,
+    mintedFor: Record<string, unknown>,
+    minted: string,
+    expiresAt: number,
+  ): { replaced: true; doc: Record<string, unknown> } | { replaced: false; doc: Record<string, unknown> } {
     let latest: Record<string, unknown>;
     try {
       latest = readGrant(path);
     } catch {
       throw new UpstreamTokenError(502, 'upstream_token_refresh_failed');
     }
-    if (latest.client_id !== clientId || latest.client_secret !== clientSecret) {
-      return fromFile(latest);
+    if (latest.client_id !== mintedFor.client_id || latest.client_secret !== mintedFor.client_secret) {
+      return { replaced: true, doc: latest };
     }
-    const next = { ...latest, access_token: minted, expires_at: Math.floor(options.now() / 1000) + expiresIn };
-    try {
-      writePrivateJsonAtomic(path, next);
-    } catch {
-      throw new UpstreamTokenError(502, 'upstream_token_refresh_failed');
-    }
-    return { header: `Bearer ${minted}`, secret: minted, redactions: redactionsFrom(latest, [minted]), refreshable: true };
+    const next = { ...latest, access_token: minted, expires_at: expiresAt };
+    writePrivateJsonAtomic(path, next);
+    return { replaced: false, doc: next };
   }
 
   function fromFile(doc: Record<string, unknown>): UpstreamAuthorization {
     const token = accessTokenOf(doc);
     if (!token) return { header: null, secret: null, redactions: redactionsFrom(doc), refreshable: hasClientCredentials(doc) };
     return { header: `Bearer ${token}`, secret: token, redactions: redactionsFrom(doc, [token]), refreshable: hasClientCredentials(doc) };
+  }
+
+  /** Credentials changed mid-exchange. Send the file's token, and let a 401 through. */
+  function fromReplacedFile(doc: Record<string, unknown>): UpstreamAuthorization {
+    const token = accessTokenOf(doc);
+    if (!token) return { header: null, secret: null, redactions: redactionsFrom(doc), refreshable: false };
+    return { header: `Bearer ${token}`, secret: token, redactions: redactionsFrom(doc, [token]), refreshable: false };
   }
 
   function current(doc: Record<string, unknown>): UpstreamAuthorization | null {

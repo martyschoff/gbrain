@@ -240,6 +240,35 @@ describe('upstream grant refresh', () => {
     await upstream.close();
   });
 
+  test('an empty grant file is bad_gateway and is not proxied', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-empty-'));
+    const path = join(dir, 'personal.json');
+    writeFileSync(path, '{}\n', { mode: 0o600 });
+    const { config, bearer } = gateConfig(path);
+    let tokenCalls = 0;
+    const upstream = await serveUpstream((_req, res) => {
+      res.writeHead(200);
+      res.end('should-not-proxy');
+    });
+    const gate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${upstream.port}`,
+      now: () => NOW_MS,
+      fetchImpl: async () => {
+        tokenCalls += 1;
+        return tokenResponse(200, { access_token: MINTED_TOKEN, expires_in: 3600 });
+      },
+    });
+    const port = await listenGate(gate);
+    const response = await call(port, bearer);
+    expect(response.status).toBe(502);
+    expect(response.text).toContain('bad_gateway');
+    expect(response.text.includes('should-not-proxy')).toBe(false);
+    expect(tokenCalls).toBe(0);
+    await new Promise<void>(resolve => gate.close(() => resolve()));
+    await upstream.close();
+  });
+
   test('a failed refresh is 502 or 401 and includes no secret', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-fail-'));
     mkdirSync(join(dir, 'second'));
@@ -386,5 +415,44 @@ describe('upstream grant refresh', () => {
     expect(kept.file.access_token).not.toBe(MINTED_TOKEN);
     expect(statSync(sameCreds).mode & 0o777).toBe(0o600);
     expect(statSync(changedCreds).mode & 0o777).toBe(0o600);
+
+    const tokenless = join(dir, 'tokenless.json');
+    writeFileSync(tokenless, `${JSON.stringify({
+      client_id: 'client-test',
+      client_secret: CLIENT_SECRET,
+      access_token: STALE_TOKEN,
+      expires_at: NOW_SEC - 5,
+    })}\n`, { mode: 0o600 });
+    const bare = { client_id: 'client-replaced', client_secret: 'secret-replaced-do-not-log', profile: 'memory-reader' };
+    const deniedHits: string[] = [];
+    let tokenCalls = 0;
+    const deniedUpstream = await serveUpstream((req, res) => {
+      deniedHits.push(String(req.headers.authorization ?? ''));
+      req.resume();
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"error":"invalid_token","source":"serve"}');
+    });
+    const deniedConfig = gateConfig(tokenless);
+    const deniedGate = createFunnelGate({
+      config: deniedConfig.config,
+      upstreamBaseUrl: `http://127.0.0.1:${deniedUpstream.port}`,
+      now: () => NOW_MS,
+      fetchImpl: async () => {
+        tokenCalls += 1;
+        writePrivateJsonAtomic(tokenless, bare);
+        return tokenResponse(200, { access_token: MINTED_TOKEN, expires_in: 3600, token_type: 'bearer' });
+      },
+    });
+    const deniedPort = await listenGate(deniedGate);
+    const denied = await call(deniedPort, deniedConfig.bearer);
+    expect(denied.status).toBe(401);
+    expect(denied.text).toContain('invalid_token');
+    expect(denied.text).toContain('serve');
+    expect(denied.text.includes('upstream_unauthorized')).toBe(false);
+    expect(tokenCalls).toBe(1);
+    expect(deniedHits).toEqual(['']);
+    expect(JSON.parse(readFileSync(tokenless, 'utf8'))).toEqual(bare);
+    await new Promise<void>(resolve => deniedGate.close(() => resolve()));
+    await deniedUpstream.close();
   });
 });
