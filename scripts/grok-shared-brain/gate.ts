@@ -5,11 +5,11 @@
  * `shared` are refused after a valid token. The process binds 127.0.0.1 and
  * does not run `tailscale`.
  */
-import { readFileSync } from 'node:fs';
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer, type Server } from 'node:http';
 import { authorizeRoute, evaluateMcpBody, queryTargetsSharedWrite, routeClass } from './mcp-policy.ts';
-import { authenticate, pathInside, redactSecrets, type ClientRecord, type FunnelConfig } from './tokens.ts';
+import { authenticate, pathInside, redactSecrets, type FunnelConfig } from './tokens.ts';
+import { createUpstreamTokens, UpstreamTokenError, type TokenEndpointFetch, type UpstreamAuthorization } from './upstream-token.ts';
 
 export const BODY_LIMIT = 1_048_576;
 /** How long a request may take to finish sending its body before the gate answers 408. */
@@ -23,6 +23,8 @@ export interface GateOptions {
   rateLimit?: { windowMs: number; max: number };
   /** When set, an upstream_token_file inside this directory is refused. */
   repoRoot?: string;
+  /** Token-endpoint client. Tests inject this. Default is global fetch. */
+  fetchImpl?: TokenEndpointFetch;
 }
 
 interface Bucket { stamps: number[] }
@@ -115,17 +117,6 @@ class WindowLimiter {
   }
 }
 
-function upstreamAuthorization(record: ClientRecord): { header: string | null; secret: string | null } {
-  if (!record.upstream_token_file) return { header: null, secret: null };
-  let parsed: { access_token?: unknown };
-  try { parsed = JSON.parse(readFileSync(record.upstream_token_file, 'utf8')) as { access_token?: unknown }; }
-  catch { throw Object.assign(new Error('upstream_token_unreadable'), { code: 'upstream_token_unreadable' }); }
-  if (typeof parsed.access_token !== 'string' || parsed.access_token.length === 0) {
-    throw Object.assign(new Error('upstream_token_missing'), { code: 'upstream_token_missing' });
-  }
-  return { header: `Bearer ${parsed.access_token}`, secret: parsed.access_token };
-}
-
 /**
  * Headers the loopback serve reads for a normal MCP call.
  * Authorization and content-length are set below from the gate, not copied.
@@ -150,6 +141,18 @@ function rejectsContentEncoding(value: string | string[] | undefined): boolean {
   });
 }
 
+interface HeldUpstream {
+  status: number;
+  headers: Record<string, string | number | string[]>;
+  body: Buffer;
+}
+
+interface ProxyResult {
+  status: number;
+  /** Set when `holdStatus` matched and the client has not been written yet. */
+  held?: HeldUpstream;
+}
+
 function proxy(
   upstream: URL,
   req: IncomingMessage,
@@ -157,7 +160,8 @@ function proxy(
   res: ServerResponse,
   authorization: string | null,
   onStatus: (status: number) => void,
-): void {
+  holdStatus?: number,
+): Promise<ProxyResult> {
   const target = new URL(req.url ?? '/', upstream);
   const headers: Record<string, string | number> = {};
   for (const [key, value] of Object.entries(req.headers)) {
@@ -168,68 +172,121 @@ function proxy(
   if (authorization) headers.authorization = authorization;
   headers.host = upstream.host;
   headers['content-length'] = body.length;
-  let reported = false;
-  const report = (status: number) => {
-    if (reported) return;
-    reported = true;
-    onStatus(status);
-  };
-  const fail = (status: number) => {
-    if (res.headersSent) return;
-    report(status);
-    sendJson(res, status, { error: 'bad_gateway' });
-  };
-  // One attempt per request. A down upstream is 502; the process keeps listening
-  // and the next request tries again. Nothing here is logged, including authorization.
-  const upstreamReq = httpRequest({
-    protocol: upstream.protocol,
-    hostname: upstream.hostname,
-    port: upstream.port,
-    method: req.method,
-    path: `${target.pathname}${target.search}`,
-    headers,
-  }, upstreamRes => {
-    report(upstreamRes.statusCode ?? 502);
-    const out: Record<string, string | number | string[]> = {};
-    for (const [key, value] of Object.entries(upstreamRes.headers)) {
-      if (value === undefined) continue;
-      if (key.toLowerCase() === 'connection') continue;
-      out[key] = value;
-    }
-    res.writeHead(upstreamRes.statusCode ?? 502, out);
-    upstreamRes.pipe(res);
+  // Nothing here is logged, including authorization. A down upstream is 502.
+  // The caller may invoke this a second time after one upstream 401.
+  return new Promise(resolvePromise => {
+    let settled = false;
+    let onClientGone = () => {};
+    let onClientClose = () => {};
+    const settle = (result: ProxyResult) => {
+      if (settled) return;
+      settled = true;
+      req.removeListener('aborted', onClientGone);
+      res.removeListener('close', onClientClose);
+      resolvePromise(result);
+    };
+    let reported = false;
+    const report = (status: number) => {
+      if (reported) return;
+      reported = true;
+      onStatus(status);
+    };
+    const fail = (status: number) => {
+      if (res.headersSent) {
+        settle({ status });
+        return;
+      }
+      report(status);
+      sendJson(res, status, { error: 'bad_gateway' });
+      settle({ status });
+    };
+    let clientGone = false;
+    const upstreamReq = httpRequest({
+      protocol: upstream.protocol,
+      hostname: upstream.hostname,
+      port: upstream.port,
+      method: req.method,
+      path: `${target.pathname}${target.search}`,
+      headers,
+    }, upstreamRes => {
+      const status = upstreamRes.statusCode ?? 502;
+      const out: Record<string, string | number | string[]> = {};
+      for (const [key, value] of Object.entries(upstreamRes.headers)) {
+        if (value === undefined) continue;
+        if (key.toLowerCase() === 'connection') continue;
+        out[key] = value;
+      }
+      if (holdStatus !== undefined && status === holdStatus) {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        let overflow = false;
+        upstreamRes.on('data', (chunk: Buffer) => {
+          if (overflow) return;
+          size += chunk.length;
+          if (size > BODY_LIMIT) {
+            overflow = true;
+            chunks.length = 0;
+            return;
+          }
+          chunks.push(chunk);
+        });
+        upstreamRes.on('end', () => {
+          if (clientGone || res.headersSent || res.writableEnded) {
+            settle({ status });
+            return;
+          }
+          if (overflow) {
+            fail(502);
+            return;
+          }
+          settle({ status, held: { status, headers: out, body: Buffer.concat(chunks) } });
+        });
+        upstreamRes.on('error', () => {
+          if (!clientGone) fail(502);
+          else settle({ status: 502 });
+        });
+        return;
+      }
+      report(status);
+      if (!res.headersSent) res.writeHead(status, out);
+      upstreamRes.pipe(res);
+      upstreamRes.on('end', () => settle({ status }));
+      upstreamRes.on('error', () => settle({ status }));
+    });
+    // Five seconds covers connect and the response headers only. MCP SSE stays
+    // open and can be quiet for longer than that; leaving the timer on would
+    // cut the body. Drop the timer and its listener once headers arrive, the
+    // upstream errors, or the client aborts or closes, so it cannot fire later.
+    const onTimeout = () => {
+      upstreamReq.destroy();
+      fail(502);
+    };
+    upstreamReq.setTimeout(5_000, onTimeout);
+    const disarm = () => {
+      upstreamReq.setTimeout(0);
+      upstreamReq.removeListener('timeout', onTimeout);
+    };
+    onClientGone = () => {
+      if (clientGone) return;
+      clientGone = true;
+      disarm();
+      if (!res.writableFinished) upstreamReq.destroy();
+      settle({ status: 499 });
+    };
+    onClientClose = () => {
+      disarm();
+      if (!res.writableFinished) onClientGone();
+    };
+    upstreamReq.on('response', disarm);
+    upstreamReq.on('error', () => {
+      disarm();
+      if (!clientGone) fail(502);
+      else settle({ status: 502 });
+    });
+    req.on('aborted', onClientGone);
+    res.on('close', onClientClose);
+    upstreamReq.end(body);
   });
-  // Five seconds covers connect and the response headers only. MCP SSE stays
-  // open and can be quiet for longer than that; leaving the timer on would
-  // cut the body. Drop the timer and its listener once headers arrive, the
-  // upstream errors, or the client aborts or closes, so it cannot fire later.
-  const onTimeout = () => {
-    upstreamReq.destroy();
-    fail(502);
-  };
-  upstreamReq.setTimeout(5_000, onTimeout);
-  let clientGone = false;
-  const disarm = () => {
-    upstreamReq.setTimeout(0);
-    upstreamReq.removeListener('timeout', onTimeout);
-  };
-  const onClientGone = () => {
-    if (clientGone) return;
-    clientGone = true;
-    disarm();
-    if (!res.writableFinished) upstreamReq.destroy();
-  };
-  upstreamReq.on('response', disarm);
-  upstreamReq.on('error', () => {
-    disarm();
-    if (!clientGone) fail(502);
-  });
-  req.on('aborted', onClientGone);
-  res.on('close', () => {
-    disarm();
-    if (!res.writableFinished) onClientGone();
-  });
-  upstreamReq.end(body);
 }
 
 export function createFunnelGate(options: GateOptions): Server {
@@ -248,6 +305,7 @@ export function createFunnelGate(options: GateOptions): Server {
     max: options.config.rate_limit.max,
   };
   const limiter = new WindowLimiter(rate.windowMs, rate.max, now);
+  const upstreamTokens = createUpstreamTokens({ upstream, now, fetchImpl: options.fetchImpl });
   return createServer((req, res) => {
     void handle(req, res).catch(error => {
       if (res.headersSent) return;
@@ -272,8 +330,9 @@ export function createFunnelGate(options: GateOptions): Server {
     const presented = typeof header === 'string' ? header : undefined;
     const auth = authenticate(presented, options.config);
     const secret = presented?.replace(/^Bearer\s+/i, '').trim();
+    const hidden = [presented ?? '', secret ?? ''].filter(item => item.length > 0);
     const finish = (status: number, client: string, upstreamSecret?: string | null) => {
-      const extras = [presented ?? '', secret ?? '', upstreamSecret ?? ''].filter(item => item.length > 0);
+      const extras = upstreamSecret ? [...hidden, upstreamSecret] : [...hidden];
       log(redactSecrets(`${method} ${url.pathname} client=${client} status=${status}`, extras));
     };
     if (!auth.ok) {
@@ -319,18 +378,39 @@ export function createFunnelGate(options: GateOptions): Server {
         return;
       }
     }
-    let authorization: string | null = null;
-    let upstreamSecret: string | null = null;
-    try {
-      const resolved = upstreamAuthorization(auth.record);
-      authorization = resolved.header;
-      upstreamSecret = resolved.secret;
-    } catch {
+    const sendTokenError = (error: unknown) => {
+      if (res.headersSent) return;
+      if (error instanceof UpstreamTokenError) {
+        finish(error.status, auth.client);
+        sendJson(res, error.status, { error: error.error });
+        return;
+      }
       finish(502, auth.client);
       sendJson(res, 502, { error: 'bad_gateway' });
+    };
+    let authz: UpstreamAuthorization;
+    try {
+      authz = await upstreamTokens.resolve(auth.record);
+    } catch (error) {
+      sendTokenError(error);
       return;
     }
-    proxy(upstream, req, body, res, authorization, status => finish(status, auth.client, upstreamSecret));
+    hidden.push(...authz.redactions);
+    const canRefresh = authz.refreshable;
+    const first = await proxy(
+      upstream, req, body, res, authz.header,
+      status => finish(status, auth.client, authz.secret),
+      canRefresh ? 401 : undefined,
+    );
+    if (!first.held || res.headersSent || res.writableEnded) return;
+    try {
+      authz = await upstreamTokens.refreshAfterUnauthorized(auth.record, authz.secret ?? '');
+    } catch (error) {
+      sendTokenError(error);
+      return;
+    }
+    hidden.push(...authz.redactions);
+    await proxy(upstream, req, body, res, authz.header, status => finish(status, auth.client, authz.secret));
   }
 }
 

@@ -103,7 +103,7 @@ The harness id is `grok-bot` for all three. That is the HTTP thin-cli id in `gbr
 
 A successful `gbrain mcp grant --json` prints a redacted receipt (`credentialReceipt`: client id, URL, profile, harness, source, expiry). A failure prints the error message on stdout, and that text is scrubbed only for the admin bootstrap token, so a client secret in an error string could show up. These blocks send stdout to `/dev/null` and print one line that names the private file.
 
-`grok-bot` access tokens expire. The gate reads `access_token` from the grant file on every proxied request and does not refresh it. After you replace a grant file, the next request uses the new value. The checkout these blocks use is `$HOME/personalgrok/gbrain`.
+`grok-bot` access tokens expire. The gate reads `access_token` from the grant file on every proxied request and refreshes it with client_credentials before `expires_at`. The manual rewrite in `docs/grok/tailnet-mcp-access.md` is recovery when that refresh fails. After you replace a grant file, the next request uses the new value. The checkout these blocks use is `$HOME/personalgrok/gbrain`.
 
 ### 1. Grant personal
 
