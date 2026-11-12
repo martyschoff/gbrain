@@ -11,7 +11,7 @@ No code change is required for this path. The gate does not allow or reject a re
 | Fact | Where |
 | --- | --- |
 | MCP path is `/mcp` (also `/mcp/` on the gate) | `scripts/grok-shared-brain/mcp-policy.ts` `routeClass` (lines 26–29); serve mounts `POST /mcp` in `src/commands/serve-http-mcp.ts` (line 153) and documents that path in `src/commands/serve-http.ts` (line 7) |
-| Transport is stateless streamable HTTP | `src/commands/serve-http-mcp.ts` (lines 133–141 and 708). `GET /mcp` returns 405 with `Allow: POST, DELETE` because there is no server-initiated SSE backchannel. `POST /mcp` uses `StreamableHTTPServerTransport` with no session id. A `POST` body may still be answered as SSE when the client sends `Accept: application/json, text/event-stream`. This is not the legacy SSE transport. |
+| Transport is stateless streamable HTTP | `src/commands/serve-http-mcp.ts` (lines 133–141 and 708). `GET /mcp` returns 405 with `Allow: POST, DELETE` because there is no server-initiated SSE backchannel. `POST /mcp` uses `StreamableHTTPServerTransport` with no session id. This is not the legacy SSE transport. A curl check sends `Accept: application/json` and expects a JSON-RPC object. Sending `Accept: application/json, text/event-stream` can make that same POST succeed as SSE (`event: message` and a `data:` line that holds the JSON-RPC object). |
 | `tailscale serve` must proxy to the gate, `127.0.0.1:8767` | `scripts/grok-shared-brain/funnel-policy.ts` `GATE_PORT` (line 10) and `GBRAIN_SERVE_PORT` (line 11). The LaunchAgent listens on 8767 and sets `--upstream http://127.0.0.1:8766` (`scripts/grok-shared-brain/launchd/com.gbrain.funnel-gate.plist`). `gbrain serve` binds `127.0.0.1` by default (`src/commands/serve-http.ts` line 622) on 8766. |
 | Bearer is `Authorization: Bearer <token>` | `scripts/grok-shared-brain/tokens.ts` `bearerToken` (lines 248–252) and `authenticate` (lines 256–264). The gate calls that on every route, including `/health` and `/mcp` (`scripts/grok-shared-brain/gate.ts` lines 271–282). A missing header, a non-Bearer scheme, or a bearer that matches no client hash is `401` with `{"error":"unauthorized"}`. |
 | Storage is hashes outside the repo | `~/.gbrain/serve/funnel-tokens.json` (`tokens.ts` `defaultFunnelTokenPath`, lines 49–50), mode 0600, SHA-256 only. Plaintext is not written to that file. The on-disk path is `<PRIVATE-PATH>/.gbrain/serve/funnel-tokens.json`. |
@@ -20,7 +20,7 @@ No code change is required for this path. The gate does not allow or reject a re
 
 `funnel_enabled` in the token file is stored and logged. The request handler does not consult it. Funnel off is a Tailscale setting, not a flag the gate enforces.
 
-After a valid bearer, the gate may still refuse the call before it proxies: unknown route `403` `wrong_scope`, `/admin` and the other admin paths `403` `admin_forbidden` (`mcp-policy.ts` lines 30–36 and 123–127), a write to `shared` `403` `shared_write_forbidden`, and over the per-client limit `429`. A proxied call uses the client's `upstream_token_file` grant (`gate.ts` `upstreamAuthorization`, lines 118–127). That file is a separate secret from the bot bearer. If it is missing or unreadable, the gate returns `502` and does not log the grant.
+After a valid bearer, the gate may still refuse the call before it proxies: unknown route `403` `wrong_scope`, `/admin` and the other admin paths `403` `admin_forbidden` (`mcp-policy.ts` lines 30–36 and 123–127), a write to `shared` `403` `shared_write_forbidden`, and over the per-client limit `429`. A proxied call uses the client's `upstream_token_file` grant (`gate.ts` `upstreamAuthorization`, lines 118–127). That file is a separate secret from the bot bearer. If it is missing or unreadable, the gate returns `502` and does not log the grant. The gate reads `access_token` from that file on every request and does not refresh it.
 
 ## Architecture
 
@@ -112,7 +112,49 @@ bun scripts/grok-shared-brain/cli-set-upstream-tokens.ts \
   --grants <PRIVATE-PATH>/.gbrain/serve/grants
 ```
 
-Issue each grant to loopback serve, not to the MagicDNS name. The gate presents that grant to `127.0.0.1:8766`. The steps are in `docs/grok/shared-brain/README.md`. Redirect grant stdout away from the terminal the same way that file does.
+Issue each grant to loopback serve, not to the MagicDNS name. The gate presents that grant to `127.0.0.1:8766`. The steps are in `docs/grok/shared-brain/README.md`. Redirect grant stdout away from the terminal the same way that file does. `gbrain mcp grant` `--url` is `http://127.0.0.1:8766/mcp`. MagicDNS is the gate, and the gate answers `/token` and `/admin` with `403` `admin_forbidden`.
+
+### Upstream access token lifetime
+
+`grok-bot` is a renewable harness. A new grant's access-token lifetime is 3600 seconds (`src/core/grants/profiles.ts` `RENEWABLE_GRANT_TTL_SECONDS`, line 9, applied at line 75). `gbrain serve --http` uses the same 3600-second default when the client row has no override (`src/cli/help/serve.ts`). `--token-ttl SECONDS` on `gbrain mcp grant` overrides that lifetime for a new client (`src/commands/mcp.ts` line 39). The allowed range is 60 through 7776000 seconds.
+
+Re-running `gbrain mcp grant` with `--client` on a client that already exists updates the registration and keeps the old credential file. It does not write a new `access_token` (`src/commands/mcp-provision.ts` line 100, `existing_credentials_preserved`). The gate keeps sending the expired token until the grant file itself changes.
+
+These grants use `client_credentials`. The issued access token has no `resource` (`src/core/oauth-grants.ts` `clientCredentials`, line 337 passes `undefined`). Serve checks a token's resource only when one is set (`src/commands/serve-http.ts` lines 790–798). A JSON-RPC auth error after a good gate bearer is an expired or missing `access_token`, or a grant file the gate cannot read. It is not a MagicDNS Host mismatch. Serve's own issuer is `--public-url` when that flag is set, otherwise `http://localhost:<port>` (`src/commands/serve-http.ts` line 650). That issuer is independent of the Tailscale Host. `127.0.0.1` and `localhost` are different origins if some later token is resource-bound. This connector's client-credentials tokens are not.
+
+Rewrite the grant file from loopback `/token` before `expires_at`. The script reads the grant, posts `client_id` and `client_secret` in the body, and writes the new `access_token` and `expires_at` back. It prints neither. Point `G` at the grant JSON. The URL is loopback serve, not MagicDNS:
+
+```bash
+umask 077
+export G=<PRIVATE-PATH>/.gbrain/serve/grants/personal.json
+python3 -c 'import json,os,time,urllib.parse,urllib.request,urllib.error
+p=os.environ["G"]
+d=json.load(open(p))
+body=urllib.parse.urlencode({"grant_type":"client_credentials","client_id":d["client_id"],"client_secret":d["client_secret"]}).encode()
+req=urllib.request.Request("http://127.0.0.1:8766/token",data=body,method="POST")
+req.add_header("Content-Type","application/x-www-form-urlencoded")
+try:
+    payload=json.load(urllib.request.urlopen(req,timeout=15))
+except urllib.error.HTTPError as e:
+    raise SystemExit("token endpoint HTTP %s"%e.code)
+tok,exp=payload.get("access_token"),payload.get("expires_in")
+if not isinstance(tok,str) or not tok or not isinstance(exp,int):
+    raise SystemExit("token endpoint returned no access_token")
+d["access_token"]=tok
+d["expires_at"]=int(time.time())+exp
+tmp=p+".tmp"
+fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+try:
+    os.write(fd,(json.dumps(d,indent=2)+"\n").encode())
+finally:
+    os.close(fd)
+os.replace(tmp,p)
+os.chmod(p,0o600)
+print("rewrote grant file")'
+unset G
+```
+
+The gate reads that file on the next request (`gate.ts` lines 118–127). This rewrite does not need `launchctl kickstart`. Repeat it for `business.json` and `hermes.json`, and for any extra bot's grant file. A launchd job or cron may run the same script. It still must not print the token. Passing `--token-ttl` on a later grant of the same `--client` changes the lifetime of the next token this script mints. It does not, by itself, replace `access_token` in the file.
 
 For an additional bot, keep the three required clients and add one object to `clients`. Create the secret and its hash in files. The command writes those files and prints neither the secret nor a prompt:
 
@@ -124,7 +166,24 @@ python3 -c 'import os,base64,hashlib,pathlib; p=pathlib.Path(os.environ["F"]); t
 unset F H
 ```
 
-`<bot>` is the new client id. Read only the hash file and paste that line into `token_sha256`. Set `routes` to `["health","mcp"]`, and set `write` and `read` to that bot's sources. Do not list `shared` under `write`. Copy the bearer file into the connector secret without displaying it, then remove the bearer file. Restart the gate:
+`<bot>` is the new client id. Read only the hash file and paste that line into `token_sha256`. Set `routes` to `["health","mcp"]`, and set `write` and `read` to that bot's sources. Do not list `shared` under `write`.
+
+Issue a loopback grant for that same name. `--token-ttl` belongs on this create, when a lifetime other than 3600 seconds is wanted. Stdout stays discarded. `cli-set-upstream-tokens.ts` updates only `personal`, `business`, and `hermes`, so set this client's `upstream_token_file` by hand to the absolute grant path. A relative path is refused (`tokens.ts` line 129).
+
+```bash
+umask 077
+mkdir -p <PRIVATE-PATH>/.gbrain/serve/grants
+chmod 700 <PRIVATE-PATH>/.gbrain/serve/grants
+gbrain mcp grant <bot> --harness grok-bot --profile memory-writer \
+  --source <bot> --federated-read <bot>,shared --skills memory-only \
+  --url "http://127.0.0.1:8766/mcp" \
+  --admin-token-file <PRIVATE-PATH>/.gbrain/serve/admin-token \
+  --credentials-out <PRIVATE-PATH>/.gbrain/serve/grants/<bot>.json \
+  --json >/dev/null
+chmod 600 <PRIVATE-PATH>/.gbrain/serve/grants/<bot>.json
+```
+
+`<bot>` in `--source` is that bot's own source id. Use the source that already exists. Do not invent `shared` as a write source. In `funnel-tokens.json`, set `upstream_token_file` to `<PRIVATE-PATH>/.gbrain/serve/grants/<bot>.json`. Copy the bearer file into the connector secret without displaying it, then remove the bearer file. Restart the gate so it loads the new client:
 
 ```bash
 launchctl kickstart -k "gui/$(id -u)/com.gbrain.funnel-gate"
@@ -156,27 +215,37 @@ Expect `401` and `{"error":"unauthorized"}` when the gate bearer is absent or wr
 
 Put the secret in a 0600 curl config, not on the command line. Example, with `<TOKEN>` standing in for the file's real contents:
 
+Good-bearer config, mode 0600. `<TOKEN>` stands in for the file's real contents. `Accept` is `application/json` so the body is a JSON-RPC object:
+
 ```
 silent
 show-error
 header = "Authorization: Bearer <TOKEN>"
 header = "Content-Type: application/json"
-header = "Accept: application/json, text/event-stream"
+header = "Accept: application/json"
+```
+
+Wrong-bearer config, also mode 0600. The value `wrong-token` is a dummy, and it stays in this file so it is not a curl argument:
+
+```
+silent
+show-error
+header = "Authorization: Bearer wrong-token"
 ```
 
 From a tailnet member (`<BOT-DEVICE>` or the Mac):
 
 ```bash
-# unauthenticated. expect 401
+# unauthenticated GET. The gate checks the bearer before the method. Expect 401.
 curl -s -o /dev/null -w '%{http_code}\n' \
   "https://<MAC-HOST>.<TAILNET>.ts.net/mcp"
 
-# wrong bearer, from a file that is not a client secret. expect 401
+# wrong bearer, from the 0600 config above. Expect 401.
 curl -s -o /dev/null -w '%{http_code}\n' \
-  -H 'Authorization: Bearer wrong-token' \
+  --config <PRIVATE-PATH>/mcp-wrong.curlrc \
   "https://<MAC-HOST>.<TAILNET>.ts.net/mcp"
 
-# good bearer. expect HTTP 200 and a JSON-RPC result (initialize, then tools/list)
+# good bearer. Expect HTTP 200 and a JSON-RPC object (initialize, then tools/list).
 curl -s -w '\n%{http_code}\n' --config <PRIVATE-PATH>/mcp-check.curlrc \
   --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"check","version":"0"}}}' \
   "https://<MAC-HOST>.<TAILNET>.ts.net/mcp"
@@ -185,6 +254,8 @@ curl -s -w '\n%{http_code}\n' --config <PRIVATE-PATH>/mcp-check.curlrc \
   --data '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
   "https://<MAC-HOST>.<TAILNET>.ts.net/mcp"
 ```
+
+If those two posts return SSE instead of a JSON object, the curl config sent `Accept: text/event-stream`. A successful SSE body is `event: message` plus a `data:` line containing the JSON-RPC object. Use `Accept: application/json` for the object.
 
 From a machine that is not on the tailnet, the same URL must fail before HTTP (DNS or connect). A `200` or a `401` from off-tailnet means the name is reachable outside the tailnet. Stop and re-check Funnel.
 
@@ -196,7 +267,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8767/health
 
 Expect `401`.
 
-If the good bearer returns `502`, the gate accepted the bot and could not read `upstream_token_file`. If it returns a JSON-RPC auth error, the gate accepted the bot and serve rejected the grant. Gate logs are method, path, client id, and status (`gate.ts` lines 275–277). They must not contain `<TOKEN>`.
+If the good bearer returns `502`, the gate accepted the bot and could not read `upstream_token_file`. If it returns a JSON-RPC auth error, the gate bearer was accepted and serve rejected the upstream `access_token`: missing, or past `expires_at` (3600 seconds unless `--token-ttl` was set on create). Rewrite the grant file with the loopback `/token` script above. Gate logs are method, path, client id, and status (`gate.ts` lines 275–277). They must not contain `<TOKEN>`.
 
 ## Risks
 
@@ -204,7 +275,7 @@ If the good bearer returns `502`, the gate accepted the bot and could not read `
 - Funnel publishes that same gate on the public internet. The bearer would be the only control. Leave Funnel off.
 - Any tailnet device that ACLs allow can present a stolen bearer. The gate does not check which Tailscale identity connected.
 - One `tailscale serve` `/` handler on 443 replaces whatever that path proxied before. Loopback `127.0.0.1:8766` is unchanged. A client that called the MagicDNS name with a gbrain access token, and no gate bearer, will get `401` from the gate.
-- The bot bearer and the grant `access_token` are different secrets. The grant can expire. The gate reads the file on each request and does not refresh it.
+- The bot bearer and the grant `access_token` are different secrets. A `grok-bot` access token expires after 3600 seconds unless create used `--token-ttl`. The gate reads the file on each request and does not call `/token`. Leave the file stale and the connector fails at serve while the gate bearer is still valid.
 - The token file is loaded at start. Until `launchctl kickstart`, an old hash still works.
 - Default limit is 60 requests per 60 seconds per client id, then `429`.
 - `initialize` and `tools/list` do not prove a write. A `tools/call` must name an allowed source. `shared` writes are `403`.
