@@ -46,6 +46,8 @@ export interface PlanOptions {
   /** Called after files are verified and before the manifest is read again. */
   recheck?: (botDir: string) => void;
   maxBytes: number;
+  now: Date;
+  maxAgeHours: number;
 }
 
 interface ListedFile {
@@ -57,8 +59,12 @@ interface ParsedManifest {
   botName: string;
   botId: string;
   account: string;
+  exportedAt: string;
   files: Record<string, ListedFile>;
 }
+
+const MANIFEST_KEYS = new Set(['version', 'bot_name', 'bot_id', 'account', 'exported_at', 'files']);
+const FILE_KEYS = new Set(['size', 'sha256']);
 
 function emptySummary(account: string, bot: string, source: string): BotSummary {
   return { id: `${account}/${bot}`, source, scanned: 0, written: 0, unchanged: 0, skipped: 0, secretsSkipped: 0, pages: 0 };
@@ -144,6 +150,7 @@ function parseManifest(raw: Buffer, folder: string, account: string): { ok: true
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { ok: false, reason: 'bad manifest' };
   const row = parsed as Record<string, unknown>;
+  if (Object.keys(row).some((key) => !MANIFEST_KEYS.has(key))) return { ok: false, reason: 'bad manifest' };
   if (row.version !== 1) return { ok: false, reason: 'bad manifest' };
   if (typeof row.bot_name !== 'string' || row.bot_name.trim() === '' || row.bot_name.length > 200) return { ok: false, reason: 'bad manifest' };
   if (row.bot_id !== folder || typeof row.account !== 'string') return { ok: false, reason: 'bad manifest' };
@@ -156,6 +163,7 @@ function parseManifest(raw: Buffer, folder: string, account: string): { ok: true
     if (kind === 'bad') return { ok: false, reason: 'bad manifest' };
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false, reason: 'bad manifest' };
     const item = value as Record<string, unknown>;
+    if (Object.keys(item).some((key) => !FILE_KEYS.has(key))) return { ok: false, reason: 'bad manifest' };
     if (typeof item.size !== 'number' || !Number.isInteger(item.size) || item.size < 0) return { ok: false, reason: 'bad manifest' };
     if (typeof item.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(item.sha256)) return { ok: false, reason: 'bad manifest' };
     files[key] = { size: item.size, sha256: item.sha256 };
@@ -165,7 +173,15 @@ function parseManifest(raw: Buffer, folder: string, account: string): { ok: true
   }
   if (manifestSecrets(row)) return { ok: false, reason: 'secret' };
   if (row.account !== account) return { ok: false, reason: 'account mismatch' };
-  return { ok: true, body: { botName: row.bot_name.trim(), botId: folder, account, files } };
+  return { ok: true, body: { botName: row.bot_name.trim(), botId: folder, account, exportedAt: row.exported_at, files } };
+}
+
+function stampFresh(value: string, now: Date, maxAgeHours: number): boolean {
+  const when = Date.parse(value);
+  if (Number.isNaN(when)) return false;
+  const windowMs = maxAgeHours * 60 * 60 * 1000;
+  const age = now.getTime() - when;
+  return age <= windowMs && age >= -windowMs;
 }
 
 interface Walk {
@@ -272,6 +288,10 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
     }
     return { planned: { summary, pages: [] }, warnings };
   }
+  if (!stampFresh(parsed.body.exportedAt, opts.now, opts.maxAgeHours)) {
+    warnings.push(`export ${tag}: stale`);
+    return { planned: { summary, pages: [] }, warnings };
+  }
   const pages: ExportPage[] = [];
   let secret = false;
   for (const [rel, meta] of Object.entries(parsed.body.files)) {
@@ -288,7 +308,7 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
     }
     if (found === 'missing') {
       summary.skipped += 1;
-      warnings.push(`export ${tag}: hash mismatch ${rel}`);
+      warnings.push(`export ${tag}: missing ${rel}`);
       continue;
     }
     const absolute = join(botDir, ...rel.split('/'));

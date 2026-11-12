@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
@@ -116,6 +116,14 @@ describe('multi-account export time', () => {
     expect(deniedExportName('holdings.csv')).toBe(true);
     expect(deniedExportName('memory.md')).toBe(false);
     expect(deniedExportContent('call ' + '555' + '-' + '010' + '-' + '0199')).toBe(true);
+    expect(deniedExportContent('call ' + '555' + '.' + '010' + '.' + '0199')).toBe(true);
+    expect(deniedExportContent('ssn ' + '000' + '-' + '00' + '-' + '0000')).toBe(true);
+    expect(deniedExportContent('password: ' + 'not-a-real-value')).toBe(true);
+    expect(deniedExportContent('password policy lives in the handbook')).toBe(false);
+    expect(deniedExportContent('api_key=' + 'not-a-real-value')).toBe(true);
+    expect(deniedExportContent('The holdings list stays offline.')).toBe(true);
+    expect(deniedExportContent('9' + ' Example ' + 'Place')).toBe(true);
+    expect(deniedExportContent('From: ada\nSubject: hello\n\nA note.\n')).toBe(true);
     expect(deniedExportContent('A fake fact.')).toBe(false);
   });
 });
@@ -155,6 +163,100 @@ describe('multi-account drops', () => {
     expect(puts.map((put) => put.slug)).not.toContain('account-a/bot-a/memory');
     expect(puts.map((put) => put.slug)).toContain('account-a/bot-a/profile');
     expect(puts.map((put) => put.slug)).toContain('account-a/bot-a/routines');
+  });
+
+  test('a size mismatch is skipped when the sha256 still matches', async () => {
+    const home = temp('gbrain-export-size-');
+    const share = join(home, 'share');
+    const dir = join(share, 'drops', '_box-export', 'bot-a');
+    writeBot(dir, 'account-a', 'bot-a', goodFiles('bot-a'), (manifest) => {
+      const files = manifest.files as Record<string, { size: number; sha256: string }>;
+      files['memory.md']!.size += 1;
+    });
+    const { brain, puts } = fakeBrain();
+    const result = await run(configFor(home, share, [roots(share)[0]!]), brain);
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).toContain('size mismatch memory.md');
+    expect(result.summaryText).not.toContain('hash mismatch memory.md');
+    expect(puts.map((put) => put.slug)).not.toContain('account-a/bot-a/memory');
+    expect(puts.map((put) => put.slug)).toContain('account-a/bot-a/profile');
+  });
+
+  test('a listed file that is gone logs missing', async () => {
+    const home = temp('gbrain-export-gone-');
+    const share = join(home, 'share');
+    const dir = join(share, 'drops', '_box-export', 'bot-a');
+    writeBot(dir, 'account-a', 'bot-a', goodFiles('bot-a'));
+    unlinkSync(join(dir, 'memory.md'));
+    const { brain, puts } = fakeBrain();
+    const result = await run(configFor(home, share, [roots(share)[0]!]), brain);
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).toContain('missing memory.md');
+    expect(result.summaryText).not.toContain('hash mismatch memory.md');
+    expect(puts.map((put) => put.slug)).not.toContain('account-a/bot-a/memory');
+    expect(puts.map((put) => put.slug)).toContain('account-a/bot-a/profile');
+  });
+
+  test('an unknown manifest key imports nothing from that folder', async () => {
+    const home = temp('gbrain-export-extra-');
+    const share = join(home, 'share');
+    const dir = join(share, 'drops', '_box-export', 'bot-a');
+    writeBot(dir, 'account-a', 'bot-a', goodFiles('bot-a'), (manifest) => { manifest.extra = 'nope'; });
+    const { brain, puts } = fakeBrain();
+    const result = await run(configFor(home, share, [roots(share)[0]!]), brain);
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).toContain('bad manifest');
+    expect(puts).toHaveLength(0);
+    writeBot(dir, 'account-a', 'bot-a', goodFiles('bot-a'), (manifest) => {
+      const files = manifest.files as Record<string, Record<string, unknown>>;
+      files['memory.md']!.note = 'extra';
+    });
+    const again = fakeBrain();
+    const fileKey = await run(configFor(home, share, [roots(share)[0]!]), again.brain);
+    expect(fileKey.summaryText).toContain('bad manifest');
+    expect(again.puts).toHaveLength(0);
+  });
+
+  test('a stamp outside the age window imports nothing', async () => {
+    const home = temp('gbrain-export-stale-');
+    const share = join(home, 'share');
+    const dir = join(share, 'drops', '_box-export', 'bot-a');
+    writeBot(dir, 'account-a', 'bot-a', goodFiles('bot-a'));
+    const config = configFor(home, share, [roots(share)[0]!]);
+    const old = fakeBrain();
+    const stale = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain: old.brain,
+      now: new Date('2026-11-14T12:00:00Z'),
+    });
+    expect(stale.exitCode).toBe(0);
+    expect(stale.summaryText).toContain('stale');
+    expect(old.puts).toHaveLength(0);
+    const ahead = fakeBrain();
+    const future = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain: ahead.brain,
+      now: new Date('2026-11-10T12:00:00Z'),
+    });
+    expect(future.summaryText).toContain('stale');
+    expect(ahead.puts).toHaveLength(0);
+  });
+
+  test('a mail-shaped note rejects the bot folder', async () => {
+    const home = temp('gbrain-export-mail-');
+    const share = join(home, 'share');
+    const files = goodFiles('bot-a');
+    files['notes/body.md'] = 'From: ada\nSubject: hello\n\nA note.\n';
+    writeBot(join(share, 'drops', '_box-export', 'bot-a'), 'account-a', 'bot-a', files);
+    const { brain, puts } = fakeBrain();
+    const result = await run(configFor(home, share, [roots(share)[0]!]), brain);
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).toContain('secret rejected');
+    expect(puts).toHaveLength(0);
   });
 
   test('a bad manifest imports nothing from that folder', async () => {
@@ -292,6 +394,7 @@ describe('multi-account drops', () => {
     write(join(agent, 'skills/daily.md'), '# Daily\n\nSay hello.\n');
     write(join(agent, 'skills/holdings.md'), 'nope\n');
     write(join(agent, 'notes', 'reach.md'), 'call ' + '555' + '-' + '010' + '-' + '0199' + '\n');
+    write(join(agent, 'notes', 'body.md'), 'From: ada\nSubject: hello\n\nA note.\n');
     const cfg = join(home, 'box.json');
     writeFileSync(cfg, JSON.stringify({ bots: { 'bot-a': agent } }));
     const out = join(home, 'share', 'drops', '_box-export');
@@ -303,6 +406,7 @@ describe('multi-account drops', () => {
     expect(memory).toContain('Remember the fake fact.');
     expect(existsSync(join(out, 'bot-a/skills/holdings.md'))).toBe(false);
     expect(existsSync(join(out, 'bot-a/notes/reach.md'))).toBe(false);
+    expect(existsSync(join(out, 'bot-a/notes/body.md'))).toBe(false);
     const routines = readFileSync(join(out, 'bot-a/routines.md'), 'utf8');
     expect(routines).toContain('schedule:');
     expect(routines).toContain('prompt:');
