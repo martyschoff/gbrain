@@ -285,7 +285,7 @@ For each bot it writes `manifest.json`, `profile.json`, `memory.md` (one dated s
 python3 scripts/bot-loader/box-export.py docs/grok/bot-loader/box-export.example.json --account account-a --dry-run
 ```
 
-Copying that directory onto the share is a separate job and is not part of this checkout. The fail-closed business and hermes readers still expect their own tree-level `EXPORTED_AT` and `MANIFEST.json`. This helper no longer writes that shape.
+Copying that directory onto the share is a separate job and is not part of this checkout. The default layout is the per-bot drop above. `--fail-closed` together with `--source <slug>` writes the other contract the fail-closed readers still expect: a tree-level `EXPORTED_AT` and `MANIFEST.json`. `--source` without `--fail-closed` is refused. An export drop whose `exported_at` is outside `box_export_max_age_hours` (default 36, either direction) is skipped with `stale`.
 
 ## Nightly agent
 

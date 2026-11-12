@@ -1485,6 +1485,25 @@ describe('fail-closed feeds', () => {
     const sourceFlag = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a', '--source', 'business'], { encoding: 'utf8' });
     expect(sourceFlag.status).not.toBe(0);
     expect(existsSync(out)).toBe(false);
+    const closed = join(home, 'closed');
+    const signed = spawnSync('python3', [BOX, cfg, '--out', closed, '--account', 'account-a', '--source', 'business', '--fail-closed'], { encoding: 'utf8' });
+    expect(signed.status).toBe(0);
+    expect(existsSync(join(closed, 'EXPORTED_AT'))).toBe(true);
+    expect(existsSync(join(closed, 'example-bot/manifest.json'))).toBe(false);
+    const tree = JSON.parse(readFileSync(join(closed, 'MANIFEST.json'), 'utf8')) as {
+      version: number;
+      account: string;
+      source: string;
+      exported_at: string;
+      files: Record<string, string>;
+      file_count: number;
+    };
+    expect(tree.version).toBe(1);
+    expect(tree.account).toBe('account-a');
+    expect(tree.source).toBe('business');
+    expect(tree.exported_at.endsWith('Z')).toBe(true);
+    expect(typeof tree.files['example-bot/profile.json']).toBe('string');
+    expect(tree.file_count).toBe(Object.keys(tree.files).length);
     const wet = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(wet.status).toBe(0);
     expect(existsSync(join(out, 'MANIFEST.json'))).toBe(false);

@@ -54,5 +54,21 @@
         }
       ]
     }
+  ],
+  "export_roots": [
+    {
+      "account": "account-a",
+      "path": "<share>/exports/_box-export",
+      "source": "account-a",
+      "target_root": "<share>/exports/pages-a",
+      "ensure_source": false
+    },
+    {
+      "account": "account-b",
+      "path": "<share>/exports/_box-export-account-b",
+      "source": "account-b",
+      "target_root": "<share>/exports/pages-b",
+      "ensure_source": false
+    }
   ]
 }

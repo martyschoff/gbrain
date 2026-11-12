@@ -250,7 +250,12 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
     }
   }
 
-  const plannedRoots = planExportRoots(config.exportRoots, { recheck, maxBytes: config.maxBytes });
+  const plannedRoots = planExportRoots(config.exportRoots, {
+    recheck,
+    maxBytes: config.maxBytes,
+    now,
+    maxAgeHours: config.boxExportMaxAgeHours,
+  });
   const exportActive: { source: string; bot: string }[] = [];
   for (const root of plannedRoots) {
     warnings.push(...root.warnings);

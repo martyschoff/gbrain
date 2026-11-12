@@ -14,6 +14,16 @@
     { "source": "\\b\\d{4}(?:[ -]\\d{4}){3}\\b", "flags": "" },
     { "source": "\\b\\d{16}\\b", "flags": "" },
     { "source": "\\b(?:account|acct)(?:\\s*(?:number|no\\.?|#))?\\s*[:=#]?\\s*\\d{6,}\\b", "flags": "i" },
-    { "source": "\\b\\d{1,5}\\s+[A-Za-z0-9.'-]+(?:\\s+[A-Za-z0-9.'-]+){0,4}\\s+(?:street|st\\.|avenue|ave\\.|road|rd\\.|boulevard|blvd\\.|lane|ln\\.|drive|dr\\.)\\b", "flags": "i" }
+    { "source": "\\b\\d{1,5}\\s+[A-Za-z0-9.'-]+(?:\\s+[A-Za-z0-9.'-]+){0,4}\\s+(?:street|st\\.|avenue|ave\\.|road|rd\\.|boulevard|blvd\\.|lane|ln\\.|drive|dr\\.|place|pl\\.)\\b", "flags": "i" },
+    { "source": "\\b\\d{3}\\.\\d{3}\\.\\d{4}\\b", "flags": "" },
+    { "source": "\\+1[\\s.-]?\\(?\\d{3}\\)?[\\s.-]?\\d{3}[\\s.-]\\d{4}", "flags": "" },
+    { "source": "\\b\\d{3}-\\d{2}-\\d{4}\\b", "flags": "" },
+    { "source": "(?:^|[\\n,])\\s*password\\s*:\\s*\\S", "flags": "i" },
+    { "source": "\\b(?:api[_-]?key|access[_-]?token)\\s*[=:]\\s*\\S{8,}", "flags": "i" },
+    { "source": "\\bholdings?\\b", "flags": "i" },
+    { "source": "\\bbrokerage\\b", "flags": "i" },
+    { "source": "\\btax-lots?\\b", "flags": "i" },
+    { "source": "(?:^|\\n)From:[ \\t]+\\S[^\\n]*\\n(?:[^\\n]*\\n){0,30}Subject:[ \\t]+\\S", "flags": "i" },
+    { "source": "(?:^|\\n)Subject:[ \\t]+\\S[^\\n]*\\n(?:[^\\n]*\\n){0,30}From:[ \\t]+\\S", "flags": "i" }
   ]
 }

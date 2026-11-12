@@ -38,7 +38,7 @@ There are no dated subfolders. Each bot folder is replaced wholesale every night
 
 Required files are `profile.json`, `memory.md` (each fact with its date), and `routines.md` (name, schedule, prompt). Optional files are `skills/<skill>.md` and `notes/<name>.md`, `notes/<name>.txt`, or `notes/<name>.json`. Skill and note names are lowercase and have no spaces.
 
-Never include tokens, keys, passwords, `.env` files, holdings, account numbers, email bodies, street addresses, or phone numbers. The loader uses `scripts/bot-loader/secret-patterns.json` and `scripts/bot-loader/export-deny.json`. A match rejects that bot folder. A size or sha256 mismatch skips that file and logs the reason. Unlisted files are not read. Symlinks are not followed; a symlink inside the bot folder rejects that folder. A path that leaves the bot folder rejects the folder. If `manifest.json` changes after the files are read, the folder is skipped.
+Never include tokens, keys, passwords, `.env` files, holdings, account numbers, email bodies, street addresses, or phone numbers. The loader uses `scripts/bot-loader/secret-patterns.json` and `scripts/bot-loader/export-deny.json`. A match rejects that bot folder. A size or sha256 mismatch skips that file and logs the reason. A listed file that is not on disk logs `missing`. Unknown keys in `manifest.json` or in a file entry reject the folder. Unlisted files are not read. Symlinks are not followed; a symlink inside the bot folder rejects that folder. A path that leaves the bot folder rejects the folder. If `manifest.json` changes after the files are read, the folder is skipped. `exported_at` must fall inside `box_export_max_age_hours` of the run (default 36, in either direction). A stamp outside that window logs `stale` and imports nothing from that folder.
 
 ## Config
 
@@ -65,7 +65,7 @@ Never include tokens, keys, passwords, `.env` files, holdings, account numbers, 
 
 The loader writes pages under `target_root/<account>/<BOT>/` and tags each page with `account`, `bot`, and `bot_name`. The same drop on a later night does not rewrite a page whose sha256 is already imported.
 
-`scripts/bot-loader/box-export.py --account <ACCOUNT> --out <root>` writes this layout. `--out` is the account root (`_box-export` or `_box-export-<ACCOUNT>`), not a dated directory.
+`scripts/bot-loader/box-export.py --account <ACCOUNT> --out <root>` writes this layout. `--out` is the account root (`_box-export` or `_box-export-<ACCOUNT>`), not a dated directory. `--fail-closed --source <SOURCE>` writes the other contract instead: a tree-level `EXPORTED_AT` and `MANIFEST.json` for a fail-closed feed. That flag is not the nightly drop.
 
 ## Drop instructions
 
