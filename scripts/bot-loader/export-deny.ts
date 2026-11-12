@@ -14,7 +14,8 @@ interface PatternRow {
 interface DenyFile {
   names: PatternRow[];
   content: PatternRow[];
-  mail_headers?: string[];
+  mail_address_headers?: string[];
+  mail_other_headers?: string[];
   mail_min_headers?: number;
   mail_scan_lines?: number;
 }
@@ -28,21 +29,37 @@ function compile(rows: PatternRow[]): RegExp[] {
 
 const DENY_NAMES = compile(patternFile.names);
 const DENY_CONTENT = compile(patternFile.content);
-const MAIL_HEADERS = patternFile.mail_headers ?? [];
 const MAIL_MIN = patternFile.mail_min_headers ?? 2;
 const MAIL_SCAN = patternFile.mail_scan_lines ?? 20;
-const MAIL_LINE = MAIL_HEADERS.length === 0
-  ? null
-  : new RegExp(`^(?:${MAIL_HEADERS.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')}):[ \\t]+\\S`, 'i');
 
-/** Several RFC 822 header lines near the top of a note, with or without an address. */
-export function looksLikeMail(text: string): boolean {
-  if (!MAIL_LINE) return false;
-  let count = 0;
-  for (const line of text.split(/\r?\n/).slice(0, MAIL_SCAN)) {
-    if (MAIL_LINE.test(line)) count += 1;
+function headerLine(names: string[]): RegExp | null {
+  if (names.length === 0) return null;
+  const body = names.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  return new RegExp(`^(?:${body}):[ \\t]+\\S`, 'i');
+}
+
+const ADDRESS_LINE = headerLine(patternFile.mail_address_headers ?? []);
+const OTHER_LINE = headerLine(patternFile.mail_other_headers ?? []);
+
+function withoutFrontMatter(text: string): string {
+  const lines = text.split(/\r?\n/);
+  if ((lines[0] ?? '').trim() !== '---') return text;
+  for (let i = 1; i < lines.length; i += 1) {
+    if (lines[i]!.trim() === '---') return lines.slice(i + 1).join('\n');
   }
-  return count >= MAIL_MIN;
+  return text;
+}
+
+/** An address header plus another mail header, after a leading YAML block. */
+export function looksLikeMail(text: string): boolean {
+  if (!ADDRESS_LINE) return false;
+  let address = 0;
+  let other = 0;
+  for (const line of withoutFrontMatter(text).split(/\r?\n/).slice(0, MAIL_SCAN)) {
+    if (ADDRESS_LINE.test(line)) address += 1;
+    else if (OTHER_LINE?.test(line)) other += 1;
+  }
+  return address >= 1 && address + other >= MAIL_MIN;
 }
 
 export function deniedExportName(name: string): boolean {

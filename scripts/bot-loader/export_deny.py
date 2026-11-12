@@ -31,15 +31,31 @@ def load_denies():
 _FILE = load_denies()
 _NAMES = _compile(_FILE["names"])
 _CONTENT = _compile(_FILE["content"])
-_MAIL_HEADERS = _FILE.get("mail_headers") or []
 _MAIL_MIN = int(_FILE.get("mail_min_headers") or 2)
 _MAIL_SCAN = int(_FILE.get("mail_scan_lines") or 20)
-_MAIL_LINE = None
-if _MAIL_HEADERS:
-    _MAIL_LINE = re.compile(
-        r"^(?:" + "|".join(re.escape(name) for name in _MAIL_HEADERS) + r"):[ \t]+\S",
+
+
+def _header_line(names):
+    if not names:
+        return None
+    return re.compile(
+        r"^(?:" + "|".join(re.escape(name) for name in names) + r"):[ \t]+\S",
         re.IGNORECASE,
     )
+
+
+_ADDRESS_LINE = _header_line(_FILE.get("mail_address_headers") or [])
+_OTHER_LINE = _header_line(_FILE.get("mail_other_headers") or [])
+
+
+def _without_front_matter(text):
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return text
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            return "\n".join(lines[index + 1 :])
+    return text
 
 
 def denied_name(rel):
@@ -48,14 +64,17 @@ def denied_name(rel):
 
 
 def looks_like_mail(text):
-    """Several RFC 822 header lines near the top, with or without an address."""
-    if _MAIL_LINE is None:
+    """An address header plus another mail header, after a leading YAML block."""
+    if _ADDRESS_LINE is None:
         return False
-    count = 0
-    for line in text.splitlines()[:_MAIL_SCAN]:
-        if _MAIL_LINE.match(line):
-            count += 1
-    return count >= _MAIL_MIN
+    address = 0
+    other = 0
+    for line in _without_front_matter(text).splitlines()[:_MAIL_SCAN]:
+        if _ADDRESS_LINE.match(line):
+            address += 1
+        elif _OTHER_LINE is not None and _OTHER_LINE.match(line):
+            other += 1
+    return address >= 1 and address + other >= _MAIL_MIN
 
 
 def denied_content(text):

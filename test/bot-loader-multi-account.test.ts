@@ -121,6 +121,10 @@ describe('multi-account export time', () => {
     expect(deniedExportContent('password: ' + 'not-a-real-value')).toBe(true);
     expect(deniedExportContent('password policy lives in the handbook')).toBe(false);
     expect(deniedExportContent('api_key=' + 'not-a-real-value')).toBe(true);
+    expect(deniedExportContent('api_key: SEE_HANDBOOK')).toBe(false);
+    expect(deniedExportName('brokerage.csv')).toBe(true);
+    expect(deniedExportContent('We talked about brokerage fees yesterday.')).toBe(false);
+    expect(deniedExportContent('the tax-lot method is FIFO')).toBe(false);
     expect(deniedExportContent('The holdings list stays offline.')).toBe(true);
     expect(deniedExportContent('9' + ' Example ' + 'Place')).toBe(true);
     expect(deniedExportContent('9 items in place.')).toBe(false);
@@ -130,6 +134,8 @@ describe('multi-account export time', () => {
     expect(deniedExportContent('From: ada\nSubject: hello\n\nA note.\n')).toBe(true);
     expect(deniedExportContent('To: alice-example\nDate: Thu, 12 Nov 2026 02:00:00 -0500\n\nA note.\n')).toBe(true);
     expect(deniedExportContent('Subject: weekly plan\n\nOrdinary notes from the meeting.\n')).toBe(false);
+    expect(deniedExportContent('Date: Thursday\nSubject: weekly plan\n\nBring the notes.\n')).toBe(false);
+    expect(deniedExportContent('---\nfrom: weekly\ndate: 2026-11-12\n---\nNotes about the plan.\n')).toBe(false);
     expect(deniedExportContent('A fake fact.')).toBe(false);
   });
 });

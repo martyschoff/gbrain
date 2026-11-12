@@ -20,12 +20,11 @@
     { "source": "\\+1[\\s.-]?\\(?\\d{3}\\)?[\\s.-]?\\d{3}[\\s.-]?\\d{4}\\b", "flags": "" },
     { "source": "\\b\\d{3}-\\d{2}-\\d{4}\\b", "flags": "" },
     { "source": "(?:^|[\\n,])\\s*password\\s*:\\s*\\S", "flags": "i" },
-    { "source": "\\b(?:api[_-]?key|access[_-]?token)\\s*[=:]\\s*\\S{8,}", "flags": "i" },
-    { "source": "\\bholdings\\b", "flags": "i" },
-    { "source": "\\bbrokerage\\b", "flags": "i" },
-    { "source": "\\btax-lots?\\b", "flags": "i" }
+    { "source": "\\b(?:[Aa][Pp][Ii][_-]?[Kk][Ee][Yy]|[Aa][Cc][Cc][Ee][Ss][Ss][_-]?[Tt][Oo][Kk][Ee][Nn])\\s*[=:]\\s*(?=\\S*[a-z0-9])\\S{8,}", "flags": "" },
+    { "source": "\\bholdings\\b", "flags": "i" }
   ],
-  "mail_headers": ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID", "Received", "Reply-To", "Return-Path"],
+  "mail_address_headers": ["From", "To", "Cc", "Bcc", "Reply-To", "Return-Path", "Message-ID", "Received"],
+  "mail_other_headers": ["Subject", "Date"],
   "mail_min_headers": 2,
   "mail_scan_lines": 20
 }
