@@ -107,10 +107,13 @@ function hasClientCredentials(doc: Record<string, unknown>): boolean {
     && typeof doc.client_secret === 'string' && doc.client_secret.length > 0;
 }
 
+/** Token-endpoint client. Tests inject this. It is not the full `typeof fetch` (no `preconnect`). */
+export type TokenFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
 export interface UpstreamTokenOptions {
   upstream: URL;
   now: () => number;
-  fetchImpl?: typeof fetch;
+  fetchImpl?: TokenFetch;
 }
 
 export interface UpstreamTokens {

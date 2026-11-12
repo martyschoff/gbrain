@@ -9,7 +9,7 @@ import { request as httpRequest, type IncomingMessage, type ServerResponse } fro
 import { createServer, type Server } from 'node:http';
 import { authorizeRoute, evaluateMcpBody, queryTargetsSharedWrite, routeClass } from './mcp-policy.ts';
 import { authenticate, pathInside, redactSecrets, type FunnelConfig } from './tokens.ts';
-import { createUpstreamTokens, UpstreamTokenError, type UpstreamAuthorization } from './upstream-token.ts';
+import { createUpstreamTokens, UpstreamTokenError, type TokenFetch, type UpstreamAuthorization } from './upstream-token.ts';
 
 export const BODY_LIMIT = 1_048_576;
 /** How long a request may take to finish sending its body before the gate answers 408. */
@@ -24,7 +24,7 @@ export interface GateOptions {
   /** When set, an upstream_token_file inside this directory is refused. */
   repoRoot?: string;
   /** Token-endpoint client. Tests inject this. Default is global fetch. */
-  fetchImpl?: typeof fetch;
+  fetchImpl?: TokenFetch;
 }
 
 interface Bucket { stamps: number[] }

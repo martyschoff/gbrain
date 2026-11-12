@@ -3,7 +3,7 @@
  * an upstream 401. Listeners bind 127.0.0.1. Tokens here are fixtures.
  */
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
@@ -454,5 +454,60 @@ describe('upstream grant refresh', () => {
     expect(JSON.parse(readFileSync(tokenless, 'utf8'))).toEqual(bare);
     await new Promise<void>(resolve => deniedGate.close(() => resolve()));
     await deniedUpstream.close();
+  });
+
+  test('a grant that cannot be re-read after /token is 502 and is not proxied', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-reread-'));
+    const run = async (during: (path: string) => void) => {
+      const path = writeGrant(dir, NOW_SEC - 5, STALE_TOKEN);
+      const { config, bearer } = gateConfig(path);
+      let upstreamHits = 0;
+      const upstream = await serveUpstream((req, res) => {
+        upstreamHits += 1;
+        const authorization = String(req.headers.authorization ?? '');
+        expect(authorization.includes(MINTED_TOKEN)).toBe(false);
+        req.resume();
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('should-not-proxy');
+      });
+      const gate = createFunnelGate({
+        config,
+        upstreamBaseUrl: `http://127.0.0.1:${upstream.port}`,
+        now: () => NOW_MS,
+        fetchImpl: async () => {
+          during(path);
+          return tokenResponse(200, { access_token: MINTED_TOKEN, expires_in: 3600, token_type: 'bearer' });
+        },
+      });
+      const port = await listenGate(gate);
+      const response = await call(port, bearer);
+      await new Promise<void>(resolve => gate.close(() => resolve()));
+      await upstream.close();
+      return { response, upstreamHits };
+    };
+    const missing = await run(path => unlinkSync(path));
+    expect(missing.response.status).toBe(502);
+    expect(missing.response.text).toContain('upstream_token_refresh_failed');
+    expect(missing.response.text.includes(MINTED_TOKEN)).toBe(false);
+    expect(missing.response.text.includes(CLIENT_SECRET)).toBe(false);
+    expect(missing.response.text.includes('should-not-proxy')).toBe(false);
+    expect(missing.upstreamHits).toBe(0);
+
+    const linked = await run(path => {
+      const target = `${path}.target`;
+      writeFileSync(target, `${JSON.stringify({
+        client_id: 'client-test',
+        client_secret: CLIENT_SECRET,
+        access_token: MINTED_TOKEN,
+        expires_at: NOW_SEC + 3600,
+      })}\n`, { mode: 0o600 });
+      unlinkSync(path);
+      symlinkSync(target, path);
+    });
+    expect(linked.response.status).toBe(502);
+    expect(linked.response.text).toContain('upstream_token_refresh_failed');
+    expect(linked.response.text.includes(MINTED_TOKEN)).toBe(false);
+    expect(linked.response.text.includes('should-not-proxy')).toBe(false);
+    expect(linked.upstreamHits).toBe(0);
   });
 });
