@@ -510,4 +510,47 @@ describe('upstream grant refresh', () => {
     expect(linked.response.text.includes('should-not-proxy')).toBe(false);
     expect(linked.upstreamHits).toBe(0);
   });
+
+  test('a grant file swapped for a symlink during /token is upstream_token_refresh_failed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-refresh-reread-'));
+    const path = writeGrant(dir, NOW_SEC - 5);
+    const swapped = join(dir, 'swapped.json');
+    writeFileSync(swapped, `${JSON.stringify({ access_token: 'other-token-do-not-log' })}\n`, { mode: 0o600 });
+    const { config, bearer } = gateConfig(path);
+    let release = () => {};
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let started = () => {};
+    const startedPromise = new Promise<void>(resolve => { started = resolve; });
+    const upstreamHits: string[] = [];
+    const upstream = await serveUpstream((req, res) => {
+      upstreamHits.push(String(req.headers.authorization ?? ''));
+      req.resume();
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('should-not-proxy');
+    });
+    const gate = createFunnelGate({
+      config,
+      upstreamBaseUrl: `http://127.0.0.1:${upstream.port}`,
+      now: () => NOW_MS,
+      fetchImpl: async () => {
+        started();
+        await held;
+        return tokenResponse(200, { access_token: MINTED_TOKEN, expires_in: 3600, token_type: 'bearer' });
+      },
+    });
+    const port = await listenGate(gate);
+    const pending = call(port, bearer);
+    await startedPromise;
+    unlinkSync(path);
+    symlinkSync(swapped, path);
+    release();
+    const response = await pending;
+    expect(response.status).toBe(502);
+    expect(response.text).toContain('upstream_token_refresh_failed');
+    expect(response.text.includes(MINTED_TOKEN)).toBe(false);
+    expect(response.text.includes('should-not-proxy')).toBe(false);
+    expect(upstreamHits).toEqual([]);
+    await new Promise<void>(resolve => gate.close(() => resolve()));
+    await upstream.close();
+  });
 });

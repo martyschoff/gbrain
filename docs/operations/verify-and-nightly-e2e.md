@@ -26,14 +26,14 @@ so an overrun shows whether the check or its neighbours grew.
 
 ## Typecheck heap
 
-`bun run typecheck` runs `node --max-old-space-size=6144
-node_modules/typescript/bin/tsc`. tsc needs about 3.5 GB of heap on this repo
-(`--extendedDiagnostics`: about 7,350 files, 1.3 M lines). Node's default heap
-limit follows host memory, about 2 GB on an 8 GB host, so without the flag
-typecheck aborts with `JavaScript heap out of memory` on 8 GB machines such as
-a Ubicloud standard-2. The value is a ceiling, not a reservation: peak RSS is
-about 3.7 GB with ceilings of 3,800, 4,096 or 6,144 MB, and wall time is the
-same. If tsc reaches the ceiling, find what grew the program (the
+`bun run typecheck` runs `node --max-old-space-size=12288
+node_modules/typescript/bin/tsc`. The value is a ceiling, not a reservation.
+Node's default heap limit follows host memory, about 2 GB on an 8 GB host, so
+without the flag typecheck aborts with `JavaScript heap out of memory` on 8 GB
+machines such as a Ubicloud standard-2. tsc's own heap on this repo now reaches
+about 6 GB and aborts at a 6144 MB ceiling; 12288 MB is the ceiling that lets
+`tsc --noEmit` finish. CI calls `bun run typecheck` and does not set its own
+heap flag. If tsc reaches 12288 MB, find what grew the program (the
 `Files`/`Memory used` lines of `--extendedDiagnostics`) before raising it.
 
 ## macOS typecheck cap
