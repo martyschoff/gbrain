@@ -58,7 +58,7 @@ if _MAIL_HEADERS:
     )
 if _BLOCK_HEADERS:
     _BLOCK_LINE = re.compile(
-        r"^(?:" + "|".join(re.escape(name) for name in _BLOCK_HEADERS) + r"):[ \t]+\S",
+        r"^[ \t]*(?:>[ \t]*)?(?:" + "|".join(re.escape(name) for name in _BLOCK_HEADERS) + r"):[ \t]+\S",
         re.IGNORECASE,
     )
 if _STRONG_HEADERS:
@@ -132,24 +132,22 @@ def _mail_lines(text):
 
 
 def _contiguous_header_block(lines):
+    """A run of header lines anywhere in the window, not only at line 1."""
     if _BLOCK_LINE is None:
         return False
     run = 0
     for line in lines:
-        trimmed = line.strip()
-        if run == 0 and trimmed in ("", "---"):
-            continue
         if _BLOCK_LINE.match(line):
             run += 1
             if run >= _BLOCK_MIN:
                 return True
             continue
-        break
+        run = 0
     return False
 
 
 def looks_like_mail(text):
-    """Address, Message-ID/Received, three top headers, or a forward marker.
+    """Address, Message-ID/Received, three header lines anywhere, or a forward marker.
 
     Only a leading closed YAML block is ignored.
     """

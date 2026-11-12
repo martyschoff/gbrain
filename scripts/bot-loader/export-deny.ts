@@ -62,7 +62,7 @@ const MAIL_LINE = MAIL_HEADERS.length === 0
   : new RegExp(`^(${MAIL_HEADERS.map(escapeHeader).join('|')}):[ \\t]+(\\S.*)$`, 'i');
 const BLOCK_LINE = BLOCK_HEADERS.length === 0
   ? null
-  : new RegExp(`^(?:${BLOCK_HEADERS.map(escapeHeader).join('|')}):[ \\t]+\\S`, 'i');
+  : new RegExp(`^[ \\t]*(?:>[ \\t]*)?(?:${BLOCK_HEADERS.map(escapeHeader).join('|')}):[ \\t]+\\S`, 'i');
 const STRONG_LINE = STRONG_HEADERS.size === 0
   ? null
   : new RegExp(`^(?:${[...STRONG_HEADERS].map(escapeHeader).join('|')}):[ \\t]+\\S`, 'i');
@@ -123,25 +123,24 @@ function mailLines(text: string): string[] {
   return visible;
 }
 
+/** A run of header lines anywhere in the window, not only at line 1. */
 function contiguousHeaderBlock(lines: string[]): boolean {
   if (!BLOCK_LINE) return false;
   let run = 0;
   for (const line of lines) {
-    const trimmed = line.trim();
-    if (run === 0 && (trimmed === '' || trimmed === '---')) continue;
     if (BLOCK_LINE.test(line)) {
       run += 1;
       if (run >= BLOCK_MIN) return true;
       continue;
     }
-    break;
+    run = 0;
   }
   return false;
 }
 
 /**
  * Mail is an address on From/To/Cc/Bcc/Reply-To/Return-Path, a Message-ID
- * or Received header, three contiguous header lines at the top, or a
+ * or Received header, three contiguous header lines anywhere in the window, or a
  * forward/reply marker. Only a leading closed YAML block is ignored.
  */
 export function looksLikeMail(text: string): boolean {

@@ -139,6 +139,9 @@ describe('multi-account export time', () => {
     expect(deniedExportContent('From: ' + 'ada' + '@' + 'example.com' + '\nSubject: hello\n\nA note.\n')).toBe(true);
     expect(deniedExportContent('To: <' + 'ada' + '@' + 'example.com' + '>\nDate: Thu, 12 Nov 2026 02:00:00 -0500\n\nA note.\n')).toBe(true);
     expect(deniedExportContent('From: ada\nSubject: hello\n\nA note.\n')).toBe(false);
+    expect(deniedExportContent('Invoice follow-up\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n')).toBe(true);
+    expect(deniedExportContent('Invoice follow-up\n\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n')).toBe(true);
+    expect(deniedExportContent('| From | To |\n| --- | --- |\n| Ada Example | Quinn Example |\n')).toBe(false);
     expect(deniedExportContent('From: Ada Example\nSubject: Re: invoice\nDate: Thursday\n\nA note.\n')).toBe(true);
     expect(deniedExportContent('From: Ada Example\nSent: Thursday, November 12, 2026 2:00 AM\nTo: the team\nSubject: Re: invoice\n')).toBe(true);
     expect(deniedExportContent('-----Original Message-----\nA note.\n')).toBe(true);
@@ -311,6 +314,10 @@ describe('multi-account drops', () => {
       'forward.md': '---------- Forwarded message ---------\nFrom: Ada Example\nDate: Tuesday\nSubject: Re: invoice\n\nA note.\n',
       'reply.md': 'On Thu, 12 Nov 2026, Ada Example wrote:\nThe invoice is a story.\n',
       'headers.md': 'From: Pat Example\nTo: Quinn Example\nSubject: notes\nDate: Tuesday\n',
+      'titled.md': 'Invoice follow-up\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n',
+      'titled-blank.md': 'Invoice follow-up\n\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n',
+      'table.md': '| From | To |\n| --- | --- |\n| Ada Example | Quinn Example |\n',
+      'twoline.md': 'From: Ada Example\nSubject: Re: invoice\n',
       'yaml.md': '---\nfrom: the notes\ndate: Tuesday\n---\n\nThe plan is to walk the hill.\n',
       'meeting.md': 'Date: Tuesday\nSubject: tomorrow\'s plan\n',
       'point.md': 'To: the point of the meeting\nDate: Tuesday\n',
@@ -329,10 +336,10 @@ describe('multi-account drops', () => {
     const out = join(home, 'out');
     const wet = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(wet.status).toBe(0);
-    for (const name of ['invoice.md', 'outlook.md', 'original.md', 'forward.md', 'reply.md', 'headers.md', 'key-real.md', 'key-mixed.md']) {
+    for (const name of ['invoice.md', 'outlook.md', 'original.md', 'forward.md', 'reply.md', 'headers.md', 'titled.md', 'titled-blank.md', 'key-real.md', 'key-mixed.md']) {
       expect(existsSync(join(out, 'bot-a/notes', name))).toBe(false);
     }
-    for (const name of ['yaml.md', 'meeting.md', 'point.md', 'key-your.md', 'key-x.md', 'key-example.md', 'key-caps.md', 'key-colon.md', 'key-access.md']) {
+    for (const name of ['yaml.md', 'meeting.md', 'point.md', 'table.md', 'twoline.md', 'key-your.md', 'key-x.md', 'key-example.md', 'key-caps.md', 'key-colon.md', 'key-access.md']) {
       expect(existsSync(join(out, 'bot-a/notes', name))).toBe(true);
     }
   });
