@@ -9,7 +9,10 @@ import json
 import os
 import re
 
+from export_deny import placeholder_secret
+
 _PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secret-patterns.json")
+_KEY_VALUE = re.compile(r"(?:api[_-]?key|access[_-]?token)\s*[=:]\s*(\S+)", re.IGNORECASE)
 
 
 def _compile(rows):
@@ -38,4 +41,12 @@ def secret_name(rel):
 
 
 def secret_content(text):
-    return any(pattern.search(text) for pattern in _CONTENT)
+    for pattern in _CONTENT:
+        match = pattern.search(text)
+        if not match:
+            continue
+        key = _KEY_VALUE.search(text[match.start():])
+        if key and placeholder_secret(key.group(1)):
+            continue
+        return True
+    return False

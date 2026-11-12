@@ -27,9 +27,16 @@
     "flags": "i",
     "min_length": 8
   },
-  "mail_headers": ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID", "Received", "Reply-To", "Return-Path"],
+  "mail_headers": ["From", "To", "Cc", "Bcc", "Subject", "Date", "Sent", "Message-ID", "Received", "Reply-To", "Return-Path"],
   "mail_address_headers": ["From", "To", "Cc", "Bcc", "Reply-To", "Return-Path"],
   "mail_strong_headers": ["Message-ID", "Received"],
+  "mail_block_headers": ["From", "To", "Cc", "Bcc", "Subject", "Date", "Sent", "Reply-To"],
+  "mail_block_min": 3,
+  "mail_markers": [
+    { "source": "original message", "flags": "i" },
+    { "source": "forwarded message", "flags": "i" },
+    { "source": "\\bwrote:", "flags": "i" }
+  ],
   "mail_min_headers": 2,
   "mail_scan_lines": 20
 }

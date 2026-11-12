@@ -40,6 +40,9 @@ _KEY_MIN = int(_KEY.get("min_length") or 8)
 _MAIL_HEADERS = _FILE.get("mail_headers") or []
 _ADDRESS_HEADERS = {name.lower() for name in (_FILE.get("mail_address_headers") or [])}
 _STRONG_HEADERS = {name.lower() for name in (_FILE.get("mail_strong_headers") or [])}
+_BLOCK_HEADERS = {name.lower() for name in (_FILE.get("mail_block_headers") or [])}
+_BLOCK_MIN = int(_FILE.get("mail_block_min") or 3)
+_MAIL_MARKERS = _compile(_FILE.get("mail_markers") or [])
 _MAIL_MIN = int(_FILE.get("mail_min_headers") or 2)
 _MAIL_SCAN = int(_FILE.get("mail_scan_lines") or 20)
 _MAIL_LINE = None
@@ -58,7 +61,7 @@ def _unquote(value):
     return bare
 
 
-def _placeholder_secret(value):
+def placeholder_secret(value):
     """ALL_CAPS words, angle placeholders, and handbook tokens are not keys."""
     bare = _unquote(value)
     if bare.startswith("<") and bare.endswith(">") and len(bare) >= 2:
@@ -77,7 +80,7 @@ def _denied_key(text):
         return False
     for match in _KEY_RE.finditer(text):
         bare = _unquote(match.group(1))
-        if len(bare) >= _KEY_MIN and not _placeholder_secret(bare):
+        if len(bare) >= _KEY_MIN and not placeholder_secret(bare):
             return True
     return False
 
@@ -88,31 +91,42 @@ def denied_name(rel):
 
 
 def looks_like_mail(text):
-    """Two headers near the top, plus an address or Message-ID/Received.
+    """Address, strong header, three header lines, or a forward/quote marker.
 
-    Lines between --- fences are YAML, not headers.
+    Only a leading closed --- block is YAML and is ignored.
     """
     if _MAIL_LINE is None:
         return False
+    lines = text.splitlines()
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                start = index + 1
+                break
+    window = lines[start:start + _MAIL_SCAN]
+    if any(pattern.search(line) for line in window for pattern in _MAIL_MARKERS):
+        return True
     headers = 0
     address = False
     strong = False
-    scanned = 0
-    in_fence = False
-    for line in text.splitlines():
-        if re.match(r"^\s*---\s*$", line):
-            in_fence = not in_fence
+    run = 0
+    block_started = False
+    for line in window:
+        if not block_started and line.strip() == "":
             continue
-        if in_fence:
-            continue
-        if scanned >= _MAIL_SCAN:
-            break
-        scanned += 1
         match = _MAIL_LINE.match(line)
+        block_started = True
+        name = match.group(1).lower() if match else ""
+        if match and name in _BLOCK_HEADERS and run >= 0:
+            run += 1
+            if run >= _BLOCK_MIN:
+                return True
+        elif line.strip() != "":
+            run = -1
         if not match:
             continue
         headers += 1
-        name = match.group(1).lower()
         value = match.group(2)
         if name in _STRONG_HEADERS:
             strong = True

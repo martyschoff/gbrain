@@ -6,6 +6,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { placeholderSecret } from './export-deny.ts';
 
 interface PatternRow {
   source: string;
@@ -30,6 +31,7 @@ function compile(rows: PatternRow[]): RegExp[] {
 
 const SECRET_NAMES = compile(patternFile.names);
 const SECRET_CONTENT = compile(patternFile.content);
+const KEY_VALUE = /\b(?:api[_-]?key|access[_-]?token)\s*[=:]\s*(\S+)/i;
 
 export function isSecretFileName(name: string): boolean {
   const base = name.split(/[/\\]/).pop() ?? name;
@@ -37,7 +39,12 @@ export function isSecretFileName(name: string): boolean {
 }
 
 export function contentHasSecret(text: string): boolean {
-  return SECRET_CONTENT.some((pattern) => pattern.test(text));
+  return SECRET_CONTENT.some((pattern) => {
+    const match = pattern.exec(text);
+    if (!match) return false;
+    const key = KEY_VALUE.exec(text.slice(match.index));
+    return !(key && placeholderSecret(key[1] ?? ''));
+  });
 }
 
 /** Strip secret-shaped substrings before anything is written to a log. Never used on a page body. */
