@@ -10,6 +10,7 @@ import { createGbrainClient } from './gbrain-client.ts';
 import { readManifest, writeManifest, type Manifest, type ManifestEntry } from './manifest.ts';
 import { bodyForExtension, pageSlug, renderPage, sha256 } from './render.ts';
 import { checkFailClosed, type PlannedFile } from './fail-closed.ts';
+import { planExportRoots, type ExportPage } from './multi-account.ts';
 import { scanTree } from './scan.ts';
 import { formatSummary, type BotSummary, type RunSummary } from './summary.ts';
 
@@ -22,6 +23,8 @@ export interface RunOptions {
   stderr?: (line: string) => void;
   /** When set, skips the PGLite lock read. True means serve holds the lock. */
   serveLockHeld?: boolean;
+  /** Test hook: runs after a bot drop is verified and before the manifest is read again. */
+  exportRecheck?: (botDir: string) => void;
 }
 
 export interface RunResult {
@@ -120,13 +123,13 @@ export async function runLoader(opts: RunOptions): Promise<RunResult> {
   try {
     const home = process.env.HOME ?? '';
     const lockHeld = opts.serveLockHeld ?? serveLockHeld(join(home, '.gbrain', 'brain.pglite'));
-    return await runLocked(config, opts.brain ?? createGbrainClient(config.gbrainBin), opts.now ?? new Date(), lockHeld);
+    return await runLocked(config, opts.brain ?? createGbrainClient(config.gbrainBin), opts.now ?? new Date(), lockHeld, opts.exportRecheck);
   } finally {
     release();
   }
 }
 
-async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, serveHeld: boolean): Promise<RunResult> {
+async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, serveHeld: boolean, recheck?: (botDir: string) => void): Promise<RunResult> {
   const warnings: string[] = [];
   const box = boxWarning(config.boxExportDir, config.boxExportMaxAgeHours, now);
   if (box) warnings.push(box);
@@ -174,6 +177,10 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
           && resolvePath(other.path) !== resolvePath(input.path)
           && isInside(other.path, input.path));
         if (covered) continue;
+        if (config.exportRoots.some((root) => isInside(root.path, input.path) || isInside(input.path, root.path))) {
+          warnings.push(`input covered by export root bot=${bot.id}`);
+          continue;
+        }
         if (!existsSync(input.path)) {
           warnings.push(`${input.required ? 'required' : 'optional'} input missing bot=${bot.id}`);
           continue;
@@ -243,13 +250,39 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
     }
   }
 
+  const plannedRoots = planExportRoots(config.exportRoots, { recheck, maxBytes: config.maxBytes });
+  const exportActive: { source: string; bot: string }[] = [];
+  for (const root of plannedRoots) {
+    warnings.push(...root.warnings);
+    exportActive.push(...root.active);
+    const needsSource = root.ensureSource && root.bots.some((bot) => bot.pages.length > 0);
+    if (needsSource && !manifest.sources?.[root.source]?.added) {
+      mkdirSync(root.targetRoot, { recursive: true });
+      const ensured = await brain.ensureSource(root.source, root.targetRoot);
+      if (!ensured.ok) {
+        warnings.push(`export ${root.account}: source not created`);
+        ok = false;
+        for (const bot of root.bots) bots.push(bot.summary);
+        continue;
+      }
+      manifest.sources = { ...manifest.sources, [root.source]: { added: true } };
+    }
+    for (const bot of root.bots) {
+      for (const page of bot.pages) {
+        const wrote = await commitExport(config, brain, manifest, seen, bot.summary, page);
+        if (!wrote) ok = false;
+      }
+      bots.push(bot.summary);
+    }
+  }
+
   writeManifest(config.statePath, manifest);
-  const activeBots = config.groups.flatMap((group) => group.bots.map((bot) => ({ source: group.source, bot: bot.id })));
-  const counts = await brain.counts(
-    [...new Set(config.groups.map((group) => group.source))],
-    activeBots,
-    manifest,
-  );
+  const activeBots = [
+    ...config.groups.flatMap((group) => group.bots.map((bot) => ({ source: group.source, bot: bot.id }))),
+    ...exportActive,
+  ];
+  const sourceIds = [...new Set([...config.groups.map((group) => group.source), ...config.exportRoots.map((root) => root.source)])];
+  const counts = await brain.counts(sourceIds, activeBots, manifest);
   for (const bot of bots) bot.pages = counts.bots[`${bot.source}/${bot.id}`] ?? 0;
   const configured = new Set(activeBots.map((bot) => `${bot.source}/${bot.bot}`));
   const orphanLines = orphanLinesFor(manifest, configured, seen);
@@ -258,7 +291,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
   const summary: RunSummary = {
     ok,
     bots,
-    sources: [...new Set(config.groups.map((group) => group.source))].map((id) => ({ id, pages: counts.sources[id] ?? 0, via: counts.via })),
+    sources: sourceIds.map((id) => ({ id, pages: counts.sources[id] ?? 0, via: counts.via })),
     orphans: orphanLines,
     warnings: warnings.filter((warning) => !warning.startsWith('orphaned ')),
     skips,
@@ -347,6 +380,80 @@ async function commitPlanned(
   if (!put.ok) return false;
   summary.written++;
   return true;
+}
+
+async function commitExport(
+  config: LoaderConfig,
+  brain: BrainClient,
+  manifest: Manifest,
+  seen: Set<string>,
+  summary: BotSummary,
+  page: ExportPage,
+): Promise<boolean> {
+  const digest = sha256(page.bytes);
+  seen.add(page.absolute);
+  const owner = destinationGroup(config, page);
+  const relativeMd = mdRelative(page.relativePosix);
+  const output = join(owner.targetRoot, page.account, page.botId, relativeMd);
+  assertDestination(config.groups.concat(owner), owner, output);
+  const slug = `${page.account}/${page.botId}/${pageSlug(relativeMd)}`;
+  const prior = manifest.files[page.absolute];
+  if (prior && prior.sha256 === digest && prior.inBrain && prior.output === output && prior.slug === slug) {
+    summary.unchanged++;
+    return true;
+  }
+  const ext = page.relativePosix.includes('.') ? page.relativePosix.slice(page.relativePosix.lastIndexOf('.')) : '';
+  const origin = originOfExport(config.shareRoot, page.absolute, page.account, page.botId, page.relativePosix);
+  const rendered = renderPage({
+    relativeMd: `${page.account}/${page.botId}/${relativeMd}`,
+    title: basename(relativeMd).replace(/\.md$/, ''),
+    originRelpath: origin,
+    originSha256: digest,
+    body: bodyForExtension(ext, page.bytes.toString('utf8'), config.csvMaxRows),
+    account: page.account,
+    bot: page.botId,
+    botName: page.botName,
+  });
+  if (pageSlug(`${page.account}/${page.botId}/${relativeMd}`) !== slug) throw new Error('slug drifted from the output path');
+  writeAtomic(output, rendered, 0o644);
+  const put = await brain.putPage(page.source, slug, output);
+  const attempts = put.pending ? (prior && prior.sha256 === digest ? (prior.pendingAttempts ?? 0) : 0) + 1 : 0;
+  const entry: ManifestEntry = {
+    sha256: digest,
+    bot: `${page.account}/${page.botId}`,
+    source: page.source,
+    slug,
+    output,
+    originRelpath: origin,
+    inBrain: put.ok,
+    pending: put.pending,
+    ...(put.pending ? { pendingAttempts: attempts } : {}),
+  };
+  manifest.files[page.absolute] = entry;
+  if (put.pending) return true;
+  if (!put.ok) return false;
+  summary.written++;
+  return true;
+}
+
+function destinationGroup(config: LoaderConfig, page: ExportPage): GroupConfig {
+  const existing = config.groups.find((group) => group.source === page.source && group.targetRoot === page.targetRoot);
+  if (existing) return existing;
+  return {
+    id: `export-${page.account}`,
+    source: page.source,
+    targetRoot: page.targetRoot,
+    extensions: [],
+    ensureSource: false,
+    forbidGit: false,
+    bots: [],
+    failClosed: false,
+  };
+}
+
+function originOfExport(shareRoot: string, absolute: string, account: string, botId: string, relativePosix: string): string {
+  if (isInside(shareRoot, absolute)) return toPosix(relative(shareRoot, absolute));
+  return `external/${account}/${botId}/${relativePosix}`;
 }
 
 function emptyBot(id: string, source: string): BotSummary {

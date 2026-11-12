@@ -84,6 +84,10 @@ export interface PageInput {
   originRelpath: string;
   originSha256: string;
   body: string;
+  /** Set for a multi-account drop so the page is tagged with its account and bot. */
+  account?: string;
+  bot?: string;
+  botName?: string;
 }
 
 export function pageSlug(relativeMd: string): string {
@@ -93,17 +97,23 @@ export function pageSlug(relativeMd: string): string {
 export function renderPage(input: PageInput): string {
   const slug = pageSlug(input.relativeMd);
   const body = input.body.endsWith('\n') ? input.body : `${input.body}\n`;
-  return [
+  const lines = [
     '---',
     `slug: ${slug}`,
     'type: note',
     `title: ${yamlString(input.title)}`,
+  ];
+  if (input.account) lines.push(`account: ${yamlString(input.account)}`);
+  if (input.bot) lines.push(`bot: ${yamlString(input.bot)}`);
+  if (input.botName) lines.push(`bot_name: ${yamlString(input.botName)}`);
+  lines.push(
     `origin_relpath: ${yamlString(input.originRelpath)}`,
     `origin_sha256: ${yamlString(input.originSha256)}`,
     '---',
     '',
     body,
-  ].join('\n');
+  );
+  return lines.join('\n');
 }
 
 export function bodyForExtension(ext: string, raw: string, csvMaxRows: number): string {

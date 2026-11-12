@@ -1,0 +1,19 @@
+{
+  "description": "Extra denials for the multi-account bot drop. scripts/bot-loader/secret-patterns.json still applies. A match rejects the drop file. Patterns are the rule; samples live in tests and are composed there.",
+  "names": [
+    { "source": "holdings?", "flags": "i" },
+    { "source": "brokerage", "flags": "i" },
+    { "source": "positions", "flags": "i" },
+    { "source": "tax-lot", "flags": "i" },
+    { "source": "account-numbers?", "flags": "i" }
+  ],
+  "content": [
+    { "source": "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "flags": "" },
+    { "source": "\\b\\d{3}-\\d{3}-\\d{4}\\b", "flags": "" },
+    { "source": "\\(\\d{3}\\)\\s*\\d{3}-\\d{4}", "flags": "" },
+    { "source": "\\b\\d{4}(?:[ -]\\d{4}){3}\\b", "flags": "" },
+    { "source": "\\b\\d{16}\\b", "flags": "" },
+    { "source": "\\b(?:account|acct)(?:\\s*(?:number|no\\.?|#))?\\s*[:=#]?\\s*\\d{6,}\\b", "flags": "i" },
+    { "source": "\\b\\d{1,5}\\s+[A-Za-z0-9.'-]+(?:\\s+[A-Za-z0-9.'-]+){0,4}\\s+(?:street|st\\.|avenue|ave\\.|road|rd\\.|boulevard|blvd\\.|lane|ln\\.|drive|dr\\.)\\b", "flags": "i" }
+  ]
+}

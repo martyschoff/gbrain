@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Extra drop denials shared with scripts/bot-loader/export-deny.json.
+
+Name and content checks for holdings, account numbers, and contact data.
+secret_rules.py remains the token and key list.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+
+_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "export-deny.json")
+
+
+def _compile(rows):
+    compiled = []
+    for row in rows:
+        flags = 0
+        if "i" in row.get("flags", ""):
+            flags |= re.IGNORECASE
+        compiled.append(re.compile(row["source"], flags))
+    return compiled
+
+
+def load_denies():
+    with open(_PATH, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+_FILE = load_denies()
+_NAMES = _compile(_FILE["names"])
+_CONTENT = _compile(_FILE["content"])
+
+
+def denied_name(rel):
+    base = rel.replace("\\", "/").split("/")[-1]
+    return any(pattern.search(base) for pattern in _NAMES)
+
+
+def denied_content(text):
+    return any(pattern.search(text) for pattern in _CONTENT)

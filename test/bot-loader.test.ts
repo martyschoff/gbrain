@@ -719,32 +719,38 @@ describe('box export helper', () => {
     const cfg = join(home, 'box.json');
     writeFileSync(cfg, JSON.stringify({ bots: { 'bot-a': agent, 'fin-bot': join(home, 'missing-agent') } }));
     const out = join(home, 'out');
-    const dry = spawnSync('python3', [BOX, cfg, '--dry-run', '--out', out], { encoding: 'utf8' });
+    const dry = spawnSync('python3', [BOX, cfg, '--dry-run', '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(dry.status).toBe(0);
-    expect(dry.stdout).toContain('dry-run bot bot-a files=4 secrets_skipped=1');
+    expect(dry.stdout).toContain('dry-run bot bot-a files=3 secrets_skipped=2');
     expect(dry.stdout).not.toContain('BEGIN RSA');
     expect(existsSync(out)).toBe(false);
     expect(readFileSync(join(agent, 'profile.json')).equals(source)).toBe(true);
 
-    const wet = spawnSync('python3', [BOX, cfg, '--out', out], { encoding: 'utf8' });
+    const wet = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(wet.status).toBe(0);
-    const stamp = readFileSync(join(out, 'EXPORTED_AT'), 'utf8');
-    expect(stamp.split('\n')[0]).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
-    expect(stamp).toContain('bot-a 4');
+    expect(existsSync(join(out, 'EXPORTED_AT'))).toBe(false);
+    expect(existsSync(join(out, 'MANIFEST.json'))).toBe(false);
+    const manifest = JSON.parse(readFileSync(join(out, 'bot-a/manifest.json'), 'utf8')) as { account: string; bot_id: string; files: Record<string, { size: number; sha256: string }> };
+    expect(manifest.account).toBe('account-a');
+    expect(manifest.bot_id).toBe('bot-a');
     expect(readFileSync(join(out, 'bot-a/profile.json'), 'utf8')).toContain('bot-a');
+    expect(existsSync(join(out, 'bot-a/memory.md'))).toBe(true);
+    expect(existsSync(join(out, 'bot-a/routines.md'))).toBe(true);
+    expect(readFileSync(join(out, 'bot-a/memory.md'), 'utf8')).not.toContain('nope');
     expect(existsSync(join(out, 'bot-a/memory/log/nested/skip.md'))).toBe(false);
     expect(existsSync(join(out, 'bot-a/attachments/picture.png'))).toBe(false);
     expect(existsSync(join(out, 'bot-a/attachments/token.txt'))).toBe(false);
+    expect(existsSync(join(out, 'bot-a/secrets.env'))).toBe(false);
     expect(statSync(join(agent, 'profile.json')).mtimeMs).toBe(mtime);
     writeFileSync(join(out, 'stale.txt'), 'gone\n');
-    const again = spawnSync('python3', [BOX, cfg, '--out', out], { encoding: 'utf8' });
+    const again = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(again.status).toBe(0);
     expect(existsSync(join(out, 'stale.txt'))).toBe(false);
-    expect(existsSync(join(out, 'EXPORTED_AT'))).toBe(true);
-    expect(existsSync(join(out, 'MANIFEST.json'))).toBe(false);
-    const def = spawnSync('python3', [BOX, cfg], { encoding: 'utf8', env: { ...process.env, HOME: home } });
+    expect(existsSync(join(out, 'bot-a/manifest.json'))).toBe(true);
+    const def = spawnSync('python3', [BOX, cfg, '--account', 'account-a'], { encoding: 'utf8', env: { ...process.env, HOME: home } });
     expect(def.status).toBe(0);
-    expect(existsSync(join(home, '.gbrain/box-export/EXPORTED_AT'))).toBe(true);
+    expect(existsSync(join(home, '.gbrain/box-export/bot-a/manifest.json'))).toBe(true);
+    expect(existsSync(join(home, '.gbrain/box-export/EXPORTED_AT'))).toBe(false);
   });
 });
 
@@ -1460,7 +1466,7 @@ describe('fail-closed feeds', () => {
     expect(result.stdout).toContain('PASS status fresh');
   });
 
-  test('box export writes a manifest only when account and source are both set', () => {
+  test('box export writes a per-bot manifest with the account tag', () => {
     const home = temp('gbrain-feed-box-');
     const agent = join(home, 'agent');
     write(join(agent, 'profile.json'), '{"id":"example-bot"}\n');
@@ -1469,41 +1475,39 @@ describe('fail-closed feeds', () => {
     const cfg = join(home, 'box.json');
     writeFileSync(cfg, JSON.stringify({ bots: { 'example-bot': agent } }));
     const plain = join(home, 'plain');
-    const noFlags = spawnSync('python3', [BOX, cfg, '--out', plain], { encoding: 'utf8' });
-    expect(noFlags.status).toBe(0);
-    expect(existsSync(join(plain, 'EXPORTED_AT'))).toBe(true);
-    expect(existsSync(join(plain, 'MANIFEST.json'))).toBe(false);
+    const noAccount = spawnSync('python3', [BOX, cfg, '--out', plain], { encoding: 'utf8' });
+    expect(noAccount.status).not.toBe(0);
+    expect(existsSync(plain)).toBe(false);
     const out = join(home, 'out');
-    const dry = spawnSync('python3', [BOX, cfg, '--dry-run', '--out', out, '--account', 'businessgrok', '--source', 'business'], { encoding: 'utf8' });
+    const dry = spawnSync('python3', [BOX, cfg, '--dry-run', '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(dry.status).toBe(0);
     expect(existsSync(out)).toBe(false);
-    const one = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'businessgrok'], { encoding: 'utf8' });
-    expect(one.status).not.toBe(0);
+    const sourceFlag = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a', '--source', 'business'], { encoding: 'utf8' });
+    expect(sourceFlag.status).not.toBe(0);
     expect(existsSync(out)).toBe(false);
-    const wet = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'businessgrok', '--source', 'business'], { encoding: 'utf8' });
+    const wet = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(wet.status).toBe(0);
-    const manifest = JSON.parse(readFileSync(join(out, 'MANIFEST.json'), 'utf8')) as {
+    expect(existsSync(join(out, 'MANIFEST.json'))).toBe(false);
+    expect(existsSync(join(out, 'EXPORTED_AT'))).toBe(false);
+    const manifest = JSON.parse(readFileSync(join(out, 'example-bot/manifest.json'), 'utf8')) as {
       version: number;
       account: string;
-      source: string;
+      bot_id: string;
+      bot_name: string;
       exported_at: string;
-      files: Record<string, string>;
-      file_count: number;
-      byte_count: number;
+      files: Record<string, { size: number; sha256: string }>;
     };
     expect(manifest.version).toBe(1);
-    expect(manifest.account).toBe('businessgrok');
-    expect(manifest.source).toBe('business');
-    expect(manifest.exported_at).toBe(readFileSync(join(out, 'EXPORTED_AT'), 'utf8').split('\n')[0]);
-    const rels = Object.keys(manifest.files);
-    expect(rels).toEqual(['example-bot/attachments/note.txt', 'example-bot/memory/profile.md', 'example-bot/profile.json']);
-    let bytes = 0;
+    expect(manifest.account).toBe('account-a');
+    expect(manifest.bot_id).toBe('example-bot');
+    expect(manifest.exported_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/);
+    const rels = Object.keys(manifest.files).sort();
+    expect(rels).toEqual(['memory.md', 'profile.json', 'routines.md']);
     for (const rel of rels) {
-      const body = readFileSync(join(out, rel));
-      expect(manifest.files[rel]).toBe(sha256(body));
-      bytes += body.length;
+      const body = readFileSync(join(out, 'example-bot', rel));
+      expect(manifest.files[rel]!.sha256).toBe(sha256(body));
+      expect(manifest.files[rel]!.size).toBe(body.length);
     }
-    expect(manifest.file_count).toBe(rels.length);
-    expect(manifest.byte_count).toBe(bytes);
+    expect(existsSync(join(out, 'example-bot/attachments/note.txt'))).toBe(false);
   });
 });

@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import { expandHome, isInside } from './files.ts';
 
 export interface InputFolder {
@@ -33,6 +33,15 @@ export interface GroupConfig {
   boxExportDir?: string;
 }
 
+/** One nightly drop root. The directory name is `_box-export` or `_box-export-<account>`. */
+export interface ExportRootConfig {
+  account: string;
+  path: string;
+  source: string;
+  targetRoot: string;
+  ensureSource: boolean;
+}
+
 export interface LoaderConfig {
   shareRoot: string;
   statePath: string;
@@ -47,6 +56,8 @@ export interface LoaderConfig {
   /** Set when the file still contains example bot ids, the example share root, or __SET_ME__. */
   placeholder: string | null;
   groups: GroupConfig[];
+  /** Nightly per-bot drops. Empty when the config does not list any. */
+  exportRoots: ExportRootConfig[];
 }
 
 const PERSONAL_EXTENSIONS = ['.md', '.txt', '.json', '.yaml', '.yml'];
@@ -284,7 +295,19 @@ export function loadConfig(path: string, home: string): LoaderConfig {
       seenBots.add(key);
     }
   }
-  assertRoutes(groups);
+  const exportRoots = parseExportRoots(parsed.export_roots, shareRoot, home);
+  validateExportRoots(exportRoots, groups, financeTargets);
+  for (const root of exportRoots) {
+    const prior = seenSources.get(root.source);
+    if (prior !== undefined && prior !== root.targetRoot) {
+      throw new Error(`config: source ${root.source} is registered with two target directories`);
+    }
+    seenSources.set(root.source, root.targetRoot);
+  }
+  assertRoutes([
+    ...groups,
+    ...exportRoots.map((root) => ({ id: `export-${root.account}`, source: root.source, targetRoot: root.targetRoot })),
+  ]);
   const placeholderBot = groups.flatMap((group) => group.bots).find((bot) => PLACEHOLDER_BOTS.has(bot.id));
   const exampleRoot = resolve(join(home, 'mnt/netfs'));
   const exampleShare = !shareConfirmed && (rawShare === EXAMPLE_SHARE || shareRoot === exampleRoot || sameRealpath(shareRoot, exampleRoot));
@@ -308,6 +331,7 @@ export function loadConfig(path: string, home: string): LoaderConfig {
     boxExportDir: personalBox,
     placeholder,
     groups,
+    exportRoots,
   };
 }
 
@@ -331,6 +355,57 @@ export function assertRoutes(groups: Pick<GroupConfig, 'id' | 'source' | 'target
       const parent = resolve(other.targetRoot);
       if (child === parent || child.startsWith(parent.endsWith('/') ? parent : parent + '/')) {
         throw new Error(`config: group ${group.id} target overlaps source ${other.source}`);
+      }
+    }
+  }
+}
+
+const EXPORT_SLUG = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+function parseExportRoots(raw: unknown, shareRoot: string, home: string): ExportRootConfig[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) throw new Error('config: export_roots must be a list');
+  const seen = new Set<string>();
+  return raw.map((item, index) => {
+    if (typeof item !== 'object' || item === null) throw new Error(`config: export_roots[${index}] must be an object`);
+    const row = item as Record<string, unknown>;
+    const account = asString(row.account, `export_roots[${index}].account`);
+    if (!EXPORT_SLUG.test(account)) throw new Error(`config: export root ${account} account must be a lowercase slug`);
+    if (seen.has(account)) throw new Error(`config: duplicate export root ${account}`);
+    seen.add(account);
+    const source = asString(row.source, `export_roots[${index}].source`);
+    if (!EXPORT_SLUG.test(source)) throw new Error(`config: export root ${account} source must be a lowercase slug`);
+    const path = resolve(expandShare(asString(row.path, `export_roots[${index}].path`), shareRoot, home));
+    const targetRoot = resolve(expandShare(asString(row.target_root, `export_roots[${index}].target_root`), shareRoot, home));
+    const base = basename(path);
+    if (base !== '_box-export' && base !== `_box-export-${account}`) {
+      throw new Error(`config: export root ${account} path must be named _box-export or _box-export-${account}`);
+    }
+    if (source === 'finance' || basename(targetRoot) === 'finance') {
+      throw new Error(`config: export root ${account} cannot use the finance source`);
+    }
+    return {
+      account,
+      path,
+      source,
+      targetRoot,
+      ensureSource: asBool(row.ensure_source, false),
+    };
+  });
+}
+
+function validateExportRoots(roots: ExportRootConfig[], groups: GroupConfig[], financeTargets: string[]): void {
+  for (const root of roots) {
+    if (isInside(root.path, root.targetRoot) || isInside(root.targetRoot, root.path)) {
+      throw new Error(`config: export root ${root.account} path overlaps its target`);
+    }
+    if (financeTargets.some((target) => isInside(target, root.path) || isInside(root.path, target) || isInside(target, root.targetRoot) || isInside(root.targetRoot, target))) {
+      throw new Error(`config: export root ${root.account} overlaps finance`);
+    }
+    for (const group of groups) {
+      if (!group.failClosed || !group.stampRoot) continue;
+      if (pathsAreSame(group.stampRoot, root.path) || isInside(group.stampRoot, root.path) || isInside(root.path, group.stampRoot)) {
+        throw new Error(`config: export root ${root.account} overlaps a fail-closed stamp_root`);
       }
     }
   }
