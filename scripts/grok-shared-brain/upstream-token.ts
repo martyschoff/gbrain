@@ -107,10 +107,13 @@ function hasClientCredentials(doc: Record<string, unknown>): boolean {
     && typeof doc.client_secret === 'string' && doc.client_secret.length > 0;
 }
 
+/** Call signature of fetch. A test mock does not have to carry fetch.preconnect. */
+export type TokenEndpointFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
 export interface UpstreamTokenOptions {
   upstream: URL;
   now: () => number;
-  fetchImpl?: typeof fetch;
+  fetchImpl?: TokenEndpointFetch;
 }
 
 export interface UpstreamTokens {
