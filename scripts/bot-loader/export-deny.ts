@@ -123,26 +123,33 @@ function mailLines(text: string): string[] {
   return visible;
 }
 
+function headerCandidate(line: string): string {
+  return line.trim().replace(/^(?:>\s*)+/, '');
+}
+
 function contiguousHeaderBlock(lines: string[]): boolean {
   if (!BLOCK_LINE) return false;
   let run = 0;
   for (const line of lines) {
-    const trimmed = line.trim();
-    if (run === 0 && (trimmed === '' || trimmed === '---')) continue;
-    if (BLOCK_LINE.test(line)) {
+    const candidate = headerCandidate(line);
+    if (candidate === '' || candidate === '---') {
+      run = 0;
+      continue;
+    }
+    if (BLOCK_LINE.test(candidate)) {
       run += 1;
       if (run >= BLOCK_MIN) return true;
       continue;
     }
-    break;
+    run = 0;
   }
   return false;
 }
 
 /**
  * Mail is an address on From/To/Cc/Bcc/Reply-To/Return-Path, a Message-ID
- * or Received header, three contiguous header lines at the top, or a
- * forward/reply marker. Only a leading closed YAML block is ignored.
+ * or Received header, three contiguous header lines anywhere in the scan
+ * window, or a forward/reply marker. Only a leading closed YAML block is ignored.
  */
 export function looksLikeMail(text: string): boolean {
   if (!MAIL_LINE) return false;

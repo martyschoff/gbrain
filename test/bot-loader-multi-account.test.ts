@@ -140,6 +140,9 @@ describe('multi-account export time', () => {
     expect(deniedExportContent('To: <' + 'ada' + '@' + 'example.com' + '>\nDate: Thu, 12 Nov 2026 02:00:00 -0500\n\nA note.\n')).toBe(true);
     expect(deniedExportContent('From: ada\nSubject: hello\n\nA note.\n')).toBe(false);
     expect(deniedExportContent('From: Ada Example\nSubject: Re: invoice\nDate: Thursday\n\nA note.\n')).toBe(true);
+    expect(deniedExportContent('Invoice follow-up\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n')).toBe(true);
+    expect(deniedExportContent('Invoice follow-up\n\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n')).toBe(true);
+    expect(deniedExportContent('| From | To |\n| --- | --- |\n| Ada Example | Quinn Example |\n')).toBe(false);
     expect(deniedExportContent('From: Ada Example\nSent: Thursday, November 12, 2026 2:00 AM\nTo: the team\nSubject: Re: invoice\n')).toBe(true);
     expect(deniedExportContent('-----Original Message-----\nA note.\n')).toBe(true);
     expect(deniedExportContent('---------- Forwarded message ---------\nA note.\n')).toBe(true);
@@ -306,6 +309,8 @@ describe('multi-account drops', () => {
     write(join(agent, 'memory/log/2026-11-12.md'), 'Remember the fake fact.\n');
     const notes: Record<string, string> = {
       'invoice.md': 'From: Ada Example\nSubject: Re: invoice\nDate: Tue, 12 Nov 2026 02:00:00 -0500\n\nA pasted note with no address.\n',
+      'titled.md': 'Invoice follow-up\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n',
+      'titled-gap.md': 'Invoice follow-up\n\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n',
       'outlook.md': 'From: Ada Example\nSent: Thursday, November 12, 2026 2:00 AM\nTo: Quinn Example\nSubject: Re: invoice\n',
       'original.md': '-----Original Message-----\nFrom: Ada Example\nSubject: Re: invoice\n\nPlease read the note.\n',
       'forward.md': '---------- Forwarded message ---------\nFrom: Ada Example\nDate: Tuesday\nSubject: Re: invoice\n\nA note.\n',
@@ -329,7 +334,7 @@ describe('multi-account drops', () => {
     const out = join(home, 'out');
     const wet = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(wet.status).toBe(0);
-    for (const name of ['invoice.md', 'outlook.md', 'original.md', 'forward.md', 'reply.md', 'headers.md', 'key-real.md', 'key-mixed.md']) {
+    for (const name of ['invoice.md', 'titled.md', 'titled-gap.md', 'outlook.md', 'original.md', 'forward.md', 'reply.md', 'headers.md', 'key-real.md', 'key-mixed.md']) {
       expect(existsSync(join(out, 'bot-a/notes', name))).toBe(false);
     }
     for (const name of ['yaml.md', 'meeting.md', 'point.md', 'key-your.md', 'key-x.md', 'key-example.md', 'key-caps.md', 'key-colon.md', 'key-access.md']) {

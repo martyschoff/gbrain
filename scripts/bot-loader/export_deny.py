@@ -131,25 +131,30 @@ def _mail_lines(text):
     return visible
 
 
+def _header_candidate(line):
+    return re.sub(r"^(?:>\s*)+", "", line.strip())
+
+
 def _contiguous_header_block(lines):
     if _BLOCK_LINE is None:
         return False
     run = 0
     for line in lines:
-        trimmed = line.strip()
-        if run == 0 and trimmed in ("", "---"):
+        candidate = _header_candidate(line)
+        if candidate in ("", "---"):
+            run = 0
             continue
-        if _BLOCK_LINE.match(line):
+        if _BLOCK_LINE.match(candidate):
             run += 1
             if run >= _BLOCK_MIN:
                 return True
             continue
-        break
+        run = 0
     return False
 
 
 def looks_like_mail(text):
-    """Address, Message-ID/Received, three top headers, or a forward marker.
+    """Address, Message-ID/Received, three header lines anywhere, or a forward marker.
 
     Only a leading closed YAML block is ignored.
     """
