@@ -9,6 +9,8 @@ import json
 import os
 import re
 
+from export_deny import placeholder_secret
+
 _PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secret-patterns.json")
 
 
@@ -29,7 +31,13 @@ def load_patterns():
 
 _FILE = load_patterns()
 _NAMES = _compile(_FILE["names"])
-_CONTENT = _compile(_FILE["content"])
+_PLAIN = [row for row in _FILE["content"] if not row.get("allow_placeholders")]
+_KEYS = [row for row in _FILE["content"] if row.get("allow_placeholders")]
+_CONTENT = _compile(_PLAIN)
+_KEY_RES = []
+for _row in _KEYS:
+    _flags = re.IGNORECASE if "i" in _row.get("flags", "") else 0
+    _KEY_RES.append(re.compile(_row["source"], _flags))
 
 
 def secret_name(rel):
@@ -37,5 +45,15 @@ def secret_name(rel):
     return any(pattern.search(base) for pattern in _NAMES)
 
 
+def _assignment_is_secret(text, pattern):
+    for match in pattern.finditer(text):
+        value = match.group(1)
+        if value and not placeholder_secret(value):
+            return True
+    return False
+
+
 def secret_content(text):
-    return any(pattern.search(text) for pattern in _CONTENT)
+    if any(pattern.search(text) for pattern in _CONTENT):
+        return True
+    return any(_assignment_is_secret(text, pattern) for pattern in _KEY_RES)

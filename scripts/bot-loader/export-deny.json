@@ -30,6 +30,13 @@
   "mail_headers": ["From", "To", "Cc", "Bcc", "Subject", "Date", "Message-ID", "Received", "Reply-To", "Return-Path"],
   "mail_address_headers": ["From", "To", "Cc", "Bcc", "Reply-To", "Return-Path"],
   "mail_strong_headers": ["Message-ID", "Received"],
+  "mail_block_headers": ["From", "To", "Cc", "Bcc", "Subject", "Date", "Sent", "Reply-To"],
   "mail_min_headers": 2,
-  "mail_scan_lines": 20
+  "mail_block_min": 3,
+  "mail_scan_lines": 20,
+  "mail_markers": [
+    { "source": "-----Original Message-----", "flags": "" },
+    { "source": "---------- Forwarded message ---------", "flags": "" },
+    { "source": "^On .+?,\\s+.+ wrote:\\s*$", "flags": "m" }
+  ]
 }

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { loadConfig } from '../scripts/bot-loader/config.ts';
 import { deniedExportContent, deniedExportName } from '../scripts/bot-loader/export-deny.ts';
+import { contentHasSecret } from '../scripts/bot-loader/secrets.ts';
 import type { BrainClient } from '../scripts/bot-loader/gbrain-client.ts';
 import { isNewYorkExportTime } from '../scripts/bot-loader/multi-account.ts';
 import { sha256 } from '../scripts/bot-loader/render.ts';
@@ -139,8 +140,25 @@ describe('multi-account export time', () => {
     expect(deniedExportContent('To: <' + 'ada' + '@' + 'example.com' + '>\nDate: Thu, 12 Nov 2026 02:00:00 -0500\n\nA note.\n')).toBe(true);
     expect(deniedExportContent('From: ada\nSubject: hello\n\nA note.\n')).toBe(false);
     expect(deniedExportContent('---\nfrom: the notes\ndate: Tuesday\n---\n\nThe plan is to walk the hill.\n')).toBe(false);
+    expect(deniedExportContent('---\nfrom: Ada Example\nsubject: Re: invoice\ndate: Tuesday\n---\nWalk the hill.\n')).toBe(false);
     expect(deniedExportContent('Date: Tuesday\nSubject: tomorrow\'s plan\n')).toBe(false);
     expect(deniedExportContent('To: the point of the meeting\nDate: Tuesday\n')).toBe(false);
+    expect(deniedExportContent('From: Ada Example\nSubject: Re: invoice\nDate: Tue, 12 Nov 2026 02:00:00 -0500\n\nA pasted note with no address.\n')).toBe(true);
+    expect(deniedExportContent('From: Ada Example\nSent: Thursday, November 12, 2026 2:00 AM\nTo: Quinn Example\nSubject: Re: invoice\n')).toBe(true);
+    expect(deniedExportContent('-----Original Message-----\nFrom: Ada Example\nSubject: Re: invoice\n\nPlease read the note.\n')).toBe(true);
+    expect(deniedExportContent('---------- Forwarded message ---------\nFrom: Ada Example\nDate: Tuesday\nSubject: Re: invoice\n\nA note.\n')).toBe(true);
+    expect(deniedExportContent('On Thu, 12 Nov 2026, Ada Example wrote:\nThe invoice is a story.\n')).toBe(true);
+    expect(deniedExportContent('From: Pat Example\nTo: Quinn Example\nSubject: notes\nDate: Tuesday\n')).toBe(true);
+    expect(deniedExportContent('---\ntitle: note\nReceived: by mail.example.test\nMessage-ID: <fake.1>\n---\nA note.\n')).toBe(true);
+    expect(deniedExportContent('---\ntitle: note\nReceived: by mail.example.test\nMessage-ID: <fake.1>\nA note.\n')).toBe(true);
+    expect(contentHasSecret('api_key=' + 'YOUR_KEY_HERE')).toBe(false);
+    expect(contentHasSecret('api_key=' + 'xxxxxxxx')).toBe(false);
+    expect(contentHasSecret('api_key=' + 'EXAMPLEabc123def456')).toBe(false);
+    expect(contentHasSecret('api_key=' + 'ALLCAPSWITH123DIGITS')).toBe(false);
+    expect(contentHasSecret('api_key: YOUR_KEY_HERE')).toBe(false);
+    expect(contentHasSecret('access_token: YOUR_TOKEN_HERE')).toBe(false);
+    expect(contentHasSecret('api_key=' + 'not-a-real-value')).toBe(true);
+    expect(contentHasSecret('api_key: ' + 'ab12cd34ef56gh78')).toBe(true);
     expect(deniedExportContent('---\nfrom: the notes\ndate: Tuesday\n---\nFrom: ' + 'ada' + '@' + 'example.com' + '\nSubject: hello\n')).toBe(true);
     expect(deniedExportContent('Subject: weekly plan\n\nOrdinary notes from the meeting.\n')).toBe(false);
     expect(deniedExportContent('Date: Thursday\nSubject: weekly plan\n\nBring the notes.\n')).toBe(false);
@@ -265,6 +283,44 @@ describe('multi-account drops', () => {
     });
     expect(future.summaryText).toContain('stale');
     expect(ahead.puts).toHaveLength(0);
+  });
+
+  test('address-less mail is not exported and placeholder keys are', () => {
+    const home = temp('gbrain-export-mail-keys-');
+    const agent = join(home, 'agent');
+    write(join(agent, 'profile.json'), '{"id":"bot-a","name":"Bot A"}\n');
+    write(join(agent, 'memory/log/2026-11-12.md'), 'Remember the fake fact.\n');
+    const notes: Record<string, string> = {
+      'invoice.md': 'From: Ada Example\nSubject: Re: invoice\nDate: Tue, 12 Nov 2026 02:00:00 -0500\n\nA pasted note with no address.\n',
+      'outlook.md': 'From: Ada Example\nSent: Thursday, November 12, 2026 2:00 AM\nTo: Quinn Example\nSubject: Re: invoice\n',
+      'original.md': '-----Original Message-----\nFrom: Ada Example\nSubject: Re: invoice\n\nPlease read the note.\n',
+      'forward.md': '---------- Forwarded message ---------\nFrom: Ada Example\nDate: Tuesday\nSubject: Re: invoice\n\nA note.\n',
+      'reply.md': 'On Thu, 12 Nov 2026, Ada Example wrote:\nThe invoice is a story.\n',
+      'headers.md': 'From: Pat Example\nTo: Quinn Example\nSubject: notes\nDate: Tuesday\n',
+      'yaml.md': '---\nfrom: the notes\ndate: Tuesday\n---\n\nThe plan is to walk the hill.\n',
+      'meeting.md': 'Date: Tuesday\nSubject: tomorrow\'s plan\n',
+      'point.md': 'To: the point of the meeting\nDate: Tuesday\n',
+      'key-your.md': 'api_key=' + 'YOUR_KEY_HERE' + '\n',
+      'key-x.md': 'api_key=' + 'xxxxxxxx' + '\n',
+      'key-example.md': 'api_key=' + 'EXAMPLEabc123def456' + '\n',
+      'key-caps.md': 'api_key=' + 'ALLCAPSWITH123DIGITS' + '\n',
+      'key-colon.md': 'api_key: YOUR_KEY_HERE\n',
+      'key-access.md': 'access_token: YOUR_TOKEN_HERE\n',
+      'key-real.md': 'api_key=' + 'not-a-real-value' + '\n',
+      'key-mixed.md': 'api_key: ' + 'ab12cd34ef56gh78' + '\n',
+    };
+    for (const [name, body] of Object.entries(notes)) write(join(agent, 'notes', name), body);
+    const cfg = join(home, 'box.json');
+    writeFileSync(cfg, JSON.stringify({ bots: { 'bot-a': agent } }));
+    const out = join(home, 'out');
+    const wet = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
+    expect(wet.status).toBe(0);
+    for (const name of ['invoice.md', 'outlook.md', 'original.md', 'forward.md', 'reply.md', 'headers.md', 'key-real.md', 'key-mixed.md']) {
+      expect(existsSync(join(out, 'bot-a/notes', name))).toBe(false);
+    }
+    for (const name of ['yaml.md', 'meeting.md', 'point.md', 'key-your.md', 'key-x.md', 'key-example.md', 'key-caps.md', 'key-colon.md', 'key-access.md']) {
+      expect(existsSync(join(out, 'bot-a/notes', name))).toBe(true);
+    }
   });
 
   test('a mail-shaped note rejects the bot folder', async () => {
