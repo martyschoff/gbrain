@@ -17,7 +17,7 @@ import secretPatterns from '../scripts/bot-loader/secret-patterns.json';
 import { slugFromRelative } from '../scripts/bot-loader/slug.ts';
 import { formatSummary } from '../scripts/bot-loader/summary.ts';
 import type { BrainClient } from '../scripts/bot-loader/gbrain-client.ts';
-import type { LoaderConfig } from '../scripts/bot-loader/config.ts';
+import type { GroupConfig, LoaderConfig } from '../scripts/bot-loader/config.ts';
 
 const REPO = join(import.meta.dir, '..');
 const CLI = join(REPO, 'scripts/bot-loader/cli.ts');
@@ -1541,21 +1541,42 @@ describe('fail-closed feeds', () => {
     write(join(agent, 'attachments/note.txt'), 'hello\n');
     const cfg = join(home, 'box.json');
     writeFileSync(cfg, JSON.stringify({ bots: { 'example-bot': agent } }));
-    const closed = join(share, 'businessgrok/gbrain/_box-export');
-    const signed = spawnSync('python3', [BOX, cfg, '--out', closed, '--account', 'businessgrok', '--source', 'business', '--fail-closed'], { encoding: 'utf8' });
+    const closed = join(share, 'share-a/_box-export');
+    const signed = spawnSync('python3', [BOX, cfg, '--out', closed, '--account', 'acme-biz', '--source', 'acme-biz', '--fail-closed'], { encoding: 'utf8' });
     expect(signed.status).toBe(0);
     expect(existsSync(join(closed, 'EXPORTED_AT'))).toBe(true);
     expect(existsSync(join(closed, 'MANIFEST.json'))).toBe(true);
-    const config = feedConfig(home, share, [
-      personalGroup(share),
-      businessGroup(share, closed, [{
-        id: 'example-bot',
-        inputs: [{ path: join(closed, 'example-bot'), required: false, role: 'box-export' }],
-      }]),
-    ]);
-    const group = config.groups.find((item) => item.source === 'business');
-    expect(group).toBeDefined();
-    const checked = checkFailClosed(group!, {
+    const target = join(share, 'share-a/pages');
+    const group: GroupConfig = {
+      id: 'acme-biz',
+      source: 'acme-biz',
+      account: 'acme-biz',
+      failClosed: true,
+      ensureSource: true,
+      forbidGit: false,
+      stampRoot: closed,
+      boxExportDir: closed,
+      targetRoot: target,
+      extensions: ['.md', '.txt', '.json', '.yaml', '.yml'],
+      bots: [{ id: 'example-bot', inputs: [{ path: join(closed, 'example-bot'), required: false, role: 'box-export' }] }],
+    };
+    const config: LoaderConfig = {
+      shareRoot: share,
+      statePath: join(home, 'state.json'),
+      summaryPath: join(home, 'summary.txt'),
+      lockPath: join(home, 'run.lock'),
+      hostEnv: join(home, 'host.env'),
+      gbrainBin: '/usr/bin/gbrain',
+      maxBytes: 1024,
+      csvMaxRows: 500,
+      boxExportMaxAgeHours: 36,
+      boxExportDir: join(share, 'share-a/unused-box'),
+      placeholder: null,
+      groups: [group],
+      exportRoots: [],
+    };
+    writeFileSync(config.hostEnv, 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const checked = checkFailClosed(group, {
       groups: config.groups,
       now: new Date(),
       maxBytes: config.maxBytes,
@@ -1566,7 +1587,7 @@ describe('fail-closed feeds', () => {
     expect(checked.files.map((file) => file.relativePosix).sort()).toEqual(['attachments/note.txt', 'memory/profile.md', 'profile.json']);
     const result = await runAt(config, brainSpy().brain);
     expect(result.exitCode).toBe(0);
-    expect(result.summaryText).not.toContain('SKIP business');
-    expect(readFileSync(join(share, 'personalgrok/gbrain/business/example-bot/memory/profile.md'), 'utf8')).toContain('A fake fact.');
+    expect(result.summaryText).not.toContain('SKIP acme-biz');
+    expect(readFileSync(join(target, 'example-bot/memory/profile.md'), 'utf8')).toContain('A fake fact.');
   });
 });
