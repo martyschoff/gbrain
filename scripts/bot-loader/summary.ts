@@ -15,6 +15,8 @@ export interface RunSummary {
   sources: { id: string; pages: number; via: string }[];
   orphans: { bot: string; count: number }[];
   warnings: string[];
+  /** Exact `SKIP <source>: ...` lines. They do not change `ok`. */
+  skips?: string[];
 }
 
 export function formatSummary(summary: RunSummary): string {
@@ -26,6 +28,7 @@ export function formatSummary(summary: RunSummary): string {
   }
   for (const source of summary.sources) lines.push(`source ${source.id} pages=${source.pages} via=${source.via}`);
   for (const orphan of summary.orphans) lines.push(`orphaned ${orphan.bot} ${orphan.count}`);
+  for (const skip of summary.skips ?? []) lines.push(skip);
   for (const warning of summary.warnings) lines.push(`WARN ${warning}`);
   return lines.join('\n') + '\n';
 }
