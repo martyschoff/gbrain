@@ -37,7 +37,7 @@ interface PublishEnv {
   stageDir: string;
   holdDir?: string;
   warnings: string[];
-  syncOnce: (source: string) => Promise<boolean>;
+  statePath: string;
 }
 
 function mdRelative(relativePosix: string): string {
@@ -84,6 +84,11 @@ function assertDestination(groups: GroupConfig[], group: GroupConfig, output: st
 }
 
 const WRONG_HOST_STATUS = 'bot-loader: skipped: wrong host\nWARN hostname does not match GBRAIN_EXPECTED_HOST\n';
+
+function withCliDetail(base: string, detail: string | undefined): string {
+  if (!detail) return base;
+  return `${base} (${detail})`;
+}
 
 function gitRemoteRefusal(group: GroupConfig): string | null {
   if (!group.forbidGit) return null;
@@ -157,27 +162,11 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
   const stage = openStage(roots, dirname(config.statePath));
   const holdDir = join(dirname(config.statePath), 'loader-held');
   const holdOutside = roots.every((root) => root && !isInside(root, holdDir) && !isInside(holdDir, root));
-  const synced = new Map<string, Promise<boolean>>();
   const env: PublishEnv = {
     stageDir: stage.dir,
     ...(holdOutside ? { holdDir } : {}),
     warnings,
-    syncOnce: (source) => {
-      let pending = synced.get(source);
-      if (!pending) {
-        pending = (async () => {
-          if (!brain.syncSource) return false;
-          const result = await brain.syncSource(source);
-          if (!result.ok) {
-            warnings.push(`sync ${source} failed (${result.detail ?? 'exit 1'})`);
-            return false;
-          }
-          return true;
-        })();
-        synced.set(source, pending);
-      }
-      return pending;
-    },
+    statePath: config.statePath,
   };
   try {
   const seen = new Set<string>();
@@ -205,7 +194,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
       mkdirSync(group.targetRoot, { recursive: true });
       const ensured = await brain.ensureSource(group.source, group.targetRoot);
       if (!ensured.ok) {
-        warnings.push(`source ${group.source} was not created`);
+        warnings.push(withCliDetail(`source ${group.source} was not created`, ensured.detail));
         ok = false;
         for (const bot of group.bots) bots.push(emptyBot(bot.id, group.source));
         continue;
@@ -272,7 +261,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
           if (!slug.startsWith(`${bot.id}/`) || !isInside(group.targetRoot, output)) throw new Error('route check failed');
           const published = await publishPage({
             brain, source: group.source, slug, canonicalPath: output, body: page, stageDir: env.stageDir,
-            prior, manifest, warnings, syncOnce: env.syncOnce, holdDir: env.holdDir,
+            prior, manifest, warnings, holdDir: env.holdDir,
           });
           const wrote = notePublish(manifest, summary, file.absolute, prior, {
             sha256: digest,
@@ -281,7 +270,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
             slug,
             output,
             originRelpath: originOf(config.shareRoot, file.absolute, bot.id, index, file.relativePosix),
-          }, published);
+          }, published, env.statePath);
           if (!wrote) ok = false;
         }
       }
@@ -305,7 +294,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
       mkdirSync(root.targetRoot, { recursive: true });
       const ensured = await brain.ensureSource(root.source, root.targetRoot);
       if (!ensured.ok) {
-        warnings.push(`export ${root.account}: source not created`);
+        warnings.push(withCliDetail(`export ${root.account}: source not created`, ensured.detail));
         ok = false;
         for (const bot of root.bots) bots.push(bot.summary);
         continue;
@@ -369,7 +358,7 @@ async function runFailClosedGroup(
   if (!checked.ok) return { bots: blanks(), skip: checked.skip, putOk: true };
   if (group.ensureSource && !manifest.sources?.[group.source]?.added) {
     const ensured = await brain.ensureSource(group.source, group.targetRoot);
-    if (!ensured.ok) return { bots: blanks(), skip: 'source not created', putOk: true };
+    if (!ensured.ok) return { bots: blanks(), skip: withCliDetail('source not created', ensured.detail), putOk: true };
     manifest.sources = { ...manifest.sources, [group.source]: { added: true } };
   }
   const summaries = new Map(group.bots.map((bot) => [bot.id, emptyBot(bot.id, group.source)]));
@@ -415,7 +404,7 @@ async function commitPlanned(
   if (!isInside(group.targetRoot, output)) throw new Error('route check failed');
   const published = await publishPage({
     brain, source: group.source, slug, canonicalPath: output, body: page, stageDir: env.stageDir,
-    prior, manifest, warnings: env.warnings, syncOnce: env.syncOnce, holdDir: env.holdDir,
+    prior, manifest, warnings: env.warnings, holdDir: env.holdDir,
   });
   return notePublish(manifest, summary, file.absolute, prior, {
     sha256: digest,
@@ -424,7 +413,7 @@ async function commitPlanned(
     slug,
     output,
     originRelpath: originOf(config.shareRoot, file.absolute, file.botId, file.inputIndex, file.relativePosix),
-  }, published);
+  }, published, env.statePath);
 }
 
 async function commitExport(
@@ -463,7 +452,7 @@ async function commitExport(
   if (pageSlug(`${page.account}/${page.botId}/${relativeMd}`) !== slug) throw new Error('slug drifted from the output path');
   const published = await publishPage({
     brain, source: page.source, slug, canonicalPath: output, body: rendered, stageDir: env.stageDir,
-    prior, manifest, warnings: env.warnings, syncOnce: env.syncOnce, holdDir: env.holdDir,
+    prior, manifest, warnings: env.warnings, holdDir: env.holdDir,
   });
   return notePublish(manifest, summary, page.absolute, prior, {
     sha256: digest,
@@ -472,7 +461,7 @@ async function commitExport(
     slug,
     output,
     originRelpath: origin,
-  }, published);
+  }, published, env.statePath);
 }
 
 function destinationGroup(config: LoaderConfig, page: ExportPage): GroupConfig {
@@ -502,8 +491,9 @@ function notePublish(
   prior: ManifestEntry | undefined,
   base: Omit<ManifestEntry, 'inBrain' | 'pending' | 'pendingAttempts' | 'revision'>,
   result: PublishResult,
+  statePath: string,
 ): boolean {
-  if (result.status === 'skipped') return true;
+  if (result.status === 'skipped') return false;
   if (result.status === 'failed' && prior?.inBrain) return false;
   const attempts = result.status === 'pending'
     ? (prior && prior.sha256 === base.sha256 ? (prior.pendingAttempts ?? 0) : 0) + 1
@@ -518,6 +508,7 @@ function notePublish(
   manifest.files[key] = entry;
   if (result.status === 'pending') return true;
   if (result.status !== 'written') return false;
+  writeManifest(statePath, manifest);
   summary.written++;
   return true;
 }

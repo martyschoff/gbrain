@@ -1,12 +1,12 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import * as files from '../scripts/bot-loader/files.ts';
 import { loadConfig, assertRoutes } from '../scripts/bot-loader/config.ts';
-import { createGbrainClient, manifestCounts, putArgv, addSourceArgv } from '../scripts/bot-loader/gbrain-client.ts';
+import { createGbrainClient, manifestCounts, putArgv, addSourceArgv, spawnGbrain } from '../scripts/bot-loader/gbrain-client.ts';
 import { shareIsMounted } from '../scripts/bot-loader/host.ts';
 import { readManifest, writeManifest } from '../scripts/bot-loader/manifest.ts';
 import { csvToMarkdown, renderPage, sha256 } from '../scripts/bot-loader/render.ts';
@@ -212,7 +212,10 @@ describe('classification', () => {
         stderr: 'Error [source_changed]: /home/acct-example/note.md',
       }));
       const refused = await occupied.putPage('finance', 'ledger/occupied', '/tmp/occupied.md');
-      expect(refused).toEqual({ ok: false, pending: false, code: 'source_changed', detail: 'exit 1, source_changed' });
+      expect(refused.ok).toBe(false);
+      expect(refused.pending).toBe(false);
+      expect(refused.code).toBe('source_changed');
+      expect(refused.detail).toContain('exit 1, source_changed');
       expect(refused.detail).not.toContain('acct-example');
       expect(refused.detail).not.toContain('/home');
       const pending = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 10, stdout: '', stderr: '' }));
@@ -235,6 +238,400 @@ describe('classification', () => {
       expect(counts.via).toBe('pages written by the loader (manifest)');
       expect(recorded.some((argv) => argv.includes('stats') || argv.includes('list') || argv.includes('--no-delegate') || argv.includes('push'))).toBe(false);
     });
+  });
+});
+
+describe('cli failure diagnostics', () => {
+  test('a uuid revision is parsed from raw stdout before redaction', async () => {
+    const rev = '11111111-2222-4333-8444-555555555555';
+    const home = temp('gbrain-loader-uuid-');
+    const bin = join(home, 'gbrain-bin');
+    writeFileSync(bin, `#!/bin/bash\nprintf '%s' '{"ok":true,"revision":"${rev}"}'\n`);
+    chmodSync(bin, 0o755);
+    const client = createGbrainClient(bin);
+    const put = await client.putPage('personal', 'alpha/note', join(home, 'note.md'));
+    expect(put.ok).toBe(true);
+    expect(put.revision).toBe(rev);
+    const read = await client.getRevision!('personal', 'alpha/note');
+    expect(read).toEqual({ ok: true, revision: rev });
+    const spawned = await spawnGbrain([bin, 'put', 'alpha/note', '--json']);
+    expect(spawned.revision).toBe(rev);
+    expect(spawned.stdout).not.toContain(rev);
+    expect(spawned.stdout).toContain('[redacted]');
+  });
+
+  test('a hung child is killed at the timeout and the loader lock is released', async () => {
+    const hung = await spawnGbrain([process.execPath, '-e', 'setTimeout(() => {}, 30000)'], { timeoutMs: 200 });
+    expect(hung.timedOut).toBe(true);
+    const client = createGbrainClient('/usr/bin/gbrain', async () => hung);
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md');
+    expect(put.ok).toBe(false);
+    expect(put.pending).toBe(false);
+    expect(put.detail).toContain('timeout');
+    expect(put.detail).not.toContain('/tmp/note.md');
+
+    const home = temp('gbrain-loader-timeout-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    write(join(share, 'personalgrok/alpha/local.md'), 'keep\n');
+    const config = baseConfig(home, share);
+    const slow = createGbrainClient(process.execPath, () => spawnGbrain(
+      [process.execPath, '-e', 'setTimeout(() => {}, 30000)'],
+      { timeoutMs: 200 },
+    ));
+    const failed = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain: slow, now: new Date('2026-11-11T00:00:00Z') });
+    expect(failed.exitCode).toBe(1);
+    expect(failed.summaryText).toContain('timeout');
+    const next = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain: fakeBrain().brain,
+      now: new Date('2026-11-11T01:00:00Z'),
+    });
+    expect(next.exitCode).toBe(0);
+  });
+
+  const stamp = '2026-11-12T02:00:00-05:00';
+  const token = 'b'.repeat(40);
+
+  function writeDrop(dir: string): void {
+    const files: Record<string, string> = {
+      'profile.json': '{"id":"bot-a","name":"Bot A"}\n',
+      'memory.md': '# Memory\n\n## 2026-11-12\n\nA fake fact.\n',
+      'routines.md': '# Routines\n\n## morning\n\n- schedule: 0 2 * * *\n- prompt: Summarize the day.\n',
+    };
+    const listed: Record<string, { size: number; sha256: string }> = {};
+    for (const [rel, text] of Object.entries(files)) {
+      write(join(dir, rel), text);
+      const buf = Buffer.from(text);
+      listed[rel] = { size: buf.length, sha256: sha256(buf) };
+    }
+    write(join(dir, 'manifest.json'), `${JSON.stringify({
+      version: 1,
+      bot_name: 'Bot A',
+      bot_id: 'bot-a',
+      account: 'account-a',
+      exported_at: stamp,
+      files: listed,
+    })}\n`);
+  }
+
+  test('ensureSource failure names the exit code and redacts a long stderr token', async () => {
+    const home = temp('gbrain-loader-src-fail-');
+    const share = join(home, 'share');
+    writeDrop(join(share, 'drops', '_box-export', 'bot-a'));
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const config = baseConfig(home, share, {
+      export_roots: [{
+        account: 'account-a',
+        path: join(share, 'drops', '_box-export'),
+        source: 'account-a',
+        target_root: join(share, 'pages-a'),
+        ensure_source: true,
+      }],
+    });
+    const brain = createGbrainClient('/usr/bin/gbrain', async (argv) => {
+      if (argv[3] === 'account-a') {
+        return {
+          code: 1,
+          stdout: JSON.stringify({
+            code: 'writer_manifest_unsafe',
+            message: `checkout refused ${token}`,
+            suggestion: 'inspect the checkout',
+          }),
+          stderr: `refused ${token}\n`,
+        };
+      }
+      return { code: 0, stdout: '{"ok":true}', stderr: '' };
+    });
+    const direct = await brain.ensureSource('account-a', join(share, 'pages-a')) as { ok: boolean; detail?: string };
+    expect(direct.ok).toBe(false);
+    expect(direct.detail).toContain('exit 1');
+    expect(direct.detail).toContain('writer_manifest_unsafe');
+    expect(direct.detail).toContain('[redacted]');
+    expect(direct.detail).not.toContain(token);
+    expect(direct.detail).not.toContain('inspect the checkout');
+    const result = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain,
+      now: new Date('2026-11-12T12:00:00Z'),
+    });
+    expect(result.summaryText).toContain('WARN export account-a: source not created (exit 1, writer_manifest_unsafe:');
+    expect(result.summaryText).not.toContain(token);
+    expect(result.summaryText).not.toContain('A fake fact');
+    expect(readFileSync(config.summaryPath, 'utf8')).toContain('exit 1, writer_manifest_unsafe');
+    const exists = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 1, stdout: '', stderr: 'source already exists\n' }));
+    expect((await exists.ensureSource('finance', '/tmp/finance')).ok).toBe(true);
+  });
+
+  test('putPage failure names the exit code on the warning', async () => {
+    const home = temp('gbrain-loader-put-fail-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    write(join(share, 'acct-example/alpha/note.md'), 'hello from the note\n');
+    const config = baseConfig(home, share, {
+      groups: [{
+        id: 'personal',
+        source: 'personal',
+        target_root: join(share, 'acct-example/gbrain/personal'),
+        ensure_source: false,
+        forbid_git: false,
+        extensions: ['.md'],
+        bots: [{
+          id: 'alpha',
+          inputs: [{ path: join(share, 'acct-example/alpha'), required: false }],
+        }],
+      }],
+    });
+    const brain = createGbrainClient('/usr/bin/gbrain', async (argv) => {
+      if (argv.includes('put')) {
+        return {
+          code: 1,
+          stdout: JSON.stringify({ code: 'live_serve', message: 'the brain is busy', suggestion: 'retry later' }),
+          stderr: 'Error [live_serve]: the brain is busy\n',
+        };
+      }
+      return { code: 0, stdout: '{"ok":true}', stderr: '' };
+    });
+    const put = await brain.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put).toMatchObject({ ok: false, pending: false });
+    expect(put.detail).toContain('exit 1');
+    expect(put.detail).toContain('live_serve');
+    expect(put.detail).toContain('the brain is busy');
+    expect(put.detail).not.toContain('retry later');
+    const result = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain,
+      now: new Date('2026-11-12T12:00:00Z'),
+    });
+    expect(result.summaryText).toContain('WARN put failed alpha/note (exit 1, live_serve: the brain is busy)');
+    expect(result.summaryText).not.toContain('hello from the note');
+    expect(readFileSync(config.summaryPath, 'utf8')).toContain('put failed alpha/note');
+  });
+
+  test('putPage keeps one redacted stderr line and drops stdout', async () => {
+    const noise = 'c'.repeat(40);
+    const page = 'page body that must stay out\n';
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 2,
+      stdout: page,
+      stderr: `gbrain: source directory is not writable ${noise}\nsecond line stays off the warning\n`,
+    }));
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put).toMatchObject({ ok: false, pending: false });
+    expect(put.detail).toContain('exit 2');
+    expect(put.detail).toContain('source directory is not writable');
+    expect(put.detail).not.toContain(page.trim());
+    expect(put.detail).not.toContain('second line stays off');
+    expect(put.detail).not.toContain(noise);
+    expect(put.detail).toContain('[redacted]');
+  });
+
+  test('diagnostics redact a short token, a url, an email, and a home path', async () => {
+    const shortToken = 'abcdefghijklmnop';
+    const page = 'stdout is the page body\n';
+    const stderr = [
+      `auth failed https://user-example:x@host.example/db?access_token=${shortToken} user-example@mail.example Cannot read /home/user-example/note.md`,
+      'second-line-marker',
+    ].join('\n');
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: page,
+      stderr,
+    }));
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put.detail).toContain('exit 1');
+    expect(put.detail).toContain('auth failed');
+    expect(put.detail).toContain('~/note.md');
+    expect(put.detail).not.toContain(shortToken);
+    expect(put.detail).not.toContain('user-example');
+    expect(put.detail).not.toContain('mail.example');
+    expect(put.detail).not.toContain('/home/');
+    expect(put.detail).not.toContain(page.trim());
+    expect(put.detail).not.toContain('second-line-marker');
+  });
+
+  test('a numeric JSON code falls back to stderr and a second object is ignored', async () => {
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 4,
+      stdout: '{"code":1,"message":"numeric code message"}\n{"argv":["token-example-should-not-leak"]}\n',
+      stderr: 'caller rejected the write\n',
+    }));
+    const numeric = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(numeric).toMatchObject({ ok: false, pending: false });
+    expect(numeric.detail).toContain('exit 4');
+    expect(numeric.detail).toContain('caller rejected the write');
+    expect(numeric.detail).not.toContain('numeric code message');
+    expect(numeric.detail).not.toContain('token-example-should-not-leak');
+
+    const wrapped = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: 'note {"code":"live_serve","message":"busy"} trailing {"argv":["also-not-logged"]}',
+      stderr: '',
+    }));
+    const parsed = await wrapped.ensureSource('finance', '/tmp/finance') as { ok: boolean; detail?: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.detail).toContain('exit 1, live_serve: busy');
+    expect(parsed.detail).not.toContain('also-not-logged');
+    expect(parsed.detail).not.toContain('trailing');
+  });
+
+  test('a kill signal is named and a huge pipe is capped before redaction', async () => {
+    const killed = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      signal: 'SIGTERM',
+      stdout: 'should-not-copy-stdout',
+      stderr: 'terminated\n',
+    }));
+    const put = await killed.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put.detail).toContain('killed SIGTERM');
+    expect(put.detail).toContain('terminated');
+    expect(put.detail).not.toContain('should-not-copy-stdout');
+    expect(put.detail).not.toContain('exit 1');
+
+    const token = 'd'.repeat(40);
+    const result = await spawnGbrain([
+      process.execPath,
+      '-e',
+      `/* argv-marker-zz */ process.stdout.write(${JSON.stringify(token)} + ' ' + 'A '.repeat(10000)); process.stderr.write('B '.repeat(10000)); process.kill(process.pid, 'SIGKILL');`,
+    ]);
+    expect(result.signal).toBe('SIGKILL');
+    expect(result.stdout.length).toBeLessThanOrEqual(8192);
+    expect(result.stderr.length).toBeLessThanOrEqual(8192);
+    expect(result.stdout.length).toBeGreaterThan(1000);
+    expect(result.stdout).not.toContain(token);
+    expect(result.stdout).toContain('[redacted]');
+    expect(result.stdout).not.toContain('argv-marker-zz');
+    expect(result.stderr).not.toContain('argv-marker-zz');
+  });
+
+  test('mid-line assignments, a short bearer, and a windows user path are redacted', async () => {
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'login failed password=abcdefgh token=tokentok api_key: keykeykey passwd=passpass secret: secsecsec\n',
+    }));
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put.detail).toContain('exit 1');
+    expect(put.detail).toContain('login failed');
+    expect(put.detail).not.toContain('abcdefgh');
+    expect(put.detail).not.toContain('tokentok');
+    expect(put.detail).not.toContain('keykeykey');
+    expect(put.detail).not.toContain('passpass');
+    expect(put.detail).not.toContain('secsecsec');
+
+    const upper = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'auth PASSWORD: hunter2\n',
+    }));
+    const password = await upper.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(password.detail).toContain('auth');
+    expect(password.detail).not.toContain('hunter2');
+
+    const header = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'Authorization: Bearer abc.def\n',
+    }));
+    const bearer = await header.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(bearer.detail).toContain('Bearer [redacted]');
+    expect(bearer.detail).not.toContain('abc.def');
+
+    const paths = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'Cannot read C:\\Users\\user-example\\x and D:/Users/user-example/note.md\n',
+    }));
+    const windows = await paths.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(windows.detail).toContain('~\\x');
+    expect(windows.detail).toContain('~/note.md');
+    expect(windows.detail).not.toContain('user-example');
+  });
+
+  test('quoted assignment values, api key spellings, and phrase colons stay precise', async () => {
+    const quoted = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'token="quoted value with spaces" password=\'abc def\'\n',
+    }));
+    const quotePut = await quoted.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(quotePut.detail).not.toContain('quoted value');
+    expect(quotePut.detail).not.toContain('with spaces');
+    expect(quotePut.detail).not.toContain('abc def');
+    expect(quotePut.detail).not.toContain("def'");
+    expect(quotePut.detail).toContain('[redacted]');
+
+    const aliases = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'login failed api-key=hyphenval apiKey: camelval APIKEY=upperval\n',
+    }));
+    const aliasPut = await aliases.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(aliasPut.detail).toContain('login failed');
+    expect(aliasPut.detail).not.toContain('hyphenval');
+    expect(aliasPut.detail).not.toContain('camelval');
+    expect(aliasPut.detail).not.toContain('upperval');
+
+    const phrase = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'invalid token: missing\n',
+    }));
+    const phrasePut = await phrase.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(phrasePut.detail).toContain('invalid token: missing');
+    expect(phrasePut.detail).not.toContain('[redacted]');
+
+    const query = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'failed ?token=querytok&x=1\n',
+    }));
+    const queryPut = await query.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(queryPut.detail).toContain('&x=1');
+    expect(queryPut.detail).toContain('token=[redacted]');
+    expect(queryPut.detail).not.toContain('querytok');
+  });
+
+  test('assignments are quote-aware and fail closed', async () => {
+    const detailOf = async (stderr: string): Promise<string> => {
+      const client = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 1, stdout: '', stderr }));
+      const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { detail?: string };
+      return put.detail ?? '';
+    };
+
+    for (const line of ['auth token: abc123\n', 'bearer token: abc123\n', 'error, token: abc123\n', 'invalid\ttoken: abc123\n']) {
+      const detail = await detailOf(line);
+      expect(detail).not.toContain('abc123');
+      expect(detail).toContain('[redacted]');
+    }
+    const phrase = await detailOf('invalid token: missing\n');
+    expect(phrase).toContain('invalid token: missing');
+    expect(phrase).not.toContain('[redacted]');
+
+    for (const line of ["password='abc def'\n", 'PASSWORD="abc def"\n', "api-key='abc def'\n", 'api_key="abc def"\n']) {
+      const detail = await detailOf(line);
+      expect(detail).toBe('exit 1, [redacted]');
+    }
+
+    expect(await detailOf('token="abc def\n')).toBe('exit 1, [redacted]');
+    expect(await detailOf('token="abc\\"def"\n')).toBe('exit 1, [redacted]');
+    expect(await detailOf('token=`abc def`\n')).toBe('exit 1, [redacted]');
+
+    const joined = await detailOf('secret=foo&bar\n');
+    expect(joined).toBe('exit 1, [redacted]');
+    expect(joined).not.toContain('&bar');
+
+    const started = performance.now();
+    const bulky = await detailOf(`token=abc ${'x '.repeat(50000)}`);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(bulky).not.toContain('token=abc');
+    expect(bulky).toContain('[redacted]');
   });
 });
 
@@ -505,13 +902,56 @@ describe('loader run', () => {
     conflict = true;
     write(note, 'third text\n');
     const third = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T02:00:00Z') });
-    expect(third.exitCode).toBe(0);
-    expect(third.summaryText).toContain('WARN put alpha/note skipped (exit 1, revision_conflict)');
+    expect(third.exitCode).toBe(1);
+    expect(third.summaryText).toContain('WARN put failed alpha/note skipped (exit 1, revision_conflict)');
     expect(readManifest(join(home, 'state.json')).files[note]?.revision).toBe(rev);
     expect(third.summaryText).not.toContain('--force');
   });
 
-  test('an unindexed loader file is synced once and moved aside, and a stranger file stays', async () => {
+  test('revision_required reads the revision once and a second conflict is a failure', async () => {
+    const home = temp('gbrain-loader-revreq-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const note = join(share, 'personalgrok/alpha/note.md');
+    write(note, 'first text\n');
+    const config = baseConfig(home, share);
+    const rev = '00000000-0000-4000-8000-0000000000cc';
+    const puts: { revision?: string }[] = [];
+    let reads = 0;
+    let mode: 'required' | 'ok' | 'conflict' = 'required';
+    const brain: BrainClient = {
+      async ensureSource() { return { ok: true }; },
+      async putPage(_source, _slug, _file, revision) {
+        puts.push({ revision });
+        if (mode === 'required' && revision === undefined) {
+          return { ok: false, pending: false, code: 'revision_required', detail: 'exit 1, revision_required' };
+        }
+        if (mode === 'conflict') {
+          return { ok: false, pending: false, code: 'revision_conflict', detail: 'exit 1, revision_conflict' };
+        }
+        return { ok: true, pending: false, revision: rev };
+      },
+      async getRevision() {
+        reads++;
+        return { ok: true, revision: rev };
+      },
+      async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+    };
+    const first = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T00:00:00Z') });
+    expect(first.exitCode).toBe(0);
+    expect(reads).toBe(1);
+    expect(puts.map((put) => put.revision)).toEqual([undefined, rev]);
+    expect(readManifest(config.statePath).files[note]?.revision).toBe(rev);
+    mode = 'conflict';
+    write(note, 'second text\n');
+    const second = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T01:00:00Z') });
+    expect(second.exitCode).toBe(1);
+    expect(second.summaryText).toContain('WARN put failed alpha/note skipped (exit 1, revision_conflict)');
+    expect(readManifest(config.statePath).files[note]?.revision).toBe(rev);
+    expect(second.summaryText).not.toContain('--force');
+  });
+
+  test('an unindexed loader file is moved aside without sync, and a stranger file stays', async () => {
     const home = temp('gbrain-loader-hold-');
     const share = join(home, 'share');
     writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
@@ -549,22 +989,112 @@ describe('loader run', () => {
         if (existsSync(canonical)) return { ok: false, pending: false, code: 'source_changed', detail: 'exit 1, source_changed' };
         return { ok: true, pending: false, revision: '00000000-0000-4000-8000-0000000000bb' };
       },
-      async syncSource(source) {
-        calls.push(`sync ${source}`);
-        return { ok: true };
-      },
       async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
     };
     const result = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T00:00:00Z') });
     expect(result.exitCode).toBe(0);
-    expect(result.summaryText).not.toContain('put alpha/note failed');
-    expect(calls.filter((call) => call === 'sync personal')).toEqual(['sync personal']);
-    expect(calls.some((call) => call.startsWith('sync finance'))).toBe(false);
+    expect(result.summaryText).not.toContain('put failed alpha/note');
+    expect(calls.some((call) => call.startsWith('sync'))).toBe(false);
     expect(existsSync(occupant)).toBe(false);
     expect(readFileSync(join(home, 'loader-held/personal/alpha/note.md'), 'utf8')).toBe('left by an earlier loader run\n');
+    expect((statSync(join(home, 'loader-held')).mode & 0o777)).toBe(0o700);
     expect(readFileSync(kept, 'utf8')).toBe('do not touch this sentence\n');
     expect(readManifest(config.statePath).files[note]?.inBrain).toBe(true);
-    expect(calls.filter((call) => call === 'put personal alpha/note').length).toBe(3);
+    expect(calls.filter((call) => call === 'put personal alpha/note').length).toBe(2);
+  });
+
+  test('a symlink occupant and an in-brain neighbor are not moved', async () => {
+    const home = temp('gbrain-loader-symlink-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const note = join(share, 'personalgrok/alpha/note.md');
+    write(note, 'hello note\n');
+    const target = join(share, 'personalgrok/gbrain/personal');
+    const outside = join(home, 'outside.md');
+    write(outside, 'do not follow this sentence\n');
+    const occupant = join(target, 'alpha/note.md');
+    mkdirSync(join(target, 'alpha'), { recursive: true });
+    symlinkSync(outside, occupant);
+    const neighbor = join(share, 'personalgrok/alpha/other.md');
+    write(neighbor, 'other\n');
+    const neighborOut = join(target, 'alpha/other.md');
+    write(neighborOut, 'indexed neighbor\n');
+    const config = baseConfig(home, share);
+    writeManifest(config.statePath, {
+      version: 1,
+      files: {
+        [note]: {
+          sha256: 'stale', bot: 'alpha', source: 'personal', slug: 'alpha/note', output: occupant,
+          originRelpath: 'personalgrok/alpha/note.md', inBrain: false,
+        },
+        [neighbor]: {
+          sha256: sha256(readFileSync(neighbor)), bot: 'alpha', source: 'personal', slug: 'alpha/other',
+          output: neighborOut, originRelpath: 'personalgrok/alpha/other.md', inBrain: true,
+          revision: '00000000-0000-4000-8000-0000000000dd',
+        },
+      },
+    });
+    const puts: string[] = [];
+    const brain: BrainClient = {
+      async ensureSource() { return { ok: true }; },
+      async putPage(_source, slug) {
+        puts.push(slug);
+        return { ok: true, pending: false, revision: '00000000-0000-4000-8000-0000000000ee' };
+      },
+      async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+    };
+    const result = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T00:00:00Z') });
+    expect(result.exitCode).toBe(1);
+    expect(puts).not.toContain('alpha/note');
+    expect(result.summaryText).toContain('WARN put failed alpha/note (not a regular file)');
+    expect(lstatSync(occupant).isSymbolicLink()).toBe(true);
+    expect(readFileSync(outside, 'utf8')).toBe('do not follow this sentence\n');
+    expect(readFileSync(neighborOut, 'utf8')).toBe('indexed neighbor\n');
+    expect(existsSync(join(home, 'loader-held'))).toBe(false);
+  });
+
+  test('a successful put is on disk before the next page, so a crash keeps the revision', async () => {
+    const home = temp('gbrain-loader-crash-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const first = join(share, 'personalgrok/alpha/one.md');
+    const second = join(share, 'personalgrok/alpha/two.md');
+    write(first, 'one\n');
+    write(second, 'two\n');
+    const config = baseConfig(home, share);
+    const rev = '00000000-0000-4000-8000-0000000000ff';
+    let puts = 0;
+    const brain: BrainClient = {
+      async ensureSource() { return { ok: true }; },
+      async putPage() {
+        puts++;
+        if (puts === 2) throw new Error('simulated crash');
+        return { ok: true, pending: false, revision: rev };
+      },
+      async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+    };
+    await expect(runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T00:00:00Z') })).rejects.toThrow('simulated crash');
+    const saved = readManifest(config.statePath);
+    const stored = Object.values(saved.files).filter((entry) => entry.inBrain);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.revision).toBe(rev);
+    const again = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain: {
+        async ensureSource() { return { ok: true }; },
+        async putPage(_source, _slug, _file, revision) {
+          expect(revision).toBeUndefined();
+          return { ok: true, pending: false, revision: rev };
+        },
+        async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+      },
+      now: new Date('2026-11-11T01:00:00Z'),
+    });
+    expect(again.exitCode).toBe(0);
+    expect(again.summaryText).toContain('unchanged=1');
+    expect(again.summaryText).toContain('written=1');
   });
 
 describe('counts, placeholders, and the lock', () => {

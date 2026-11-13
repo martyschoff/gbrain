@@ -23,6 +23,7 @@ import { readJournalLimits } from './limits.ts';
 import { cloneTopologyCheckout, flushTopologyDirectory, flushTopologyTree, topologyDirectoryBytes, topologyDirectoryIdentity } from './topology-filesystem.ts';
 import { finishTopologyClone } from './topology-recovery.ts';
 import { reservePhysicalRoot, preparePhysicalRootReplacement, readPhysicalRootReservation } from './physical-root.ts';
+import { assertSourceNameFree } from '../source-name.ts';
 
 const writerStatusFix=(sourceId?:string):Action=>readFix(
   sourceId?`Shows source ${sourceId}'s owner host, worktree path and state, read-only.`:'Shows every canonical worktree binding, its path, owner and state, read-only.',
@@ -75,6 +76,7 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
     {fix:{argv:['gbrain','sources','add',input.sourceId,'--path',target,'--json'],consent:[],actor:'agent',requires_exclusive:false,
       why:`Registers the existing directory as source ${input.sourceId} without cloning or overwriting it.`,
       verify:{argv:['gbrain','sources','list','--json']}}});
+  if(input.operation==='add')await assertSourceNameFree(engine,input.sourceId,input.name??input.sourceId);
   if(input.dryRun)return {dry_run:true,operation:input.operation,source_id:input.sourceId,path:target,source_incarnation:source?.incarnation??null};
   return withTopologyLocks(engine,input.sourceId,async bindings=>{
     if(input.operation==='add'&&bindings.some(binding=>!binding.unbound||binding.local_path!==target))throw opError('overlapping_path','A new clone cannot replace or nest inside an existing canonical worktree.',
@@ -190,6 +192,7 @@ export async function runManagedSourceClone(engine:BrainEngine,input:SourceLifec
       });
       return topologyReceipt(accepted);
     }catch(error){
+      if(error instanceof OperationError&&error.code==='source_name_taken')throw error;
       if(!accepted)throw error;
       // A commit may have succeeded even when its acknowledgment was lost.
       // Read the durable record before considering cleanup or retry.

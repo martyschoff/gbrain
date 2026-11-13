@@ -16,19 +16,17 @@ export interface PutOutcome {
   ok: boolean;
   /** Exit 10: accepted, not committed. Retried next run. Not a failure and not counted. */
   pending: boolean;
-  /** Revision from a successful put. Passed back as `--expected-revision`. */
+  /** Revision from a successful put, parsed from raw stdout before redaction. */
   revision?: string;
   /** Machine error code from a failed command, when the CLI printed one. */
   code?: string;
-  /** Short reason: `exit N` plus the error code. No paths and no page text. */
+  /** Set only when the command failed. One redacted line: exit, timeout, or kill, then a JSON code and message, or one stderr line. */
   detail?: string;
 }
 
 export interface BrainClient {
   ensureSource(source: string, directory: string): Promise<{ ok: boolean; detail?: string }>;
   putPage(source: string, slug: string, file: string, expectedRevision?: string): Promise<PutOutcome>;
-  /** One `gbrain sync --source` for a source this loader configured. Optional so older test doubles still compile. */
-  syncSource?(source: string): Promise<{ ok: boolean; code?: string; detail?: string }>;
   /** Read the current page revision. Optional so older test doubles still compile. */
   getRevision?(source: string, slug: string): Promise<{ ok: boolean; revision?: string; code?: string }>;
   counts(sources: string[], bots: { source: string; bot: string }[], manifest: Manifest): Promise<PageCounts>;
@@ -38,6 +36,12 @@ export interface SpawnResult {
   code: number;
   stdout: string;
   stderr: string;
+  /** Set when the child was killed. The diagnostic names the signal instead of an exit code. */
+  signal?: string | null;
+  /** UUID revision parsed from raw stdout before the diagnostic redaction. */
+  revision?: string;
+  /** The child was killed because it ran past the timeout. */
+  timedOut?: boolean;
 }
 
 export type SpawnFn = (argv: string[]) => Promise<SpawnResult>;
@@ -47,10 +51,6 @@ export function putArgv(bin: string, source: string, slug: string, file: string,
   if (expectedRevision) argv.push('--expected-revision', expectedRevision);
   argv.push('--json');
   return argv;
-}
-
-export function syncArgv(bin: string, source: string): string[] {
-  return [bin, 'sync', '--source', source];
 }
 
 export function getArgv(bin: string, source: string, slug: string): string[] {
@@ -63,20 +63,299 @@ export function addSourceArgv(bin: string, source: string, directory: string): s
 
 const ALREADY = /already registered|already exists|duplicate key/i;
 const PENDING_EXIT = 10;
+const CLI_SNIP = 300;
+const PIPE_CAP = 8 * 1024;
 
-export function spawnGbrain(argv: string[]): Promise<SpawnResult> {
+/** Status words. Any other value after a secret key is redacted. */
+const NON_SECRET_VALUE = new Set([
+  'missing', 'invalid', 'expired', 'required', 'none', 'null', 'empty', 'expected', 'unset', 'undefined',
+]);
+
+/** Longest first so `authorization` wins over `auth` and `access_token` over `token`. */
+const ASSIGNMENT_KEY = [
+  'authorization', 'access_token', 'access-token', 'accesstoken', 'password',
+  'api_key', 'api-key', 'apikey', 'bearer', 'passwd', 'secret', 'token', 'auth',
+] as const;
+const QUERY_KEY = [...ASSIGNMENT_KEY, 'key'] as const;
+
+function wordChar(char: string | undefined): boolean {
+  return char !== undefined && ((char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char === '_');
+}
+
+function keyAt(text: string, index: number, names: readonly string[]): { name: string; end: number } | null {
+  if (wordChar(text[index - 1])) return null;
+  const slice = text.slice(index, index + 16).toLowerCase();
+  for (const name of names) {
+    if (!slice.startsWith(name)) continue;
+    const end = index + name.length;
+    if (wordChar(text[end])) continue;
+    return { name, end };
+  }
+  return null;
+}
+
+/** Index where the value begins, after `:` or `=`. Space and tab only. */
+function valueStartAt(text: string, index: number): number | null {
+  let cursor = index;
+  while (text[cursor] === ' ' || text[cursor] === '\t') cursor++;
+  if (text[cursor] !== ':' && text[cursor] !== '=') return null;
+  cursor++;
+  while (text[cursor] === ' ' || text[cursor] === '\t') cursor++;
+  return cursor;
+}
+
+function nonSecretValue(raw: string): boolean {
+  return NON_SECRET_VALUE.has(raw.toLowerCase());
+}
+
+/**
+ * Quoted values keep spaces and honor backslash escapes. An unterminated quote
+ * runs to the end of the line. Unquoted query values stop at whitespace, `&`,
+ * or `#`. Any other unquoted value runs to whitespace.
+ */
+function readValue(text: string, index: number, query: boolean): { end: number; raw: string; quoted: boolean } {
+  const quote = text[index];
+  if (quote === '"' || quote === "'" || quote === '`') {
+    let cursor = index + 1;
+    while (cursor < text.length && text[cursor] !== '\n' && text[cursor] !== '\r') {
+      if (text[cursor] === '\\') {
+        cursor += cursor + 1 < text.length && text[cursor + 1] !== '\n' && text[cursor + 1] !== '\r' ? 2 : 1;
+        continue;
+      }
+      if (text[cursor] === quote) return { end: cursor + 1, raw: text.slice(index, cursor + 1), quoted: true };
+      cursor++;
+    }
+    return { end: cursor, raw: text.slice(index, cursor), quoted: true };
+  }
+  let cursor = index;
+  while (cursor < text.length) {
+    const char = text[cursor];
+    if (char === ' ' || char === '\t' || char === '\n' || char === '\r') break;
+    if (query && (char === '&' || char === '#')) break;
+    cursor++;
+  }
+  return { end: cursor, raw: text.slice(index, cursor), quoted: false };
+}
+
+/**
+ * One left-to-right pass. `token=` / `token:` is always a key. The value is
+ * kept only when it is a known non-secret word. `Authorization: Bearer <secret>`
+ * keeps the scheme word and redacts the secret. Runs before redactSecrets so a
+ * quoted value is not split by the shared start-of-line `\S+` patterns.
+ */
+function redactAssignments(text: string): string {
+  let out = '';
+  let index = 0;
+  while (index < text.length) {
+    const query = text[index - 1] === '?' || text[index - 1] === '&';
+    const key = keyAt(text, index, query ? QUERY_KEY : ASSIGNMENT_KEY);
+    const start = key ? valueStartAt(text, key.end) : null;
+    if (key && start !== null) {
+      const value = readValue(text, start, query);
+      const schemeIntro = (key.name === 'auth' || key.name === 'authorization')
+        && !value.quoted && value.raw.toLowerCase() === 'bearer';
+      if (schemeIntro) {
+        out += text.slice(index, start);
+        index = start;
+        continue;
+      }
+      if (!value.quoted && nonSecretValue(value.raw)) {
+        out += text.slice(index, value.end);
+      } else if (query) {
+        out += `${text.slice(index, start)}[redacted]`;
+      } else {
+        out += '[redacted]';
+      }
+      index = value.end;
+      continue;
+    }
+    const bearer = keyAt(text, index, ['bearer']);
+    if (bearer && valueStartAt(text, bearer.end) === null && (text[bearer.end] === ' ' || text[bearer.end] === '\t')) {
+      let cursor = bearer.end;
+      while (text[cursor] === ' ' || text[cursor] === '\t') cursor++;
+      const next = keyAt(text, cursor, ASSIGNMENT_KEY);
+      const nextIsToken = next?.name === 'token' && valueStartAt(text, next.end) !== null;
+      if (!nextIsToken && cursor < text.length && text[cursor] !== '\n' && text[cursor] !== '\r') {
+        const value = readValue(text, cursor, false);
+        if (value.raw && (value.quoted || !nonSecretValue(value.raw))) {
+          out += 'Bearer [redacted]';
+          index = value.end;
+          continue;
+        }
+      }
+    }
+    out += text[index];
+    index++;
+  }
+  return out;
+}
+
+/**
+ * Redact text that may be copied onto a warning. Page files are not read here.
+ * This does not stop a CLI from echoing a page, a path, or a secret, so callers
+ * keep stdout off the warning and only attach a short redacted stderr line or
+ * a JSON code plus message. argv is never appended.
+ */
+function redactCliText(text: string): string {
+  let out = redactAssignments(text);
+  out = redactSecrets(out);
+  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1');
+  out = out.replace(/\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[redacted]');
+  out = out.replace(/\S+@\S+/g, '[redacted]');
+  out = out.replace(/[A-Za-z]:[/\\]Users[/\\][^/\\\s]+/gi, '~');
+  out = out.replace(/(?:\/home|\/Users)\/[^/\s]+/g, '~');
+  out = out.replace(/(^|[\s"'`(])(\/(?:[^\s/]+\/)*[^\s/]+)/g, (_match, lead: string, path: string) => {
+    const base = path.slice(path.lastIndexOf('/') + 1);
+    return `${lead}${base}`;
+  });
+  return out.replace(/[A-Za-z0-9+/=._~-]{24,}/g, '[redacted]');
+}
+
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length <= max ? flat : flat.slice(0, max);
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function asOpError(value: unknown): { code: string; message: string } | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.code !== 'string' || record.code.trim() === '') return null;
+  if (typeof record.message !== 'string') return null;
+  return { code: record.code, message: record.message };
+}
+
+function firstBalancedObject(text: string): unknown {
+  const start = text.indexOf('{');
+  if (start < 0) return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') depth++;
+    else if (char === '}') {
+      depth--;
+      if (depth === 0) return parseJson(text.slice(start, i + 1));
+    }
+  }
+  return undefined;
+}
+
+/** One JSON value: the whole text, else the first JSON line, else the first balanced object. */
+function firstJsonValue(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const whole = parseJson(trimmed);
+  if (whole !== undefined) return whole;
+  for (const line of trimmed.split('\n')) {
+    const parsed = parseJson(line.trim());
+    if (parsed !== undefined) return parsed;
+  }
+  return firstBalancedObject(trimmed);
+}
+
+function parseOpError(text: string): { code: string; message: string } | null {
+  return asOpError(firstJsonValue(text));
+}
+
+function failureHead(result: SpawnResult): string {
+  if (result.timedOut) return 'timeout';
+  if (result.signal) return `killed ${result.signal}`;
+  return `exit ${result.code}`;
+}
+
+function stderrLine(stderr: string): string {
+  const redacted = redactCliText(stderr);
+  const line = redacted.split(/\r?\n/).map((part) => part.trim()).find(Boolean) ?? '';
+  return oneLine(line, CLI_SNIP);
+}
+
+function failureDetail(result: SpawnResult): string {
+  const head = failureHead(result);
+  const parsed = parseOpError(result.stdout) ?? parseOpError(result.stderr);
+  if (parsed) {
+    const code = oneLine(redactCliText(parsed.code), 80);
+    const message = oneLine(redactCliText(parsed.message), CLI_SNIP);
+    return message ? `${head}, ${code}: ${message}` : `${head}, ${code}`;
+  }
+  const line = stderrLine(result.stderr);
+  return line ? `${head}, ${line}` : head;
+}
+
+function pushCapped(chunks: Buffer[], state: { n: number }, chunk: Buffer): void {
+  if (state.n >= PIPE_CAP) return;
+  const room = PIPE_CAP - state.n;
+  const slice = chunk.length > room ? chunk.subarray(0, room) : chunk;
+  chunks.push(slice);
+  state.n += slice.length;
+}
+
+/** Default bound for one gbrain child. A timeout kills it and the run releases the loader lock. */
+export const SPAWN_TIMEOUT_MS = 120_000;
+
+export function spawnGbrain(argv: string[], options: { timeoutMs?: number } = {}): Promise<SpawnResult> {
+  const timeoutMs = Number.isFinite(options.timeoutMs) && (options.timeoutMs ?? 0) > 0 ? options.timeoutMs! : SPAWN_TIMEOUT_MS;
   return new Promise((resolvePromise) => {
+    // argv is the command. It is not copied into the result or the diagnostic.
+    let settled = false;
+    let timedOut = false;
+    let hardKill: ReturnType<typeof setTimeout> | undefined;
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (result: SpawnResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (hardKill) clearTimeout(hardKill);
+      resolvePromise(result);
+    };
     const child = spawn(argv[0]!, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
-    child.stdout.on('data', (chunk: Buffer) => out.push(chunk));
-    child.stderr.on('data', (chunk: Buffer) => err.push(chunk));
-    child.on('error', (error) => resolvePromise({ code: 127, stdout: '', stderr: redactSecrets(error.message) }));
-    child.on('close', (code) => {
-      resolvePromise({
+    const outBytes = { n: 0 };
+    const errBytes = { n: 0 };
+    child.stdout.on('data', (chunk: Buffer) => pushCapped(out, outBytes, chunk));
+    child.stderr.on('data', (chunk: Buffer) => pushCapped(err, errBytes, chunk));
+    timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+      hardKill = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }, 1000);
+    }, timeoutMs);
+    child.on('error', (error) => finish({
+      code: 127,
+      stdout: '',
+      stderr: redactCliText(error.message),
+      ...(timedOut ? { timedOut: true } : {}),
+    }));
+    child.on('close', (code, signal) => {
+      const rawOut = Buffer.concat(out).toString('utf8');
+      const revision = revisionOf(rawOut);
+      finish({
         code: code ?? 1,
-        stdout: Buffer.concat(out).toString('utf8'),
-        stderr: redactSecrets(Buffer.concat(err).toString('utf8')),
+        stdout: redactCliText(rawOut),
+        stderr: redactCliText(Buffer.concat(err).toString('utf8')),
+        ...(signal ? { signal } : {}),
+        ...(revision ? { revision } : {}),
+        ...(timedOut ? { timedOut: true } : {}),
       });
     });
   });
@@ -99,31 +378,26 @@ export function manifestCounts(sources: string[], bots: { source: string; bot: s
   return { sources: sourceCounts, bots: botCounts, via: 'pages written by the loader (manifest)' };
 }
 
-export function createGbrainClient(bin: string, spawnFn: SpawnFn = spawnGbrain): BrainClient {
+export function createGbrainClient(bin: string, spawnFn?: SpawnFn, options?: { timeoutMs?: number }): BrainClient {
+  const spawn = spawnFn ?? ((argv: string[]) => spawnGbrain(argv, options));
   return {
     async ensureSource(source, directory) {
-      const result = await spawnFn(addSourceArgv(bin, source, directory));
+      const result = await spawn(addSourceArgv(bin, source, directory));
       if (result.code === 0) return { ok: true };
       if (ALREADY.test(result.stdout) || ALREADY.test(result.stderr)) return { ok: true };
-      return { ok: false };
+      return { ok: false, detail: failureDetail(result) };
     },
     async putPage(source, slug, file, expectedRevision) {
-      const result = await spawnFn(putArgv(bin, source, slug, file, expectedRevision));
-      if (result.code === 0) return { ok: true, pending: false, revision: revisionOf(result.stdout) };
-      if (result.code === PENDING_EXIT) return { ok: false, pending: true };
+      const result = await spawn(putArgv(bin, source, slug, file, expectedRevision));
+      if (!result.timedOut && result.code === 0) return { ok: true, pending: false, revision: result.revision ?? revisionOf(result.stdout) };
+      if (!result.timedOut && result.code === PENDING_EXIT) return { ok: false, pending: true };
       const code = errorCode(result);
-      return { ok: false, pending: false, ...(code ? { code } : {}), detail: failureDetail(result, code) };
-    },
-    async syncSource(source) {
-      const result = await spawnFn(syncArgv(bin, source));
-      if (result.code === 0) return { ok: true };
-      const code = errorCode(result);
-      return { ok: false, ...(code ? { code } : {}), detail: failureDetail(result, code) };
+      return { ok: false, pending: false, ...(code ? { code } : {}), detail: failureDetail(result) };
     },
     async getRevision(source, slug) {
-      const result = await spawnFn(getArgv(bin, source, slug));
-      if (result.code === 0) {
-        const revision = revisionOf(result.stdout);
+      const result = await spawn(getArgv(bin, source, slug));
+      if (!result.timedOut && result.code === 0) {
+        const revision = result.revision ?? revisionOf(result.stdout);
         return revision ? { ok: true, revision } : { ok: false };
       }
       const code = errorCode(result);
@@ -175,9 +449,4 @@ function errorCode(result: SpawnResult): string | undefined {
     if (CODE.test(raw)) return raw;
   }
   return undefined;
-}
-
-/** Exit code plus the error code. The CLI message is dropped so a path or a secret cannot land in the summary. */
-function failureDetail(result: SpawnResult, code: string | undefined): string {
-  return code ? `exit ${result.code}, ${code}` : `exit ${result.code}`;
 }

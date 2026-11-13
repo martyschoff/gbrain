@@ -173,6 +173,29 @@ function publicError(error: unknown): Record<string, unknown> {
   return { error: 'storage_error', message: 'The persistence owner could not complete this request.' };
 }
 
+/** A driver field safe to print: letters, digits, underscore. Anything else is dropped. */
+function ownerFaultField(value: unknown): string {
+  const text = typeof value === 'string' || typeof value === 'number' ? String(value) : '';
+  return /^[A-Za-z0-9_]{1,64}$/.test(text) ? text : '-';
+}
+
+/**
+ * One stderr line for a fault the client must not see. Structured fields only:
+ * class, driver code, constraint, severity, operation, request id. Never the
+ * message, DETAIL, params, paths, or SQL values.
+ */
+function logUnclassifiedOwnerFault(error: unknown, operation: string, requestId: string | undefined): void {
+  if (error instanceof OperationError) return;
+  const err = error instanceof Error ? error : new Error('unknown');
+  const raw = (error ?? {}) as { code?: unknown; constraint?: unknown; constraint_name?: unknown; severity?: unknown };
+  const cls = ownerFaultField(err.constructor?.name || err.name) === '-' ? 'Error' : (err.constructor?.name || err.name || 'Error');
+  const op = /^[a-z][a-z0-9_]{0,63}$/.test(operation) ? operation : 'unknown';
+  const id = requestId && isWriteRequestId(requestId) ? requestId : '-';
+  const line = `[gbrain persistence] ${cls} code=${ownerFaultField(raw.code)} constraint=${ownerFaultField(raw.constraint_name ?? raw.constraint)} severity=${ownerFaultField(raw.severity)} operation=${op} request_id=${id}\n`;
+  try { process.stderr.write(line); }
+  catch { /* stderr gone */ }
+}
+
 function responseFrame(value: unknown): string {
   const frame = JSON.stringify(value) + '\n';
   if (Buffer.byteLength(frame) > PERSISTENCE_IPC_MAX_BYTES) {
@@ -232,8 +255,15 @@ export async function startPersistenceIpcServer(
       void (async () => {
         let admitted = false;
         let mutation: { requestId: string; receipt?: WriteReceipt } | undefined;
+        let faultOperation = 'unknown';
+        let faultRequestId: string | undefined;
         try {
           const request: unknown = JSON.parse(payload);
+          if (record(request)) {
+            if (typeof request.operation === 'string') faultOperation = request.operation;
+            else if (typeof request.kind === 'string') faultOperation = request.kind;
+            if (record(request.params) && isWriteRequestId(request.params.request_id)) faultRequestId = request.params.request_id;
+          }
           if (record(request) && exactKeys(request, ['version', 'kind']) && request.version === 1 && request.kind === 'capabilities') {
             socket.end(responseFrame({ version: 1, ok: true, result: {
               version: 1, brain_id: provider.brainId, operations: PERSISTENCE_IPC_OPERATIONS,
@@ -273,6 +303,7 @@ export async function startPersistenceIpcServer(
           if (mutation && record(result) && isWriteReceipt(result.write_request)) mutation.receipt = result.write_request;
           if (!socket.destroyed) socket.end(responseFrame({ version: 1, ok: true, result }));
         } catch (error) {
+          logUnclassifiedOwnerFault(error, faultOperation, faultRequestId);
           // #6989: a write whose reply is too large to frame may have committed; the error carries its request ID (and
           // receipt, when the result held one) so the advice to inspect it is actionable. A read gets none.
           if (mutation && error instanceof OperationError && error.code === 'response_too_large') {
