@@ -66,7 +66,7 @@ TS = `deniedExportContent` / `looksLikeMail` (plus `contentHasSecret` for keys).
 | fenced `api_key: SEE_HANDBOOK` | keep | n | n | n | n | yes |
 | ph YOUR_KEY_HERE / xxxxxxxx / `<redacted>` / SEE_VAULT | keep | n | n | n | n | yes |
 | real mixed alnum / `not-a-real-value` | deny | y | y | n | n | no |
-| **fp-travel** `From: Harrisburg` / `To: Philadelphia` / `Date: Friday` | new | **y** | **y** | y | y | **no** |
+| **fp-travel** `From: City A` / `To: City B` / `Date: Friday` | new | **y** | **y** | y | y | **no** |
 | **fp-meeting-template** `Date: Monday` / `Subject: Planning` / `To: team` | new | **y** | **y** | y | y | **no** |
 | three headers with a blank between each | keep | n | n | n | n | yes |
 | two headers, prose, two more | keep | n | n | n | n | yes |
