@@ -471,6 +471,50 @@ describe('cli failure diagnostics', () => {
     expect(windows.detail).toContain('~/note.md');
     expect(windows.detail).not.toContain('user-example');
   });
+
+  test('quoted assignment values, api key spellings, and phrase colons stay precise', async () => {
+    const quoted = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'token="quoted value with spaces" password=\'abc def\'\n',
+    }));
+    const quotePut = await quoted.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(quotePut.detail).not.toContain('quoted value');
+    expect(quotePut.detail).not.toContain('with spaces');
+    expect(quotePut.detail).not.toContain('abc def');
+    expect(quotePut.detail).not.toContain("def'");
+    expect(quotePut.detail).toContain('[redacted]');
+
+    const aliases = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'login failed api-key=hyphenval apiKey: camelval APIKEY=upperval\n',
+    }));
+    const aliasPut = await aliases.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(aliasPut.detail).toContain('login failed');
+    expect(aliasPut.detail).not.toContain('hyphenval');
+    expect(aliasPut.detail).not.toContain('camelval');
+    expect(aliasPut.detail).not.toContain('upperval');
+
+    const phrase = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'invalid token: missing\n',
+    }));
+    const phrasePut = await phrase.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(phrasePut.detail).toContain('invalid token: missing');
+    expect(phrasePut.detail).not.toContain('[redacted]');
+
+    const query = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'failed ?token=querytok&x=1\n',
+    }));
+    const queryPut = await query.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(queryPut.detail).toContain('&x=1');
+    expect(queryPut.detail).toContain('token=[redacted]');
+    expect(queryPut.detail).not.toContain('querytok');
+  });
 });
 
 describe('secret list', () => {

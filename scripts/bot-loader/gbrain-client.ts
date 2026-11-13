@@ -58,9 +58,15 @@ const PIPE_CAP = 8 * 1024;
 function redactCliText(text: string): string {
   let out = redactSecrets(text);
   out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1');
-  out = out.replace(/([?&](?:access_token|password|token|secret|bearer|key)=)[^&#\s]*/gi, '$1[redacted]');
+  out = out.replace(/([?&](?:access_token|api[_-]?key|password|token|secret|bearer|key)=)[^&#\s]*/gi, '$1[redacted]');
   // Diagnostic only. The shared password pattern stays anchored so other callers keep their tests.
-  out = out.replace(/\b(?:password|passwd|secret|token|api_key)\s*[:=]\s*\S+/gi, '[redacted]');
+  // Unquoted values stop at whitespace, & and #. Names after ? or & were handled above.
+  // "invalid token:" is a phrase: token before a colon counts only when no word precedes it.
+  // token= is always a key. Quoted values keep their spaces.
+  const quotedOrToken = "(?:'[^']*'|\"[^\"]*\"|[^\\s&#]+)";
+  out = out.replace(new RegExp(`(?<![?&])\\b(?:password|passwd|secret|api[_-]?key)\\b\\s*[:=]\\s*${quotedOrToken}`, 'gi'), '[redacted]');
+  out = out.replace(new RegExp(`(?<![?&])\\btoken\\b\\s*=\\s*${quotedOrToken}`, 'gi'), '[redacted]');
+  out = out.replace(new RegExp(`(?<![?&])(?<!\\b[A-Za-z]+\\s)\\btoken\\b\\s*:\\s*${quotedOrToken}`, 'gi'), '[redacted]');
   out = out.replace(/\bbearer\s+\S+/gi, 'Bearer [redacted]');
   out = out.replace(/\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[redacted]');
   out = out.replace(/\S+@\S+/g, '[redacted]');
