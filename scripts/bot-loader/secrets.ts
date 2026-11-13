@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { placeholderSecret } from './export-deny.ts';
+import { compilePattern, globalCopy } from './unicode-regexp.ts';
 
 interface PatternRow {
   source: string;
@@ -47,7 +48,7 @@ function compile(rows: PatternRow[]): Compiled[] {
     index,
     source: row.source,
     flags: row.flags,
-    pattern: new RegExp(row.source, row.flags),
+    pattern: compilePattern(row.source, row.flags),
     allowPlaceholders: row.allow_placeholders === true,
   }));
 }
@@ -89,7 +90,7 @@ export function isSecretFileName(name: string): boolean {
 }
 
 function assignmentMatch(text: string, source: string, flags: string): { index: number; length: number } | null {
-  const pattern = new RegExp(source, flags.includes('g') ? flags : `${flags}g`);
+  const pattern = compilePattern(source, flags.includes('g') ? flags : `${flags}g`);
   for (const match of text.matchAll(pattern)) {
     const bare = (match[1] ?? '').trim();
     const value = bare.length >= 2 && ((bare.startsWith('"') && bare.endsWith('"')) || (bare.startsWith("'") && bare.endsWith("'")))
@@ -140,7 +141,7 @@ export function contentHasSecret(text: string): boolean {
 export function redactSecrets(text: string): string {
   let out = text;
   for (const pattern of REDACT_CONTENT) {
-    out = out.replace(new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`), '[redacted]');
+    out = out.replace(globalCopy(pattern), '[redacted]');
   }
   return out;
 }

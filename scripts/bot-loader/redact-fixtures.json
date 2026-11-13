@@ -62,6 +62,30 @@
       "hits": [{ "rule": "deny.content[5]", "line": 1, "count": 1 }]
     },
     {
+      "name": "phone-fullwidth",
+      "input": "call ５５５-０１０-０１９９ later\n",
+      "output": "call <phone> later\n",
+      "hits": [{ "rule": "deny.content[1]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "ssn-fullwidth",
+      "input": "ssn ０００-００-００００\n",
+      "output": "ssn <number>\n",
+      "hits": [{ "rule": "deny.content[10]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "card-fullwidth",
+      "input": "card ４２４２ ４２４２ ４２４２ ４２４２\n",
+      "output": "card <number>\n",
+      "hits": [{ "rule": "deny.content[3]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "account-fullwidth",
+      "input": "acct １２３４５６\n",
+      "output": "<number>\n",
+      "hits": [{ "rule": "deny.content[5]", "line": 1, "count": 1 }]
+    },
+    {
       "name": "street",
       "input": "Meet at 12 Canary9f3a Street tomorrow.\n",
       "output": "Meet at <address> tomorrow.\n",

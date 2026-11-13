@@ -140,6 +140,20 @@ class SecretRulesTest(unittest.TestCase):
         self.assertTrue(loaded["names"])
         self.assertTrue(loaded["content"])
 
+    def test_secret_content_unicode_digits(self):
+        """Content rows that use \\d must treat fullwidth digits like Python's \\d."""
+        data = load_patterns()
+        wide = str.maketrans("0123456789", "０１２３４５６７８９")
+        checked = 0
+        for row in data["content"]:
+            checked += 1
+            if "\\d" not in row["source"] and "\\D" not in row["source"]:
+                continue
+            sample = row["sample"]
+            self.assertEqual(secret_content_rule(sample.translate(wide)), secret_content_rule(sample), row["source"])
+        self.assertEqual(checked, len(data["content"]))
+        self.assertGreater(checked, 0)
+
     def test_redact_fixtures_match_typescript(self):
         from export_deny import redact_export_deny
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "redact-fixtures.json")

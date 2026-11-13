@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test';
 import { loadConfig } from '../scripts/bot-loader/config.ts';
 import { deniedContentMatch, deniedContentRule, deniedExportContent, deniedExportName, deniedNameRule, redactExportDenyContent } from '../scripts/bot-loader/export-deny.ts';
 import { contentHasSecret, isSecretFileName, secretContentMatch, secretContentRule, secretNameRule } from '../scripts/bot-loader/secrets.ts';
+import { compilePattern } from '../scripts/bot-loader/unicode-regexp.ts';
 import type { BrainClient } from '../scripts/bot-loader/gbrain-client.ts';
 import { isNewYorkExportTime } from '../scripts/bot-loader/multi-account.ts';
 import { sha256 } from '../scripts/bot-loader/render.ts';
@@ -261,7 +262,7 @@ describe('multi-account drops', () => {
     expect(puts.filter((put) => put.source === 'account-b')).toHaveLength(5);
   });
 
-  test('a sha mismatch is skipped and the rest of the bot is imported', async () => {
+  test('a sha mismatch rejects the whole bot', async () => {
     const home = temp('gbrain-export-hash-');
     const share = join(home, 'share');
     const files = goodFiles('bot-a');
@@ -272,12 +273,12 @@ describe('multi-account drops', () => {
     const result = await run(configFor(home, share, [roots(share)[0]!]), brain);
     expect(result.exitCode).toBe(0);
     expect(result.summaryText).toContain('hash mismatch memory.md');
-    expect(puts.map((put) => put.slug)).not.toContain('account-a/bot-a/memory');
-    expect(puts.map((put) => put.slug)).toContain('account-a/bot-a/profile');
-    expect(puts.map((put) => put.slug)).toContain('account-a/bot-a/routines');
+    expect(result.summaryText).not.toContain('secret rejected');
+    expect(result.summaryText).toContain('secrets_skipped=0');
+    expect(puts).toHaveLength(0);
   });
 
-  test('a size mismatch is skipped when the sha256 still matches', async () => {
+  test('a size mismatch rejects the whole bot when the sha256 still matches', async () => {
     const home = temp('gbrain-export-size-');
     const share = join(home, 'share');
     const dir = join(share, 'drops', '_box-export', 'bot-a');
@@ -290,8 +291,9 @@ describe('multi-account drops', () => {
     expect(result.exitCode).toBe(0);
     expect(result.summaryText).toContain('size mismatch memory.md');
     expect(result.summaryText).not.toContain('hash mismatch memory.md');
-    expect(puts.map((put) => put.slug)).not.toContain('account-a/bot-a/memory');
-    expect(puts.map((put) => put.slug)).toContain('account-a/bot-a/profile');
+    expect(result.summaryText).not.toContain('secret rejected');
+    expect(result.summaryText).toContain('secrets_skipped=0');
+    expect(puts).toHaveLength(0);
   });
 
   test('a listed file that is gone logs missing', async () => {
@@ -760,24 +762,25 @@ describe('multi-account drops', () => {
     expect(result.summaryText).not.toContain('redacted ');
     expect(puts).toHaveLength(0);
 
-    const home2 = temp('gbrain-export-hash-email-');
+    const home2 = temp('gbrain-export-hash-jwt-');
     const share2 = join(home2, 'share');
     const dir2 = join(share2, 'drops', '_box-export', 'bot-a');
-    writeBot(dir2, 'account-a', 'bot-a', goodFiles('bot-a'));
-    const body = 'Write ' + email + ' later.\n';
-    writeFileSync(join(dir2, 'memory.md'), body);
+    const jwtBody = '# Memory\n\n' + jwt + '\n';
+    const jwtFiles = goodFiles('bot-a');
+    jwtFiles['memory.md'] = jwtBody;
+    writeBot(dir2, 'account-a', 'bot-a', jwtFiles);
     const manifestPath = join(dir2, 'manifest.json');
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { files: Record<string, { size: number; sha256: string }> };
-    manifest.files['memory.md']!.size = Buffer.from(body).length;
     manifest.files['memory.md']!.sha256 = '0'.repeat(64);
     writeFileSync(manifestPath, JSON.stringify(manifest) + '\n');
     const hashed = fakeBrain();
     const mismatch = await run(configFor(home2, share2, [roots(share2)[0]!]), hashed.brain);
     expect(mismatch.summaryText).toContain('hash mismatch memory.md');
-    expect(mismatch.summaryText).not.toContain('redacted memory.md');
-    expect(mismatch.summaryText).not.toContain(email);
-    expect(hashed.puts.map((put) => put.slug)).not.toContain('account-a/bot-a/memory');
-    expect(hashed.puts.map((put) => put.slug)).toContain('account-a/bot-a/profile');
+    expect(mismatch.summaryText).toContain('secret rejected memory.md rule=secrets.content[21]');
+    expect(mismatch.summaryText).toContain('secrets_skipped=1');
+    expect(mismatch.summaryText).not.toContain(jwt);
+    expect(mismatch.summaryText).not.toContain('redacted ');
+    expect(hashed.puts).toHaveLength(0);
   });
 
   test('a deny key assignment still rejects, and phone, ssn, card, and account numbers redact', async () => {
@@ -802,6 +805,53 @@ describe('multi-account drops', () => {
       const again = redactExportDenyContent(redacted.text);
       expect(again.text).toBe(redacted.text);
       expect(again.hits).toEqual([]);
+    }
+  });
+
+  test('every pattern compiles under unicode flags and matches its ascii sample', () => {
+    const secrets = JSON.parse(readFileSync(join(REPO, 'scripts/bot-loader/secret-patterns.json'), 'utf8')) as {
+      names: { source: string; flags: string; sample: string }[];
+      content: { source: string; flags: string; sample: string }[];
+      name_negatives: string[];
+      content_negatives: string[];
+    };
+    const deny = JSON.parse(readFileSync(join(REPO, 'scripts/bot-loader/export-deny.json'), 'utf8')) as {
+      names: { source: string; flags: string }[];
+      content: { source: string; flags: string }[];
+      key_assignment: { source: string; flags: string };
+      mail_markers: { source: string; flags: string }[];
+    };
+    const rows = [
+      ...secrets.names,
+      ...secrets.content,
+      ...deny.names,
+      ...deny.content,
+      deny.key_assignment,
+      ...deny.mail_markers,
+    ];
+    expect(rows.length).toBeGreaterThan(40);
+    for (const row of rows) {
+      const compiled = compilePattern(row.source, row.flags);
+      expect(compiled.flags.includes('u')).toBe(true);
+    }
+    for (const row of [...secrets.names, ...secrets.content]) {
+      const legacy = new RegExp(row.source, row.flags);
+      const compiled = compilePattern(row.source, row.flags);
+      const before = legacy.exec(row.sample);
+      const after = compiled.exec(row.sample);
+      expect(after?.[0]).toBe(before?.[0]);
+      expect(after?.index).toBe(before?.index);
+    }
+    const klass = compilePattern(String.raw`[\d]`, '');
+    expect(klass.test('５')).toBe(true);
+    expect(klass.test('5')).toBe(true);
+    expect(compilePattern(String.raw`[\D]`, '').test('５')).toBe(false);
+    expect(compilePattern(String.raw`\D`, '').test('５')).toBe(false);
+    expect(compilePattern(String.raw`\D`, '').test('a')).toBe(true);
+    const wide = (text: string) => text.replace(/[0-9]/g, (digit) => String.fromCodePoint(0xff10 + Number(digit)));
+    for (const row of secrets.content) {
+      if (!row.source.includes(String.raw`\d`) && !row.source.includes(String.raw`\D`)) continue;
+      expect(secretContentRule(wide(row.sample))).toBe(secretContentRule(row.sample));
     }
   });
 });

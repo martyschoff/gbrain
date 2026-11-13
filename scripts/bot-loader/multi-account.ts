@@ -343,6 +343,7 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
   const pages: ExportPage[] = [];
   const redactNotes: string[] = [];
   let secret = false;
+  let rejectBot = false;
   for (const [rel, meta] of Object.entries(parsed.body.files)) {
     summary.scanned += 1;
     const namedRule = nameRule(rel);
@@ -369,14 +370,20 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
       warnings.push(`export ${tag}: symlink`);
       return { planned: { summary, pages: [] }, warnings };
     }
-    if (bytes.length !== meta.size) {
-      summary.skipped += 1;
-      warnings.push(`export ${tag}: size mismatch ${rel}`);
-      continue;
-    }
-    if (sha256(bytes) !== meta.sha256) {
-      summary.skipped += 1;
-      warnings.push(`export ${tag}: hash mismatch ${rel}`);
+    const sizeMismatch = bytes.length !== meta.size;
+    const hashMismatch = !sizeMismatch && sha256(bytes) !== meta.sha256;
+    if (sizeMismatch || hashMismatch) {
+      warnings.push(`export ${tag}: ${sizeMismatch ? 'size' : 'hash'} mismatch ${rel}`);
+      const raw = bytes.includes(0) ? null : bytes.toString('utf8');
+      if (raw !== null) {
+        const secretHit = secretContentMatch(raw);
+        if (secretHit) {
+          secret = true;
+          summary.secretsSkipped += 1;
+          warnSecret(warnings, tag, rel, { rule: secretHit.rule, line: secretHit.line });
+        }
+      }
+      rejectBot = true;
       continue;
     }
     const text = bytes.includes(0) ? null : bytes.toString('utf8');
@@ -421,9 +428,9 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
       bytes: redacted.hits.length === 0 ? bytes : Buffer.from(redacted.text, 'utf8'),
     });
   }
-  if (secret) {
+  if (secret || rejectBot) {
     summary.redactedHits = 0;
-    warnings.push(`export ${tag}: secret rejected`);
+    if (secret) warnings.push(`export ${tag}: secret rejected`);
     return { planned: { summary, pages: [] }, warnings };
   }
   warnings.push(...redactNotes);

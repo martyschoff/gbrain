@@ -1,6 +1,6 @@
 # Multi-account bot export
 
-**Say to your agent:** *"Ingest the nightly bot drops from both account roots, tag each page with its account and bot, and skip any file whose manifest hash does not match."*
+**Say to your agent:** *"Ingest the nightly bot drops from both account roots, tag each page with its account and bot, redact emails, phone numbers, street addresses, and account numbers in the loaded pages, and reject a whole bot folder when its manifest hash or size does not match or a token or password is present."*
 
 This is the drop the Grok Bot loader reads from `export_roots` in the local config. It is separate from the fail-closed business feed.
 
@@ -38,7 +38,17 @@ There are no dated subfolders. Each bot folder is replaced wholesale every night
 
 Required files are `profile.json`, `memory.md` (each fact with its date), and `routines.md` (name, schedule, prompt). Optional files are `skills/<skill>.md` and `notes/<name>.md`, `notes/<name>.txt`, or `notes/<name>.json`. Skill and note names are lowercase and have no spaces.
 
-Never include tokens, keys, passwords, `.env` files, holdings, account numbers, email bodies, street addresses, or phone numbers. The loader uses `scripts/bot-loader/secret-patterns.json` and `scripts/bot-loader/export-deny.json`. A match rejects that bot folder. A size or sha256 mismatch skips that file and logs the reason. A listed file that is not on disk logs `missing`. Unknown keys in `manifest.json` or in a file entry reject the folder. Unlisted files are not read. Symlinks are not followed; a symlink inside the bot folder rejects that folder. A path that leaves the bot folder rejects the folder. If `manifest.json` changes after the files are read, the folder is skipped. `exported_at` must fall inside `box_export_max_age_hours` of the run (default 36, in either direction). A stamp outside that window logs `stale` and imports nothing from that folder.
+Never include tokens, keys, passwords, `.env` files, holdings, account numbers, email bodies, street addresses, or phone numbers. The loader uses `scripts/bot-loader/secret-patterns.json` and `scripts/bot-loader/export-deny.json`.
+
+A secrets hit still rejects the whole bot folder, and nothing from it is loaded. That includes a sensitive filename (`secrets.names[N]` or `deny.names[N]`), a manifest string value other than a sha256, any `secrets.*` content rule, the deny `password:` row (`deny.content[11]`), and `deny.key_assignment`. The log line is `export <account>/<bot>: secret rejected <rel> rule=<label>`, plus `line=<n>` for a content hit. The matched text is not logged. A summary line `export <account>/<bot>: secret rejected` follows, and `secrets_skipped` counts those files.
+
+Other export-deny content is redacted, and the file is loaded. Emails become `<email>`, phone numbers `<phone>`, street addresses and `N Name Place` addresses `<address>`, SSN-like values, 16-digit runs, 4×4 card numbers, and account-number runs `<number>`, and the word holdings becomes `positions-summary`. Digits follow Python: fullwidth decimal digits are redacted too. Pasted mail drops header lines and marker lines (`-----Original Message-----`, `Forwarded message`, `On ... wrote:`) inside the scanned window. Each redaction logs `export <account>/<bot>: redacted <rel> rule=<label> line=<n> count=<k>`. The bot summary includes `redacted_hits=<n>` between `secrets_skipped` and `pages`.
+
+The mail scan only covers the first 20 lines. A leading closed `---` block is skipped, except `Message-ID` and `Received`. Folded header continuation lines are not recognized and are not dropped. After redaction, every deny rule and every secrets rule runs again on the redacted text; a remaining match rejects the folder. A throw in the redactor or that rescan aborts the whole `planExportRoots` call, so no root in that call is planned.
+
+`origin_sha256` on an export page is the sha256 of the redacted text, not of the drop file. Idempotency hashes that same redacted page, so a source change that redacts to the same text reports unchanged.
+
+A manifest size or sha256 mismatch rejects the whole bot folder: nothing from it is loaded. The loader still scans the raw bytes of the mismatched file for secrets, so a secret there is logged and counted in `secrets_skipped` along with the `size mismatch` or `hash mismatch` line. A listed file that is not on disk logs `missing` and does not by itself reject the folder. Unknown keys in `manifest.json` or in a file entry reject the folder. Unlisted files are not read. Symlinks are not followed; a symlink inside the bot folder rejects that folder. A path that leaves the bot folder rejects the folder. If `manifest.json` changes after the files are read, the folder is skipped. `exported_at` must fall inside `box_export_max_age_hours` of the run (default 36, in either direction). A stamp outside that window logs `stale` and imports nothing from that folder.
 
 ## Config
 
@@ -63,7 +73,7 @@ Never include tokens, keys, passwords, `.env` files, holdings, account numbers, 
 }
 ```
 
-The loader writes pages under `target_root/<account>/<BOT>/` and tags each page with `account`, `bot`, and `bot_name`. The same drop on a later night does not rewrite a page whose sha256 is already imported.
+The loader writes pages under `target_root/<account>/<BOT>/` and tags each page with `account`, `bot`, and `bot_name`. The same drop on a later night does not rewrite a page whose redacted text hashes to a sha256 already imported.
 
 `scripts/bot-loader/box-export.py --account <ACCOUNT> --out <root>` writes this layout. `--out` is the account root (`_box-export` or `_box-export-<ACCOUNT>`), not a dated directory. `--fail-closed --source <SOURCE>` writes the other contract instead: a tree-level `EXPORTED_AT` and `MANIFEST.json` for a fail-closed feed. That flag is not the nightly drop.
 

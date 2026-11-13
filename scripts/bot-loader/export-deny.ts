@@ -5,6 +5,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { compilePattern, globalCopy } from './unicode-regexp.ts';
 
 interface PatternRow {
   source: string;
@@ -40,14 +41,14 @@ interface Compiled {
 }
 
 function compileIndexed(rows: PatternRow[]): Compiled[] {
-  return rows.map((row, index) => ({ index, pattern: new RegExp(row.source, row.flags) }));
+  return rows.map((row, index) => ({ index, pattern: compilePattern(row.source, row.flags) }));
 }
 
 const DENY_NAME_ROWS = compileIndexed(patternFile.names);
 const DENY_CONTENT_ROWS = compileIndexed(patternFile.content);
 const MAIL_MARKER_ROWS = compileIndexed(patternFile.mail_markers ?? []);
 const KEY_ASSIGNMENT = patternFile.key_assignment
-  ? new RegExp(patternFile.key_assignment.source, `${patternFile.key_assignment.flags}g`)
+  ? compilePattern(patternFile.key_assignment.source, `${patternFile.key_assignment.flags}g`)
   : null;
 const KEY_MIN = patternFile.key_assignment?.min_length ?? 8;
 const MAIL_HEADERS = patternFile.mail_headers ?? [];
@@ -324,8 +325,7 @@ function redactSpans(text: string): RedactSpan[] {
   for (const row of DENY_CONTENT_ROWS) {
     const token = row.index < REDACT_TOKENS.length ? REDACT_TOKENS[row.index] ?? null : null;
     if (!token) continue;
-    const flags = row.pattern.flags.includes('g') ? row.pattern.flags : `${row.pattern.flags}g`;
-    const re = new RegExp(row.pattern.source, flags);
+    const re = globalCopy(row.pattern);
     for (const match of text.matchAll(re)) {
       if (match.index === undefined || match[0].length === 0) continue;
       found.push({ start: match.index, end: match.index + match[0].length, token, rule: `deny.content[${row.index}]` });
