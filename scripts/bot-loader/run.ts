@@ -67,6 +67,11 @@ function assertDestination(groups: GroupConfig[], group: GroupConfig, output: st
 
 const WRONG_HOST_STATUS = 'bot-loader: skipped: wrong host\nWARN hostname does not match GBRAIN_EXPECTED_HOST\n';
 
+function withCliDetail(base: string, detail: string | undefined): string {
+  if (!detail) return base;
+  return `${base} (${detail})`;
+}
+
 function gitRemoteRefusal(group: GroupConfig): string | null {
   if (!group.forbidGit) return null;
   if (!existsSync(join(group.targetRoot, '.git'))) return null;
@@ -143,7 +148,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
 
   for (const group of config.groups) {
     if (group.failClosed) {
-      const closed = await runFailClosedGroup(config, group, brain, manifest, seen, now);
+      const closed = await runFailClosedGroup(config, group, brain, manifest, seen, now, warnings);
       bots.push(...closed.bots);
       if (closed.skip) skips.push(`SKIP ${group.source}: ${closed.skip}`);
       if (!closed.putOk) ok = false;
@@ -160,7 +165,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
       mkdirSync(group.targetRoot, { recursive: true });
       const ensured = await brain.ensureSource(group.source, group.targetRoot);
       if (!ensured.ok) {
-        warnings.push(`source ${group.source} was not created`);
+        warnings.push(withCliDetail(`source ${group.source} was not created`, ensured.detail));
         ok = false;
         for (const bot of group.bots) bots.push(emptyBot(bot.id, group.source));
         continue;
@@ -241,7 +246,11 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
           };
           manifest.files[file.absolute] = entry;
           if (put.pending) continue;
-          if (!put.ok) { ok = false; continue; }
+          if (!put.ok) {
+            warnings.push(withCliDetail(`put failed ${slug}`, put.detail));
+            ok = false;
+            continue;
+          }
           summary.written++;
         }
       }
@@ -265,7 +274,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
       mkdirSync(root.targetRoot, { recursive: true });
       const ensured = await brain.ensureSource(root.source, root.targetRoot);
       if (!ensured.ok) {
-        warnings.push(`export ${root.account}: source not created`);
+        warnings.push(withCliDetail(`export ${root.account}: source not created`, ensured.detail));
         ok = false;
         for (const bot of root.bots) bots.push(bot.summary);
         continue;
@@ -274,7 +283,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
     }
     for (const bot of root.bots) {
       for (const page of bot.pages) {
-        const wrote = await commitExport(config, brain, manifest, seen, bot.summary, page);
+        const wrote = await commitExport(config, brain, manifest, seen, bot.summary, page, warnings);
         if (!wrote) ok = false;
       }
       bots.push(bot.summary);
@@ -313,6 +322,7 @@ async function runFailClosedGroup(
   manifest: Manifest,
   seen: Set<string>,
   now: Date,
+  warnings: string[],
 ): Promise<{ bots: BotSummary[]; skip: string | null; putOk: boolean }> {
   const blanks = () => group.bots.map((bot) => emptyBot(bot.id, group.source));
   if (group.bots.length === 0) return { bots: [], skip: 'no bots named', putOk: true };
@@ -325,7 +335,7 @@ async function runFailClosedGroup(
   if (!checked.ok) return { bots: blanks(), skip: checked.skip, putOk: true };
   if (group.ensureSource && !manifest.sources?.[group.source]?.added) {
     const ensured = await brain.ensureSource(group.source, group.targetRoot);
-    if (!ensured.ok) return { bots: blanks(), skip: 'source not created', putOk: true };
+    if (!ensured.ok) return { bots: blanks(), skip: withCliDetail('source not created', ensured.detail), putOk: true };
     manifest.sources = { ...manifest.sources, [group.source]: { added: true } };
   }
   const summaries = new Map(group.bots.map((bot) => [bot.id, emptyBot(bot.id, group.source)]));
@@ -334,7 +344,7 @@ async function runFailClosedGroup(
     const summary = summaries.get(file.botId);
     if (!summary) return { bots: blanks(), skip: 'route', putOk: true };
     summary.scanned++;
-    const wrote = await commitPlanned(config, group, brain, manifest, seen, summary, file);
+    const wrote = await commitPlanned(config, group, brain, manifest, seen, summary, file, warnings);
     if (!wrote) putOk = false;
   }
   return { bots: group.bots.map((bot) => summaries.get(bot.id)!), skip: null, putOk };
@@ -348,6 +358,7 @@ async function commitPlanned(
   seen: Set<string>,
   summary: BotSummary,
   file: PlannedFile,
+  warnings: string[],
 ): Promise<boolean> {
   const digest = sha256(file.bytes);
   seen.add(file.absolute);
@@ -382,7 +393,10 @@ async function commitPlanned(
   };
   manifest.files[file.absolute] = entry;
   if (put.pending) return true;
-  if (!put.ok) return false;
+  if (!put.ok) {
+    warnings.push(withCliDetail(`put failed ${slug}`, put.detail));
+    return false;
+  }
   summary.written++;
   return true;
 }
@@ -394,6 +408,7 @@ async function commitExport(
   seen: Set<string>,
   summary: BotSummary,
   page: ExportPage,
+  warnings: string[],
 ): Promise<boolean> {
   const digest = sha256(page.bytes);
   seen.add(page.absolute);
@@ -436,7 +451,10 @@ async function commitExport(
   };
   manifest.files[page.absolute] = entry;
   if (put.pending) return true;
-  if (!put.ok) return false;
+  if (!put.ok) {
+    warnings.push(withCliDetail(`put failed ${slug}`, put.detail));
+    return false;
+  }
   summary.written++;
   return true;
 }

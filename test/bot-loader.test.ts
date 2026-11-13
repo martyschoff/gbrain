@@ -6,7 +6,7 @@ import { join, resolve, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import * as files from '../scripts/bot-loader/files.ts';
 import { loadConfig, assertRoutes } from '../scripts/bot-loader/config.ts';
-import { createGbrainClient, manifestCounts, putArgv, addSourceArgv } from '../scripts/bot-loader/gbrain-client.ts';
+import { createGbrainClient, manifestCounts, putArgv, addSourceArgv, spawnGbrain } from '../scripts/bot-loader/gbrain-client.ts';
 import { shareIsMounted } from '../scripts/bot-loader/host.ts';
 import { readManifest } from '../scripts/bot-loader/manifest.ts';
 import { csvToMarkdown, renderPage, sha256 } from '../scripts/bot-loader/render.ts';
@@ -198,7 +198,7 @@ describe('classification', () => {
     return client.ensureSource('finance', '/tmp/finance').then(async () => {
       expect((await client.putPage('finance', 'ledger/feeds/prices', '/tmp/prices.md')).ok).toBe(true);
       const failed = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 1, stdout: '', stderr: '' }));
-      expect(await failed.putPage('finance', 'ledger/failed', '/tmp/failed.md')).toEqual({ ok: false, pending: false });
+      expect(await failed.putPage('finance', 'ledger/failed', '/tmp/failed.md')).toEqual({ ok: false, pending: false, detail: 'exit 1' });
       const pending = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 10, stdout: '', stderr: '' }));
       expect(await pending.putPage('finance', 'ledger/pending', '/tmp/pending.md')).toEqual({ ok: false, pending: true });
       const kept = join(temp('gbrain-count-'), 'kept.md');
@@ -219,6 +219,350 @@ describe('classification', () => {
       expect(counts.via).toBe('pages written by the loader (manifest)');
       expect(recorded.some((argv) => argv.includes('stats') || argv.includes('list') || argv.includes('--no-delegate') || argv.includes('push'))).toBe(false);
     });
+  });
+});
+
+describe('cli failure diagnostics', () => {
+  const stamp = '2026-11-12T02:00:00-05:00';
+  const token = 'b'.repeat(40);
+
+  function writeDrop(dir: string): void {
+    const files: Record<string, string> = {
+      'profile.json': '{"id":"bot-a","name":"Bot A"}\n',
+      'memory.md': '# Memory\n\n## 2026-11-12\n\nA fake fact.\n',
+      'routines.md': '# Routines\n\n## morning\n\n- schedule: 0 2 * * *\n- prompt: Summarize the day.\n',
+    };
+    const listed: Record<string, { size: number; sha256: string }> = {};
+    for (const [rel, text] of Object.entries(files)) {
+      write(join(dir, rel), text);
+      const buf = Buffer.from(text);
+      listed[rel] = { size: buf.length, sha256: sha256(buf) };
+    }
+    write(join(dir, 'manifest.json'), `${JSON.stringify({
+      version: 1,
+      bot_name: 'Bot A',
+      bot_id: 'bot-a',
+      account: 'account-a',
+      exported_at: stamp,
+      files: listed,
+    })}\n`);
+  }
+
+  test('ensureSource failure names the exit code and redacts a long stderr token', async () => {
+    const home = temp('gbrain-loader-src-fail-');
+    const share = join(home, 'share');
+    writeDrop(join(share, 'drops', '_box-export', 'bot-a'));
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const config = baseConfig(home, share, {
+      export_roots: [{
+        account: 'account-a',
+        path: join(share, 'drops', '_box-export'),
+        source: 'account-a',
+        target_root: join(share, 'pages-a'),
+        ensure_source: true,
+      }],
+    });
+    const brain = createGbrainClient('/usr/bin/gbrain', async (argv) => {
+      if (argv[3] === 'account-a') {
+        return {
+          code: 1,
+          stdout: JSON.stringify({
+            code: 'writer_manifest_unsafe',
+            message: `checkout refused ${token}`,
+            suggestion: 'inspect the checkout',
+          }),
+          stderr: `refused ${token}\n`,
+        };
+      }
+      return { code: 0, stdout: '{"ok":true}', stderr: '' };
+    });
+    const direct = await brain.ensureSource('account-a', join(share, 'pages-a')) as { ok: boolean; detail?: string };
+    expect(direct.ok).toBe(false);
+    expect(direct.detail).toContain('exit 1');
+    expect(direct.detail).toContain('writer_manifest_unsafe');
+    expect(direct.detail).toContain('[redacted]');
+    expect(direct.detail).not.toContain(token);
+    expect(direct.detail).not.toContain('inspect the checkout');
+    const result = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain,
+      now: new Date('2026-11-12T12:00:00Z'),
+    });
+    expect(result.summaryText).toContain('WARN export account-a: source not created (exit 1, writer_manifest_unsafe:');
+    expect(result.summaryText).not.toContain(token);
+    expect(result.summaryText).not.toContain('A fake fact');
+    expect(readFileSync(config.summaryPath, 'utf8')).toContain('exit 1, writer_manifest_unsafe');
+    const exists = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 1, stdout: '', stderr: 'source already exists\n' }));
+    expect((await exists.ensureSource('finance', '/tmp/finance')).ok).toBe(true);
+  });
+
+  test('putPage failure names the exit code on the warning', async () => {
+    const home = temp('gbrain-loader-put-fail-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    write(join(share, 'acct-example/alpha/note.md'), 'hello from the note\n');
+    const config = baseConfig(home, share, {
+      groups: [{
+        id: 'personal',
+        source: 'personal',
+        target_root: join(share, 'acct-example/gbrain/personal'),
+        ensure_source: false,
+        forbid_git: false,
+        extensions: ['.md'],
+        bots: [{
+          id: 'alpha',
+          inputs: [{ path: join(share, 'acct-example/alpha'), required: false }],
+        }],
+      }],
+    });
+    const brain = createGbrainClient('/usr/bin/gbrain', async (argv) => {
+      if (argv.includes('put')) {
+        return {
+          code: 1,
+          stdout: JSON.stringify({ code: 'live_serve', message: 'the brain is busy', suggestion: 'retry later' }),
+          stderr: 'Error [live_serve]: the brain is busy\n',
+        };
+      }
+      return { code: 0, stdout: '{"ok":true}', stderr: '' };
+    });
+    const put = await brain.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put).toMatchObject({ ok: false, pending: false });
+    expect(put.detail).toContain('exit 1');
+    expect(put.detail).toContain('live_serve');
+    expect(put.detail).toContain('the brain is busy');
+    expect(put.detail).not.toContain('retry later');
+    const result = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain,
+      now: new Date('2026-11-12T12:00:00Z'),
+    });
+    expect(result.summaryText).toContain('WARN put failed alpha/note (exit 1, live_serve: the brain is busy)');
+    expect(result.summaryText).not.toContain('hello from the note');
+    expect(readFileSync(config.summaryPath, 'utf8')).toContain('put failed alpha/note');
+  });
+
+  test('putPage keeps one redacted stderr line and drops stdout', async () => {
+    const noise = 'c'.repeat(40);
+    const page = 'page body that must stay out\n';
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 2,
+      stdout: page,
+      stderr: `gbrain: source directory is not writable ${noise}\nsecond line stays off the warning\n`,
+    }));
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put).toMatchObject({ ok: false, pending: false });
+    expect(put.detail).toContain('exit 2');
+    expect(put.detail).toContain('source directory is not writable');
+    expect(put.detail).not.toContain(page.trim());
+    expect(put.detail).not.toContain('second line stays off');
+    expect(put.detail).not.toContain(noise);
+    expect(put.detail).toContain('[redacted]');
+  });
+
+  test('diagnostics redact a short token, a url, an email, and a home path', async () => {
+    const shortToken = 'abcdefghijklmnop';
+    const page = 'stdout is the page body\n';
+    const stderr = [
+      `auth failed https://user-example:x@host.example/db?access_token=${shortToken} user-example@mail.example Cannot read /home/user-example/note.md`,
+      'second-line-marker',
+    ].join('\n');
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: page,
+      stderr,
+    }));
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put.detail).toContain('exit 1');
+    expect(put.detail).toContain('auth failed');
+    expect(put.detail).toContain('~/note.md');
+    expect(put.detail).not.toContain(shortToken);
+    expect(put.detail).not.toContain('user-example');
+    expect(put.detail).not.toContain('mail.example');
+    expect(put.detail).not.toContain('/home/');
+    expect(put.detail).not.toContain(page.trim());
+    expect(put.detail).not.toContain('second-line-marker');
+  });
+
+  test('a numeric JSON code falls back to stderr and a second object is ignored', async () => {
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 4,
+      stdout: '{"code":1,"message":"numeric code message"}\n{"argv":["token-example-should-not-leak"]}\n',
+      stderr: 'caller rejected the write\n',
+    }));
+    const numeric = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(numeric).toMatchObject({ ok: false, pending: false });
+    expect(numeric.detail).toContain('exit 4');
+    expect(numeric.detail).toContain('caller rejected the write');
+    expect(numeric.detail).not.toContain('numeric code message');
+    expect(numeric.detail).not.toContain('token-example-should-not-leak');
+
+    const wrapped = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: 'note {"code":"live_serve","message":"busy"} trailing {"argv":["also-not-logged"]}',
+      stderr: '',
+    }));
+    const parsed = await wrapped.ensureSource('finance', '/tmp/finance') as { ok: boolean; detail?: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.detail).toContain('exit 1, live_serve: busy');
+    expect(parsed.detail).not.toContain('also-not-logged');
+    expect(parsed.detail).not.toContain('trailing');
+  });
+
+  test('a kill signal is named and a huge pipe is capped before redaction', async () => {
+    const killed = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      signal: 'SIGTERM',
+      stdout: 'should-not-copy-stdout',
+      stderr: 'terminated\n',
+    }));
+    const put = await killed.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put.detail).toContain('killed SIGTERM');
+    expect(put.detail).toContain('terminated');
+    expect(put.detail).not.toContain('should-not-copy-stdout');
+    expect(put.detail).not.toContain('exit 1');
+
+    const token = 'd'.repeat(40);
+    const result = await spawnGbrain([
+      process.execPath,
+      '-e',
+      `/* argv-marker-zz */ process.stdout.write(${JSON.stringify(token)} + ' ' + 'A '.repeat(10000)); process.stderr.write('B '.repeat(10000)); process.kill(process.pid, 'SIGKILL');`,
+    ]);
+    expect(result.signal).toBe('SIGKILL');
+    expect(result.stdout.length).toBeLessThanOrEqual(8192);
+    expect(result.stderr.length).toBeLessThanOrEqual(8192);
+    expect(result.stdout.length).toBeGreaterThan(1000);
+    expect(result.stdout).not.toContain(token);
+    expect(result.stdout).toContain('[redacted]');
+    expect(result.stdout).not.toContain('argv-marker-zz');
+    expect(result.stderr).not.toContain('argv-marker-zz');
+  });
+
+  test('mid-line assignments, a short bearer, and a windows user path are redacted', async () => {
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'login failed password=abcdefgh token=tokentok api_key: keykeykey passwd=passpass secret: secsecsec\n',
+    }));
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put.detail).toContain('exit 1');
+    expect(put.detail).toContain('login failed');
+    expect(put.detail).not.toContain('abcdefgh');
+    expect(put.detail).not.toContain('tokentok');
+    expect(put.detail).not.toContain('keykeykey');
+    expect(put.detail).not.toContain('passpass');
+    expect(put.detail).not.toContain('secsecsec');
+
+    const upper = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'auth PASSWORD: hunter2\n',
+    }));
+    const password = await upper.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(password.detail).toContain('auth');
+    expect(password.detail).not.toContain('hunter2');
+
+    const header = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'Authorization: Bearer abc.def\n',
+    }));
+    const bearer = await header.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(bearer.detail).toContain('Bearer [redacted]');
+    expect(bearer.detail).not.toContain('abc.def');
+
+    const paths = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'Cannot read C:\\Users\\user-example\\x and D:/Users/user-example/note.md\n',
+    }));
+    const windows = await paths.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(windows.detail).toContain('~\\x');
+    expect(windows.detail).toContain('~/note.md');
+    expect(windows.detail).not.toContain('user-example');
+  });
+
+  test('quoted assignment values, api key spellings, and phrase colons stay precise', async () => {
+    const quoted = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'token="quoted value with spaces" password=\'abc def\'\n',
+    }));
+    const quotePut = await quoted.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(quotePut.detail).not.toContain('quoted value');
+    expect(quotePut.detail).not.toContain('with spaces');
+    expect(quotePut.detail).not.toContain('abc def');
+    expect(quotePut.detail).not.toContain("def'");
+    expect(quotePut.detail).toContain('[redacted]');
+
+    const aliases = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'login failed api-key=hyphenval apiKey: camelval APIKEY=upperval\n',
+    }));
+    const aliasPut = await aliases.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(aliasPut.detail).toContain('login failed');
+    expect(aliasPut.detail).not.toContain('hyphenval');
+    expect(aliasPut.detail).not.toContain('camelval');
+    expect(aliasPut.detail).not.toContain('upperval');
+
+    const phrase = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'invalid token: missing\n',
+    }));
+    const phrasePut = await phrase.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(phrasePut.detail).toContain('invalid token: missing');
+    expect(phrasePut.detail).not.toContain('[redacted]');
+
+    const query = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'failed ?token=querytok&x=1\n',
+    }));
+    const queryPut = await query.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(queryPut.detail).toContain('&x=1');
+    expect(queryPut.detail).toContain('token=[redacted]');
+    expect(queryPut.detail).not.toContain('querytok');
+  });
+
+  test('assignments are quote-aware and fail closed', async () => {
+    const detailOf = async (stderr: string): Promise<string> => {
+      const client = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 1, stdout: '', stderr }));
+      const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { detail?: string };
+      return put.detail ?? '';
+    };
+
+    for (const line of ['auth token: abc123\n', 'bearer token: abc123\n', 'error, token: abc123\n', 'invalid\ttoken: abc123\n']) {
+      const detail = await detailOf(line);
+      expect(detail).not.toContain('abc123');
+      expect(detail).toContain('[redacted]');
+    }
+    const phrase = await detailOf('invalid token: missing\n');
+    expect(phrase).toContain('invalid token: missing');
+    expect(phrase).not.toContain('[redacted]');
+
+    for (const line of ["password='abc def'\n", 'PASSWORD="abc def"\n', "api-key='abc def'\n", 'api_key="abc def"\n']) {
+      const detail = await detailOf(line);
+      expect(detail).toBe('exit 1, [redacted]');
+    }
+
+    expect(await detailOf('token="abc def\n')).toBe('exit 1, [redacted]');
+    expect(await detailOf('token="abc\\"def"\n')).toBe('exit 1, [redacted]');
+    expect(await detailOf('token=`abc def`\n')).toBe('exit 1, [redacted]');
+
+    const joined = await detailOf('secret=foo&bar\n');
+    expect(joined).toBe('exit 1, [redacted]');
+    expect(joined).not.toContain('&bar');
+
+    const started = performance.now();
+    const bulky = await detailOf(`token=abc ${'x '.repeat(50000)}`);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(bulky).not.toContain('token=abc');
+    expect(bulky).toContain('[redacted]');
   });
 });
 
