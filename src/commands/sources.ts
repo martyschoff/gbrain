@@ -36,6 +36,7 @@ import { writeFileSync, unlinkSync, existsSync } from 'fs';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine } from '../core/engine.ts';
+import { assertSourceNameFree, refuseSourceNameRace } from '../core/source-name.ts';
 import {
   assessDestructiveImpact,
   checkDestructiveConfirmation,
@@ -1115,7 +1116,8 @@ async function runRename(engine: BrainEngine, args: string[]): Promise<void> {
     console.error(`Source "${id}" not found.`);
     process.exit(4);
   }
-  await engine.executeRaw(`UPDATE sources SET name = $1 WHERE id = $2`, [newName, id]);
+  await assertSourceNameFree(engine, id, newName);
+  await engine.executeRaw(`UPDATE sources SET name = $1 WHERE id = $2`, [newName, id]).catch(error => refuseSourceNameRace(engine, error, id, newName));
   console.log(`Renamed source "${id}" display: ${src.name} → ${newName} (id is immutable).`);
 }
 

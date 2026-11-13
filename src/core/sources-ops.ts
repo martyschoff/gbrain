@@ -63,6 +63,8 @@ import { resolveSourceWithTier, type SourceTier } from './source-resolver.ts';
 import { deleteSourceRow } from './source-delete.ts';
 import { defaultCloneDir, isOwnedClone } from './url-clone.ts';
 import { hookSessionCwd } from './session-cwd.ts';
+import { OperationError } from './ops/contract.ts';
+import { assertSourceNameFree, isSourceNameUniqueViolation, refuseSourceNameRace } from './source-name.ts';
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -449,12 +451,101 @@ async function insertApiSource(engine: BrainEngine, opts: AddSourceOpts, kind: '
       `${choice.dir} overlaps source "${overlap.id}" at ${overlap.local_path}; its pages would be imported by both sources. Choose a directory no other source covers.`);
     mkdirPrivate(choice.dir);
   }
-  await engine.executeRaw(
+  await sourceNameWrite(
+    engine,
     `INSERT INTO sources (id, name, local_path, config)
          VALUES ($1, $2, $3, $4::text::jsonb)`,
     [opts.id, opts.name ?? opts.id, choice.dir, JSON.stringify(kind === 'slack' ? slackSourceConfig(opts.slack!, choice, opts.federated, false)
       : meetingsSourceConfig(opts.meetings!, choice, opts.federated, false))],
+    opts.id,
+    opts.name ?? opts.id,
   );
+}
+
+/** Clone INSERT. A name collision stays `source_name_taken`; any other failure removes the temp clone and is `insert_failed`. */
+async function insertClonedSourceRow(
+  engine: BrainEngine,
+  opts: AddSourceOpts,
+  tempDir: string,
+  finalPath: string | null,
+  config: Record<string, unknown>,
+  displayName: string,
+): Promise<void> {
+  try {
+    await sourceNameWrite(
+      engine,
+      `INSERT INTO sources (id, name, local_path, config)
+           VALUES ($1, $2, $3, $4::text::jsonb)`,
+      [opts.id, displayName, finalPath, JSON.stringify(config)],
+      opts.id,
+      displayName,
+    );
+  } catch (e) {
+    rmSync(tempDir, { recursive: true, force: true });
+    if (e instanceof OperationError) throw e;
+    if (isSourceNameUniqueViolation(e)) await refuseSourceNameRace(engine, e, opts.id, displayName);
+    throw new SourceOpError(
+      'insert_failed',
+      `INSERT failed for source "${opts.id}": ${(e as Error).message}`,
+      e,
+    );
+  }
+}
+
+/** INSERT/UPDATE of `sources.name`. A lost race (23505 on sources_name_key) is `source_name_taken`, not a raw driver error. */
+function sourceNameWrite(
+  engine: BrainEngine,
+  sql: string,
+  params: unknown[],
+  id: string,
+  name: string | null | undefined,
+): Promise<unknown> {
+  return engine.executeRaw(sql, params).catch((error: unknown) => refuseSourceNameRace(engine, error, id, name));
+}
+
+/**
+ * Id collision (including the path-less attach exception) and the display-name
+ * collision. Runs once, before the url, github, google, meetings, slack and
+ * local-path inserts.
+ */
+async function assertSourceAddAvailable(
+  engine: BrainEngine,
+  opts: AddSourceOpts,
+): Promise<{ attachPath: boolean }> {
+  const existing = await engine.executeRaw<{ id: string; local_path: string | null }>(
+    `SELECT id, local_path FROM sources WHERE id = $1`,
+    [opts.id],
+  );
+  // #3903: attach, don't collide. `gbrain sync --source X` on a path-less
+  // source prints "Run: gbrain sources add X --path <path>" — so when the
+  // existing row has NO local_path and the caller supplies exactly a --path
+  // (no --url, no --kind github), treat this as attaching a working tree to
+  // the existing row (non-destructive UPDATE) instead of demanding
+  // `sources remove --confirm-destructive`, which cascades page deletion.
+  const attachPath =
+    existing.length > 0 &&
+    existing[0]!.local_path === null &&
+    !!opts.localPath &&
+    !opts.remoteUrl &&
+    !opts.github &&
+    !opts.google && !opts.meetings && !opts.slack;
+  if (existing.length > 0 && !attachPath) {
+    const pathNote = existing[0]!.local_path
+      ? ` with local_path ${existing[0]!.local_path}`
+      : '';
+    throw new SourceOpError(
+      'source_id_taken',
+      `Source id "${opts.id}" is already registered${pathNote}. ` +
+        `To replace it, run 'gbrain sources remove ${opts.id} --confirm-destructive' ` +
+        `first, then re-add — WARNING: remove permanently deletes every page ` +
+        `imported for this source.`,
+    );
+  }
+  // An attach keeps the stored name unless --name is set. Every insert writes
+  // --name, or the id when --name is omitted.
+  const name = attachPath ? opts.name : (opts.name ?? opts.id);
+  if (name !== undefined) await assertSourceNameFree(engine, opts.id, name);
+  return { attachPath };
 }
 
 export async function addSource(
@@ -504,36 +595,8 @@ export async function addSource(
     opts = { ...opts, google: { ...opts.google, dir: resolvePath(msysToNativePath(opts.google.dir)) } };
   }
 
-  // Q4: pre-flight collision check before any clone work.
-  const existing = await engine.executeRaw<{ id: string; local_path: string | null }>(
-    `SELECT id, local_path FROM sources WHERE id = $1`,
-    [opts.id],
-  );
-  // #3903: attach, don't collide. `gbrain sync --source X` on a path-less
-  // source prints "Run: gbrain sources add X --path <path>" — so when the
-  // existing row has NO local_path and the caller supplies exactly a --path
-  // (no --url, no --kind github), treat this as attaching a working tree to
-  // the existing row (non-destructive UPDATE) instead of demanding
-  // `sources remove --confirm-destructive`, which cascades page deletion.
-  const attachPath =
-    existing.length > 0 &&
-    existing[0]!.local_path === null &&
-    !!opts.localPath &&
-    !opts.remoteUrl &&
-    !opts.github &&
-    !opts.google && !opts.meetings && !opts.slack;
-  if (existing.length > 0 && !attachPath) {
-    const pathNote = existing[0]!.local_path
-      ? ` with local_path ${existing[0]!.local_path}`
-      : '';
-    throw new SourceOpError(
-      'source_id_taken',
-      `Source id "${opts.id}" is already registered${pathNote}. ` +
-        `To replace it, run 'gbrain sources remove ${opts.id} --confirm-destructive' ` +
-        `first, then re-add — WARNING: remove permanently deletes every page ` +
-        `imported for this source.`,
-    );
-  }
+  // Id and display-name collisions, before any clone or INSERT (every insert path below).
+  const { attachPath } = await assertSourceAddAvailable(engine, opts);
 
   // Validate URL before doing any filesystem work.
   let parsedUrl: { url: string; hostname: string } | null = null;
@@ -581,22 +644,7 @@ export async function addSource(
     if (opts.federated !== null && opts.federated !== undefined) {
       config.federated = opts.federated;
     }
-    const displayName = opts.name ?? opts.id;
-
-    try {
-      await engine.executeRaw(
-        `INSERT INTO sources (id, name, local_path, config)
-             VALUES ($1, $2, $3, $4::text::jsonb)`,
-        [opts.id, displayName, finalPath, JSON.stringify(config)],
-      );
-    } catch (e) {
-      rmSync(tempDir, { recursive: true, force: true });
-      throw new SourceOpError(
-        'insert_failed',
-        `INSERT failed for source "${opts.id}": ${(e as Error).message}`,
-        e,
-      );
-    }
+    await insertClonedSourceRow(engine, opts, tempDir, finalPath, config, opts.name ?? opts.id);
 
     // Final step: rename temp dir to final clone path. EXDEV (cross-device
     // rename) is rare on a single-host brain but possible if $GBRAIN_HOME
@@ -656,10 +704,13 @@ export async function addSource(
       }
     }
     const displayName = opts.name ?? opts.id;
-    await engine.executeRaw(
+    await sourceNameWrite(
+      engine,
       `INSERT INTO sources (id, name, local_path, config)
            VALUES ($1, $2, $3, $4::text::jsonb)`,
       [opts.id, displayName, finalPath, JSON.stringify(config)],
+      opts.id,
+      displayName,
     );
   } else if (opts.google) {
     // ── Path D: --kind google (v0.47) ─────────────────────────────────────
@@ -692,10 +743,13 @@ export async function addSource(
       federated: opts.federated ?? true,
     };
     const displayName = opts.name ?? opts.id;
-    await engine.executeRaw(
+    await sourceNameWrite(
+      engine,
       `INSERT INTO sources (id, name, local_path, config)
            VALUES ($1, $2, $3, $4::text::jsonb)`,
       [opts.id, displayName, finalPath, JSON.stringify(config)],
+      opts.id,
+      displayName,
     );
   } else if (opts.meetings || opts.slack) {
     await insertApiSource(engine, opts, opts.slack ? 'slack' : 'meetings');
@@ -739,7 +793,8 @@ export async function addSource(
       // typed them). Unmentioned fields, other config keys, and pages all
       // survive. No JSON.stringify into ::jsonb — the federated flag merges
       // via jsonb_build_object on a bound boolean.
-      await engine.executeRaw(
+      await sourceNameWrite(
+        engine,
         `UPDATE sources
             SET local_path = $2,
                 name = COALESCE($3, name),
@@ -748,6 +803,8 @@ export async function addSource(
                                    || jsonb_build_object('federated', $4::boolean) END
           WHERE id = $1`,
         [opts.id, finalPath, opts.name ?? null, opts.federated ?? null],
+        opts.id,
+        opts.name,
       );
     } else {
       const config: Record<string, unknown> = {};
@@ -755,10 +812,13 @@ export async function addSource(
         config.federated = opts.federated;
       }
       const displayName = opts.name ?? opts.id;
-      await engine.executeRaw(
+      await sourceNameWrite(
+        engine,
         `INSERT INTO sources (id, name, local_path, config)
              VALUES ($1, $2, $3, $4::text::jsonb)`,
         [opts.id, displayName, finalPath, JSON.stringify(config)],
+        opts.id,
+        displayName,
       );
     }
   }
