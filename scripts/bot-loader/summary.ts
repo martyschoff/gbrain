@@ -6,6 +6,8 @@ export interface BotSummary {
   unchanged: number;
   skipped: number;
   secretsSkipped: number;
+  /** Export drops only. Personal scans leave this unset so their summary line stays put. */
+  redactedHits?: number;
   pages: number;
 }
 
@@ -23,7 +25,7 @@ export function formatSummary(summary: RunSummary): string {
   const lines = [`bot-loader: ${summary.ok ? 'ok' : 'failed'}`];
   for (const bot of summary.bots) {
     lines.push(
-      `bot ${bot.id} source=${bot.source} scanned=${bot.scanned} written=${bot.written} unchanged=${bot.unchanged} skipped=${bot.skipped} secrets_skipped=${bot.secretsSkipped} pages=${bot.pages}`,
+      `bot ${bot.id} source=${bot.source} scanned=${bot.scanned} written=${bot.written} unchanged=${bot.unchanged} skipped=${bot.skipped} secrets_skipped=${bot.secretsSkipped}${bot.redactedHits === undefined ? '' : ` redacted_hits=${bot.redactedHits}`} pages=${bot.pages}`,
     );
   }
   for (const source of summary.sources) lines.push(`source ${source.id} pages=${source.pages} via=${source.via}`);

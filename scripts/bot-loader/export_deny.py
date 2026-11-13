@@ -89,23 +89,29 @@ def placeholder_secret(value):
     return False
 
 
-def _denied_key(text):
-    if _KEY_RE is None:
-        return False
-    for match in _KEY_RE.finditer(text):
-        bare = _unquote(match.group(1))
-        if len(bare) >= _KEY_MIN and not placeholder_secret(bare):
-            return True
-    return False
+def _line_at(text, index, lexeme=""):
+    if lexeme.startswith("\r\n"):
+        index += 2
+    elif lexeme.startswith("\n"):
+        index += 1
+    return text.count("\n", 0, index) + 1
+
+
+def denied_name_rule(rel):
+    """First filename rule label, or None. Never the matched text."""
+    base = rel.replace("\\", "/").split("/")[-1]
+    for index, pattern in enumerate(_NAMES):
+        if pattern.search(base):
+            return "deny.names[%d]" % index
+    return None
 
 
 def denied_name(rel):
-    base = rel.replace("\\", "/").split("/")[-1]
-    return any(pattern.search(base) for pattern in _NAMES)
+    return denied_name_rule(rel) is not None
 
 
-def _mail_lines(text):
-    """Drop a leading closed front-matter block.
+def _mail_window(text):
+    """Visible lines as (1-based line, text). A leading closed front-matter block is skipped.
 
     The block counts only when line 1 is ``---`` and a later line closes it.
     An unclosed ``---`` is ordinary text. Message-ID and Received stay visible
@@ -127,7 +133,7 @@ def _mail_lines(text):
             continue
         if close > 0 and index in (0, close):
             continue
-        visible.append(line)
+        visible.append((index + 1, line))
     return visible
 
 
@@ -135,20 +141,69 @@ def _header_candidate(line):
     return re.sub(r"^(?:>\s*)+", "", line.strip())
 
 
-def _contiguous_header_block(lines):
-    """A run of header lines anywhere in the window, not only at line 1."""
+def _marker_rule(window):
+    for index, pattern in enumerate(_MAIL_MARKERS):
+        for lineno, line in window:
+            if pattern.search(line):
+                return {"rule": "deny.mail_markers[%d]" % index, "line": lineno, "index": 0, "length": 0}
+    return None
+
+
+def _block_rule(window):
     if _BLOCK_LINE is None:
-        return False
+        return None
     run = 0
-    for line in lines:
+    start = None
+    for lineno, line in window:
         candidate = _header_candidate(line)
         if _BLOCK_LINE.match(candidate):
             run += 1
-            if run >= _BLOCK_MIN:
-                return True
+            if start is None:
+                start = lineno
+            if run >= _BLOCK_MIN and start is not None:
+                return {"rule": "deny.mail_headers", "line": start, "index": 0, "length": 0}
             continue
         run = 0
-    return False
+        start = None
+    return None
+
+
+def _header_rule(window):
+    if _MAIL_LINE is None:
+        return None
+    headers = 0
+    address = False
+    strong = False
+    first = None
+    for lineno, line in window:
+        match = _MAIL_LINE.match(line)
+        if not match:
+            continue
+        headers += 1
+        if first is None:
+            first = lineno
+        name = match.group(1).lower()
+        value = match.group(2)
+        if name in _STRONG_HEADERS:
+            strong = True
+        if name in _ADDRESS_HEADERS and _ADDRESS_VALUE.search(value):
+            address = True
+    if headers >= _MAIL_MIN and (address or strong) and first is not None:
+        return {"rule": "deny.mail_headers", "line": first, "index": 0, "length": 0}
+    return None
+
+
+def _mail_rule(text):
+    if _MAIL_LINE is None:
+        return None
+    window = _mail_window(text)
+    marker = _marker_rule(window)
+    if marker:
+        return marker
+    block = _block_rule(window)
+    if block:
+        return block
+    return _header_rule(window)
 
 
 def looks_like_mail(text):
@@ -156,31 +211,176 @@ def looks_like_mail(text):
 
     Only a leading closed YAML block is ignored.
     """
-    if _MAIL_LINE is None:
-        return False
-    lines = _mail_lines(text)
-    if any(pattern.search(line) for line in lines for pattern in _MAIL_MARKERS):
-        return True
-    if _contiguous_header_block(lines):
-        return True
-    headers = 0
-    address = False
-    strong = False
-    for line in lines:
-        match = _MAIL_LINE.match(line)
-        if not match:
-            continue
-        headers += 1
-        name = match.group(1).lower()
-        value = match.group(2)
-        if name in _STRONG_HEADERS:
-            strong = True
-        if name in _ADDRESS_HEADERS and _ADDRESS_VALUE.search(value):
-            address = True
-    return headers >= _MAIL_MIN and (address or strong)
+    return _mail_rule(text) is not None
+
+
+def _denied_key_match(text):
+    if _KEY_RE is None:
+        return None
+    for match in _KEY_RE.finditer(text):
+        bare = _unquote(match.group(1))
+        if len(bare) >= _KEY_MIN and not placeholder_secret(bare):
+            return match
+    return None
+
+
+def denied_content_match(text):
+    """First content rule, with a 1-based line. Keys use deny.key_assignment."""
+    mail = _mail_rule(text)
+    if mail:
+        return mail
+    key = _denied_key_match(text)
+    if key:
+        return {
+            "rule": "deny.key_assignment",
+            "line": _line_at(text, key.start(), key.group(0)),
+            "index": key.start(),
+            "length": len(key.group(0)),
+        }
+    for index, pattern in enumerate(_CONTENT):
+        match = pattern.search(text)
+        if match:
+            return {
+                "rule": "deny.content[%d]" % index,
+                "line": _line_at(text, match.start(), match.group(0)),
+                "index": match.start(),
+                "length": len(match.group(0)),
+            }
+    return None
+
+
+def denied_content_rule(text):
+    hit = denied_content_match(text)
+    return None if hit is None else hit["rule"]
 
 
 def denied_content(text):
-    if looks_like_mail(text) or _denied_key(text):
-        return True
-    return any(pattern.search(text) for pattern in _CONTENT)
+    return denied_content_rule(text) is not None
+
+
+# Index-aligned with export-deny.json content rows. None stays blocking.
+_REDACT_TOKENS = [
+    "<email>",
+    "<phone>",
+    "<phone>",
+    "<number>",
+    "<number>",
+    "<number>",
+    "<address>",
+    "<address>",
+    "<phone>",
+    "<phone>",
+    "<number>",
+    None,
+    "positions-summary",
+]
+
+
+def _line_ranges(text):
+    ranges = {}
+    start = 0
+    line = 1
+    for index, ch in enumerate(text):
+        if ch != "\n":
+            continue
+        ranges[line] = (start, index + 1)
+        start = index + 1
+        line += 1
+    if start < len(text):
+        ranges[line] = (start, len(text))
+    return ranges
+
+
+def _mail_drop_lines(text):
+    if not looks_like_mail(text):
+        return []
+    drops = []
+    seen = set()
+    for index, pattern in enumerate(_MAIL_MARKERS):
+        for lineno, line in _mail_window(text):
+            if lineno in seen or not pattern.search(line):
+                continue
+            seen.add(lineno)
+            drops.append((lineno, "deny.mail_markers[%d]" % index))
+    for lineno, line in _mail_window(text):
+        if lineno in seen:
+            continue
+        candidate = _header_candidate(line)
+        header = (_BLOCK_LINE is not None and _BLOCK_LINE.match(candidate)) or (
+            _MAIL_LINE is not None and _MAIL_LINE.match(line)
+        )
+        if not header:
+            continue
+        seen.add(lineno)
+        drops.append((lineno, "deny.mail_headers"))
+    return drops
+
+
+def _redact_spans(text):
+    found = []
+    for index, pattern in enumerate(_CONTENT):
+        token = _REDACT_TOKENS[index] if index < len(_REDACT_TOKENS) else None
+        if not token:
+            continue
+        for match in pattern.finditer(text):
+            if not match.group(0):
+                continue
+            found.append((match.start(), match.end(), token, "deny.content[%d]" % index))
+    found.sort(key=lambda item: (item[0], item[0] - item[1]))
+    chosen = []
+    end = -1
+    for start, stop, token, rule in found:
+        if start < end:
+            continue
+        chosen.append((start, stop, token, rule))
+        end = stop
+    return chosen
+
+
+def redact_export_deny(text):
+    """Redact deny content. Password and key-assignment rows are left in place.
+
+    Box export does not call this. denied_content stays the skip check.
+    Returns {"text", "hits"} with hits of rule, 1-based line, and count.
+    """
+    ranges = _line_ranges(text)
+    dropped = _mail_drop_lines(text)
+    dropped_lines = {lineno for lineno, _rule in dropped}
+    edits = []
+    for lineno, rule in dropped:
+        span = ranges.get(lineno)
+        if span is None:
+            continue
+        edits.append((span[0], span[1], "", rule, lineno))
+    for start, stop, token, rule in _redact_spans(text):
+        lexeme = text[start:stop]
+        line = _line_at(text, start, lexeme)
+        overlap = False
+        for lineno in dropped_lines:
+            span = ranges.get(lineno)
+            if span is not None and start < span[1] and stop > span[0]:
+                overlap = True
+                break
+        if overlap:
+            continue
+        edits.append((start, stop, token, rule, line))
+    if not edits:
+        return {"text": text, "hits": []}
+    grouped = {}
+    for _start, _stop, _token, rule, line in edits:
+        current = grouped.get(rule)
+        if current is None:
+            grouped[rule] = {"line": line, "count": 1}
+        else:
+            current["count"] += 1
+            if line < current["line"]:
+                current["line"] = line
+    out = text
+    for start, stop, token, _rule, _line in sorted(edits, key=lambda item: item[0], reverse=True):
+        out = out[:start] + token + out[stop:]
+    hits = [
+        {"rule": rule, "line": hit["line"], "count": hit["count"]}
+        for rule, hit in grouped.items()
+    ]
+    hits.sort(key=lambda item: (item["line"], item["rule"]))
+    return {"text": out, "hits": hits}

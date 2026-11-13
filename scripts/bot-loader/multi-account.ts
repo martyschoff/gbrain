@@ -6,10 +6,10 @@
 import { constants, closeSync, lstatSync, openSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { ExportRootConfig } from './config.ts';
-import { deniedExportContent, deniedExportName } from './export-deny.ts';
+import { deniedContentMatch, deniedNameRule, redactExportDenyContent, type RuleMatch } from './export-deny.ts';
 import { isInside } from './files.ts';
 import type { BotSummary } from './summary.ts';
-import { contentHasSecret, isSecretFileName } from './secrets.ts';
+import { secretContentMatch, secretNameRule } from './secrets.ts';
 import { sha256 } from './render.ts';
 
 const BOT_SLUG = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -67,7 +67,7 @@ const MANIFEST_KEYS = new Set(['version', 'bot_name', 'bot_id', 'account', 'expo
 const FILE_KEYS = new Set(['size', 'sha256']);
 
 function emptySummary(account: string, bot: string, source: string): BotSummary {
-  return { id: `${account}/${bot}`, source, scanned: 0, written: 0, unchanged: 0, skipped: 0, secretsSkipped: 0, pages: 0 };
+  return { id: `${account}/${bot}`, source, scanned: 0, written: 0, unchanged: 0, skipped: 0, secretsSkipped: 0, redactedHits: 0, pages: 0 };
 }
 
 function readNoFollow(absolute: string): Buffer | null {
@@ -123,24 +123,68 @@ function classifyRel(rel: string): 'ok' | 'escape' | 'bad' {
   return allowedRel(rel) ? 'ok' : 'bad';
 }
 
-function sensitiveName(rel: string): boolean {
-  return rel.split('/').some((part) => isSecretFileName(part) || deniedExportName(part));
+function lineNumberAt(text: string, index: number): number {
+  let line = 1;
+  const end = Math.max(0, Math.min(index, text.length));
+  for (let i = 0; i < end; i += 1) if (text.charCodeAt(i) === 10) line += 1;
+  return line;
 }
 
-function sensitiveText(text: string): boolean {
-  return contentHasSecret(text) || deniedExportContent(text);
-}
-
-function manifestSecrets(value: unknown): boolean {
-  if (typeof value === 'string') return sensitiveText(value);
-  if (Array.isArray(value)) return value.some((item) => manifestSecrets(item));
-  if (typeof value === 'object' && value !== null) {
-    return Object.entries(value as Record<string, unknown>).some(([key, item]) => key !== 'sha256' && manifestSecrets(item));
+function nameRule(rel: string): string | null {
+  for (const part of rel.split('/')) {
+    const rule = secretNameRule(part) ?? deniedNameRule(part);
+    if (rule) return rule;
   }
-  return false;
+  return null;
 }
 
-function parseManifest(raw: Buffer, folder: string, account: string): { ok: true; body: ParsedManifest } | { ok: false; reason: 'bad manifest' | 'account mismatch' | 'path escape' | 'secret' } {
+function textMatch(text: string): RuleMatch | null {
+  return secretContentMatch(text) ?? deniedContentMatch(text);
+}
+
+function warnSecret(warnings: string[], tag: string, rel: string, hit: { rule: string; line?: number }): void {
+  const safe = rel.replace(/[\r\n]/g, '?');
+  const line = hit.line === undefined ? '' : ` line=${hit.line}`;
+  warnings.push(`export ${tag}: secret rejected ${safe} rule=${hit.rule}${line}`);
+}
+
+/** First secret-shaped string value, skipping sha256. The label never includes the value. */
+function manifestSecret(raw: string, value: unknown, cursor: { i: number }): { rule: string; line: number } | null {
+  if (typeof value === 'string') {
+    const detail = textMatch(value);
+    const token = JSON.stringify(value);
+    const at = raw.indexOf(token, cursor.i);
+    if (at >= 0) cursor.i = at + token.length;
+    if (!detail) return null;
+    const interior = JSON.stringify(value.slice(detail.index, detail.index + Math.max(detail.length, 1))).slice(1, -1);
+    const found = interior.length > 0 ? raw.indexOf(interior, at >= 0 ? at : 0) : -1;
+    return { rule: detail.rule, line: lineNumberAt(raw, found >= 0 ? found : Math.max(at, 0)) };
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const hit = manifestSecret(raw, item, cursor);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  if (typeof value === 'object' && value !== null) {
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (key === 'sha256') {
+        if (typeof item === 'string') {
+          const token = JSON.stringify(item);
+          const at = raw.indexOf(token, cursor.i);
+          if (at >= 0) cursor.i = at + token.length;
+        }
+        continue;
+      }
+      const hit = manifestSecret(raw, item, cursor);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+function parseManifest(raw: Buffer, folder: string, account: string): { ok: true; body: ParsedManifest } | { ok: false; reason: 'bad manifest' | 'account mismatch' | 'path escape' | 'secret'; rule?: string; line?: number } {
   const text = raw.toString('utf8');
   let parsed: unknown;
   try {
@@ -171,7 +215,8 @@ function parseManifest(raw: Buffer, folder: string, account: string): { ok: true
   for (const required of REQUIRED) {
     if (!files[required]) return { ok: false, reason: 'bad manifest' };
   }
-  if (manifestSecrets(row)) return { ok: false, reason: 'secret' };
+  const secret = manifestSecret(text, row, { i: 0 });
+  if (secret) return { ok: false, reason: 'secret', rule: secret.rule, line: secret.line };
   if (row.account !== account) return { ok: false, reason: 'account mismatch' };
   return { ok: true, body: { botName: row.bot_name.trim(), botId: folder, account, exportedAt: row.exported_at, files } };
 }
@@ -273,8 +318,10 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
     warnings.push(`export ${tag}: ${walked.reason}`);
     return { planned: { summary, pages: [] }, warnings };
   }
-  if (walked.files.some((rel) => sensitiveName(rel))) {
+  const named = walked.files.find((rel) => nameRule(rel));
+  if (named) {
     summary.secretsSkipped += 1;
+    warnSecret(warnings, tag, named, { rule: nameRule(named) ?? 'secrets.names' });
     warnings.push(`export ${tag}: secret rejected`);
     return { planned: { summary, pages: [] }, warnings };
   }
@@ -282,6 +329,7 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
   if (!parsed.ok) {
     if (parsed.reason === 'secret') {
       summary.secretsSkipped += 1;
+      warnSecret(warnings, tag, 'manifest.json', { rule: parsed.rule ?? 'secrets.content', line: parsed.line });
       warnings.push(`export ${tag}: secret rejected`);
     } else {
       warnings.push(`export ${tag}: ${parsed.reason}`);
@@ -293,12 +341,16 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
     return { planned: { summary, pages: [] }, warnings };
   }
   const pages: ExportPage[] = [];
+  const redactNotes: string[] = [];
   let secret = false;
+  let rejectBot = false;
   for (const [rel, meta] of Object.entries(parsed.body.files)) {
     summary.scanned += 1;
-    if (sensitiveName(rel)) {
+    const namedRule = nameRule(rel);
+    if (namedRule) {
       secret = true;
       summary.secretsSkipped += 1;
+      warnSecret(warnings, tag, rel, { rule: namedRule });
       continue;
     }
     const found = locate(botDir, rel);
@@ -318,26 +370,52 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
       warnings.push(`export ${tag}: symlink`);
       return { planned: { summary, pages: [] }, warnings };
     }
+    const sizeMismatch = bytes.length !== meta.size;
+    const hashMismatch = !sizeMismatch && sha256(bytes) !== meta.sha256;
+    if (sizeMismatch || hashMismatch) {
+      warnings.push(`export ${tag}: ${sizeMismatch ? 'size' : 'hash'} mismatch ${rel}`);
+      const raw = bytes.includes(0) ? null : bytes.toString('utf8');
+      if (raw !== null) {
+        const secretHit = secretContentMatch(raw);
+        if (secretHit) {
+          secret = true;
+          summary.secretsSkipped += 1;
+          warnSecret(warnings, tag, rel, { rule: secretHit.rule, line: secretHit.line });
+        }
+      }
+      rejectBot = true;
+      continue;
+    }
     const text = bytes.includes(0) ? null : bytes.toString('utf8');
-    if (text !== null && sensitiveText(text)) {
+    if (text === null) {
+      summary.skipped += 1;
+      warnings.push(`export ${tag}: rejected binary ${rel}`);
+      continue;
+    }
+    const secretHit = secretContentMatch(text);
+    if (secretHit) {
       secret = true;
       summary.secretsSkipped += 1;
+      warnSecret(warnings, tag, rel, { rule: secretHit.rule, line: secretHit.line });
       continue;
     }
-    if (bytes.length !== meta.size) {
+    if (bytes.length > opts.maxBytes) {
       summary.skipped += 1;
-      warnings.push(`export ${tag}: size mismatch ${rel}`);
+      warnings.push(`export ${tag}: oversized ${rel}`);
       continue;
     }
-    if (sha256(bytes) !== meta.sha256) {
-      summary.skipped += 1;
-      warnings.push(`export ${tag}: hash mismatch ${rel}`);
+    const redacted = redactExportDenyContent(text);
+    const again = secretContentMatch(redacted.text) ?? deniedContentMatch(redacted.text);
+    if (again) {
+      secret = true;
+      summary.secretsSkipped += 1;
+      warnSecret(warnings, tag, rel, { rule: again.rule, line: again.line });
       continue;
     }
-    if (bytes.length > opts.maxBytes || text === null) {
-      summary.skipped += 1;
-      warnings.push(`export ${tag}: ${text === null ? 'rejected binary' : 'oversized'} ${rel}`);
-      continue;
+    const safeRel = rel.replace(/[\r\n]/g, '?');
+    for (const hit of redacted.hits) {
+      redactNotes.push(`export ${tag}: redacted ${safeRel} rule=${hit.rule} line=${hit.line} count=${hit.count}`);
+      summary.redactedHits = (summary.redactedHits ?? 0) + hit.count;
     }
     pages.push({
       absolute,
@@ -347,13 +425,15 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
       botName: parsed.body.botName,
       source: root.source,
       targetRoot: root.targetRoot,
-      bytes,
+      bytes: redacted.hits.length === 0 ? bytes : Buffer.from(redacted.text, 'utf8'),
     });
   }
-  if (secret) {
-    warnings.push(`export ${tag}: secret rejected`);
+  if (secret || rejectBot) {
+    summary.redactedHits = 0;
+    if (secret) warnings.push(`export ${tag}: secret rejected`);
     return { planned: { summary, pages: [] }, warnings };
   }
+  warnings.push(...redactNotes);
   const unlisted = walked.files.filter((rel) => rel !== 'manifest.json' && !parsed.body.files[rel]);
   if (unlisted.length > 0) warnings.push(`export ${tag}: ignored unlisted ${unlisted.length}`);
   opts.recheck?.(botDir);

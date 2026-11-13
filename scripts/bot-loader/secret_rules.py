@@ -40,20 +40,68 @@ for _row in _KEYS:
     _KEY_RES.append(re.compile(_row["source"], _flags))
 
 
-def secret_name(rel):
+def _line_at(text, index, lexeme=""):
+    if lexeme.startswith("\r\n"):
+        index += 2
+    elif lexeme.startswith("\n"):
+        index += 1
+    return text.count("\n", 0, index) + 1
+
+
+def secret_name_rule(rel):
+    """First filename rule label, or None. Never the matched text."""
     base = rel.replace("\\", "/").split("/")[-1]
-    return any(pattern.search(base) for pattern in _NAMES)
+    for index, pattern in enumerate(_NAMES):
+        if pattern.search(base):
+            return "secrets.names[%d]" % index
+    return None
 
 
-def _assignment_is_secret(text, pattern):
+def secret_name(rel):
+    return secret_name_rule(rel) is not None
+
+
+def _assignment_match(text, pattern):
     for match in pattern.finditer(text):
         value = match.group(1)
         if value and not placeholder_secret(value):
-            return True
-    return False
+            return match
+    return None
+
+
+def secret_content_match(text):
+    """First content rule, with a 1-based line. Placeholder keys use secrets.key_assignment."""
+    plain_at = 0
+    for index, row in enumerate(_FILE["content"]):
+        if row.get("allow_placeholders"):
+            continue
+        match = _CONTENT[plain_at].search(text)
+        plain_at += 1
+        if match:
+            return {
+                "rule": "secrets.content[%d]" % index,
+                "line": _line_at(text, match.start(), match.group(0)),
+                "index": match.start(),
+                "length": len(match.group(0)),
+            }
+    for pattern in _KEY_RES:
+        match = _assignment_match(text, pattern)
+        if match:
+            lexeme = match.group(0)
+            start = match.start() + (1 if lexeme.startswith("\n") else 0)
+            return {
+                "rule": "secrets.key_assignment",
+                "line": _line_at(text, start),
+                "index": start,
+                "length": len(lexeme) - (start - match.start()),
+            }
+    return None
+
+
+def secret_content_rule(text):
+    hit = secret_content_match(text)
+    return None if hit is None else hit["rule"]
 
 
 def secret_content(text):
-    if any(pattern.search(text) for pattern in _CONTENT):
-        return True
-    return any(_assignment_is_secret(text, pattern) for pattern in _KEY_RES)
+    return secret_content_rule(text) is not None
