@@ -261,3 +261,139 @@ export function deniedContentRule(text: string): string | null {
 export function deniedExportContent(text: string): boolean {
   return deniedContentRule(text) !== null;
 }
+
+/**
+ * Replacement tokens for export-deny.json `content` rows, by index.
+ * null stays blocking (the password row, and any future row).
+ * Key assignment is not a content row and is never redacted.
+ */
+const REDACT_TOKENS: (string | null)[] = [
+  '<email>',
+  '<phone>',
+  '<phone>',
+  '<number>',
+  '<number>',
+  '<number>',
+  '<address>',
+  '<address>',
+  '<phone>',
+  '<phone>',
+  '<number>',
+  null,
+  'positions-summary',
+];
+
+export interface RedactionHit {
+  rule: string;
+  line: number;
+  count: number;
+}
+
+function mailDropLines(text: string): { rule: string; line: number }[] {
+  if (!looksLikeMail(text)) return [];
+  const window = mailWindow(text);
+  const drops: { rule: string; line: number }[] = [];
+  const seen = new Set<number>();
+  for (const row of MAIL_MARKER_ROWS) {
+    for (const line of window) {
+      if (seen.has(line.line) || !row.pattern.test(line.text)) continue;
+      seen.add(line.line);
+      drops.push({ rule: `deny.mail_markers[${row.index}]`, line: line.line });
+    }
+  }
+  for (const line of window) {
+    if (seen.has(line.line)) continue;
+    const candidate = headerCandidate(line.text);
+    const header = (BLOCK_LINE !== null && BLOCK_LINE.test(candidate)) || (MAIL_LINE !== null && MAIL_LINE.test(line.text));
+    if (!header) continue;
+    seen.add(line.line);
+    drops.push({ rule: 'deny.mail_headers', line: line.line });
+  }
+  return drops;
+}
+
+interface RedactSpan {
+  start: number;
+  end: number;
+  token: string;
+  rule: string;
+}
+
+function redactSpans(text: string): RedactSpan[] {
+  const found: RedactSpan[] = [];
+  for (const row of DENY_CONTENT_ROWS) {
+    const token = row.index < REDACT_TOKENS.length ? REDACT_TOKENS[row.index] ?? null : null;
+    if (!token) continue;
+    const flags = row.pattern.flags.includes('g') ? row.pattern.flags : `${row.pattern.flags}g`;
+    const re = new RegExp(row.pattern.source, flags);
+    for (const match of text.matchAll(re)) {
+      if (match.index === undefined || match[0].length === 0) continue;
+      found.push({ start: match.index, end: match.index + match[0].length, token, rule: `deny.content[${row.index}]` });
+    }
+  }
+  found.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+  const chosen: RedactSpan[] = [];
+  let end = -1;
+  for (const span of found) {
+    if (span.start < end) continue;
+    chosen.push(span);
+    end = span.end;
+  }
+  return chosen;
+}
+
+function lineRanges(text: string): Map<number, { start: number; end: number }> {
+  const map = new Map<number, { start: number; end: number }>();
+  let start = 0;
+  let line = 1;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) !== 10) continue;
+    map.set(line, { start, end: i + 1 });
+    start = i + 1;
+    line += 1;
+  }
+  if (start < text.length) map.set(line, { start, end: text.length });
+  return map;
+}
+
+/**
+ * Redact export-deny content on one file. Password and key-assignment rows are left in place.
+ * Callers that want today's skip behavior should keep using deniedExportContent and ignore this.
+ */
+export function redactExportDenyContent(text: string): { text: string; hits: RedactionHit[] } {
+  const ranges = lineRanges(text);
+  const dropped = mailDropLines(text);
+  const droppedLines = new Set(dropped.map((drop) => drop.line));
+  const edits: { start: number; end: number; insert: string; rule: string; line: number }[] = [];
+  for (const drop of dropped) {
+    const range = ranges.get(drop.line);
+    if (!range) continue;
+    edits.push({ start: range.start, end: range.end, insert: '', rule: drop.rule, line: drop.line });
+  }
+  for (const span of redactSpans(text)) {
+    const line = lineOfMatch(text, span.start, text.slice(span.start, span.end));
+    const overlapsDrop = [...droppedLines].some((number) => {
+      const range = ranges.get(number);
+      return range !== undefined && span.start < range.end && span.end > range.start;
+    });
+    if (overlapsDrop) continue;
+    edits.push({ start: span.start, end: span.end, insert: span.token, rule: span.rule, line });
+  }
+  if (edits.length === 0) return { text, hits: [] };
+  const grouped = new Map<string, { line: number; count: number }>();
+  for (const edit of edits) {
+    const current = grouped.get(edit.rule);
+    if (!current) grouped.set(edit.rule, { line: edit.line, count: 1 });
+    else {
+      current.count += 1;
+      if (edit.line < current.line) current.line = edit.line;
+    }
+  }
+  let out = text;
+  const ordered = [...edits].sort((a, b) => b.start - a.start);
+  for (const edit of ordered) out = out.slice(0, edit.start) + edit.insert + out.slice(edit.end);
+  const hits = [...grouped.entries()]
+    .map(([rule, hit]) => ({ rule, line: hit.line, count: hit.count }))
+    .sort((a, b) => a.line - b.line || (a.rule < b.rule ? -1 : a.rule > b.rule ? 1 : 0));
+  return { text: out, hits };
+}

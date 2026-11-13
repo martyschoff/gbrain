@@ -2,6 +2,8 @@
 """Table-driven checks for every name and content pattern in secret-patterns.json."""
 from __future__ import annotations
 
+import json
+import os
 import unittest
 
 from export_deny import denied_content, denied_content_rule, denied_name, denied_name_rule
@@ -137,6 +139,20 @@ class SecretRulesTest(unittest.TestCase):
         self.assertIn("content", loaded)
         self.assertTrue(loaded["names"])
         self.assertTrue(loaded["content"])
+
+    def test_redact_fixtures_match_typescript(self):
+        from export_deny import redact_export_deny
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "redact-fixtures.json")
+        with open(path, "r", encoding="utf-8") as handle:
+            cases = json.load(handle)["cases"]
+        self.assertGreaterEqual(len(cases), 15)
+        for row in cases:
+            redacted = redact_export_deny(row["input"])
+            self.assertEqual(redacted["text"], row["output"], row["name"])
+            self.assertEqual(redacted["hits"], row["hits"], row["name"])
+            again = redact_export_deny(redacted["text"])
+            self.assertEqual(again["text"], redacted["text"], row["name"])
+            self.assertEqual(again["hits"], [], row["name"])
 
 
 if __name__ == "__main__":

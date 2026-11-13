@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { loadConfig } from '../scripts/bot-loader/config.ts';
-import { deniedContentMatch, deniedContentRule, deniedExportContent, deniedExportName, deniedNameRule } from '../scripts/bot-loader/export-deny.ts';
+import { deniedContentMatch, deniedContentRule, deniedExportContent, deniedExportName, deniedNameRule, redactExportDenyContent } from '../scripts/bot-loader/export-deny.ts';
 import { contentHasSecret, isSecretFileName, secretContentMatch, secretContentRule, secretNameRule } from '../scripts/bot-loader/secrets.ts';
 import type { BrainClient } from '../scripts/bot-loader/gbrain-client.ts';
 import { isNewYorkExportTime } from '../scripts/bot-loader/multi-account.ts';
@@ -402,17 +402,25 @@ describe('multi-account drops', () => {
     }
   });
 
-  test('a mail-shaped note rejects the bot folder', async () => {
+  test('a mail-shaped note drops the header lines and still loads', async () => {
     const home = temp('gbrain-export-mail-');
     const share = join(home, 'share');
     const files = goodFiles('bot-a');
-    files['notes/body.md'] = 'From: ' + 'ada' + '@' + 'example.com' + '\nSubject: hello\n\nA note.\n';
+    const canary = 'canary-mail@example.org';
+    files['notes/body.md'] = 'From: ' + canary + '\nSubject: hello\n\nA note.\n';
     writeBot(join(share, 'drops', '_box-export', 'bot-a'), 'account-a', 'bot-a', files);
     const { brain, puts } = fakeBrain();
     const result = await run(configFor(home, share, [roots(share)[0]!]), brain);
     expect(result.exitCode).toBe(0);
-    expect(result.summaryText).toContain('secret rejected');
-    expect(puts).toHaveLength(0);
+    expect(result.summaryText).toContain('export account-a/bot-a: redacted notes/body.md rule=deny.mail_headers line=1 count=2');
+    expect(result.summaryText).not.toContain('secret rejected');
+    expect(result.summaryText).not.toContain(canary);
+    expect(result.summaryText).not.toContain('Subject:');
+    const note = puts.find((put) => put.slug === 'account-a/bot-a/notes/body');
+    expect(note?.text).toContain('A note.');
+    expect(note?.text).not.toContain(canary);
+    expect(note?.text).not.toContain('From:');
+    expect(note?.text).not.toContain('Subject:');
   });
 
   test('a bad manifest imports nothing from that folder', async () => {
@@ -662,5 +670,138 @@ describe('multi-account drops', () => {
       export_roots: [{ account: 'account-a', path: stamp, source: 'account-a', target_root: join(share, 'pages-a') }],
     }));
     expect(() => loadConfig(closed, home)).toThrow(/fail-closed stamp_root/);
+  });
+
+  test('export-deny content is redacted in place and a second run is unchanged', async () => {
+    const home = temp('gbrain-export-redact-bots-');
+    const share = join(home, 'share');
+    const root = join(share, 'drops', '_box-export');
+    const emailB = 'canary-b@example.org';
+    const emailC = 'canary-c@example.org';
+    const emailE = 'canary-e@example.org';
+    const street = '12 Canary9f3a Street';
+    const atLine = (line: number, hit: string): string => {
+      const rows: string[] = [];
+      for (let i = 1; i < line; i += 1) rows.push('A fake fact.');
+      rows.push(hit);
+      return rows.join('\n') + '\n';
+    };
+    const botA = goodFiles('bot-a');
+    botA['routines.md'] = atLine(17, 'See the holdings note.');
+    const botB = goodFiles('bot-b');
+    botB['memory.md'] = atLine(55, 'Write ' + emailB + ' later.');
+    const botC = goodFiles('bot-c');
+    botC['memory.md'] = atLine(36, 'Write ' + emailC + ' later.');
+    const botD = goodFiles('bot-d');
+    botD['routines.md'] = atLine(18, 'See the holdings note.');
+    const botE = goodFiles('bot-e');
+    botE['memory.md'] = atLine(3, 'Write ' + emailE + ' later.');
+    botE['routines.md'] = atLine(18, 'See the holdings note.');
+    botE['notes/handoff-x.md'] = atLine(228, 'Meet at ' + street + ' tomorrow.');
+    writeBot(join(root, 'bot-a'), 'account-a', 'bot-a', botA);
+    writeBot(join(root, 'bot-b'), 'account-a', 'bot-b', botB);
+    writeBot(join(root, 'bot-c'), 'account-a', 'bot-c', botC);
+    writeBot(join(root, 'bot-d'), 'account-a', 'bot-d', botD);
+    writeBot(join(root, 'bot-e'), 'account-a', 'bot-e', botE);
+    const config = configFor(home, share, [roots(share)[0]!]);
+    const { brain, puts } = fakeBrain();
+    const result = await run(config, brain);
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).not.toContain('secret rejected');
+    for (const canary of [emailB, emailC, emailE, 'Canary9f3a', 'holdings']) {
+      expect(result.summaryText).not.toContain(canary);
+    }
+    expect(result.summaryText).toContain('export account-a/bot-a: redacted routines.md rule=deny.content[12] line=17 count=1');
+    expect(result.summaryText).toContain('export account-a/bot-b: redacted memory.md rule=deny.content[0] line=55 count=1');
+    expect(result.summaryText).toContain('export account-a/bot-c: redacted memory.md rule=deny.content[0] line=36 count=1');
+    expect(result.summaryText).toContain('export account-a/bot-d: redacted routines.md rule=deny.content[12] line=18 count=1');
+    expect(result.summaryText).toContain('export account-a/bot-e: redacted memory.md rule=deny.content[0] line=3 count=1');
+    expect(result.summaryText).toContain('export account-a/bot-e: redacted routines.md rule=deny.content[12] line=18 count=1');
+    expect(result.summaryText).toContain('export account-a/bot-e: redacted notes/handoff-x.md rule=deny.content[6] line=228 count=1');
+    expect(result.summaryText).toContain('redacted_hits=1');
+    expect(result.summaryText).toContain('bot account-a/bot-e source=account-a');
+    expect(result.summaryText).toMatch(/bot account-a\/bot-e source=account-a .* redacted_hits=3 /);
+    const body = puts.map((put) => put.text).join('\n');
+    expect(body).toContain('positions-summary');
+    expect(body).toContain('<email>');
+    expect(body).toContain('<address>');
+    expect(body).not.toContain('holdings');
+    expect(body).not.toContain(emailB);
+    expect(body).not.toContain(emailC);
+    expect(body).not.toContain(emailE);
+    expect(body).not.toContain('Canary9f3a');
+    expect(puts.map((put) => put.slug)).toContain('account-a/bot-a/routines');
+    expect(puts.map((put) => put.slug)).toContain('account-a/bot-b/memory');
+    expect(puts.map((put) => put.slug)).toContain('account-a/bot-c/memory');
+    expect(puts.map((put) => put.slug)).toContain('account-a/bot-d/routines');
+    expect(puts.map((put) => put.slug)).toContain('account-a/bot-e/notes/handoff-x');
+
+    const second = fakeBrain();
+    const again = await run(config, second.brain);
+    expect(again.exitCode).toBe(0);
+    expect(second.puts).toHaveLength(0);
+    expect(again.summaryText).toMatch(/bot account-a\/bot-a source=account-a scanned=5 written=0 unchanged=5 /);
+  });
+
+  test('a jwt beside an email still rejects the bot, and a raw hash mismatch is not redacted', async () => {
+    const home = temp('gbrain-export-jwt-');
+    const share = join(home, 'share');
+    const jwt = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0ZXN0In0.signaturevalue';
+    const email = 'canary-j@example.org';
+    const tainted = goodFiles('bot-a');
+    tainted['memory.md'] = '# Memory\n\n' + jwt + '\n' + email + '\n';
+    writeBot(join(share, 'drops', '_box-export', 'bot-a'), 'account-a', 'bot-a', tainted);
+    const { brain, puts } = fakeBrain();
+    const result = await run(configFor(home, share, [roots(share)[0]!]), brain);
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).toContain('secret rejected memory.md rule=secrets.content[21] line=3');
+    expect(result.summaryText).not.toContain(jwt);
+    expect(result.summaryText).not.toContain(email);
+    expect(result.summaryText).not.toContain('redacted ');
+    expect(puts).toHaveLength(0);
+
+    const home2 = temp('gbrain-export-hash-email-');
+    const share2 = join(home2, 'share');
+    const dir2 = join(share2, 'drops', '_box-export', 'bot-a');
+    writeBot(dir2, 'account-a', 'bot-a', goodFiles('bot-a'));
+    const body = 'Write ' + email + ' later.\n';
+    writeFileSync(join(dir2, 'memory.md'), body);
+    const manifestPath = join(dir2, 'manifest.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { files: Record<string, { size: number; sha256: string }> };
+    manifest.files['memory.md']!.size = Buffer.from(body).length;
+    manifest.files['memory.md']!.sha256 = '0'.repeat(64);
+    writeFileSync(manifestPath, JSON.stringify(manifest) + '\n');
+    const hashed = fakeBrain();
+    const mismatch = await run(configFor(home2, share2, [roots(share2)[0]!]), hashed.brain);
+    expect(mismatch.summaryText).toContain('hash mismatch memory.md');
+    expect(mismatch.summaryText).not.toContain('redacted memory.md');
+    expect(mismatch.summaryText).not.toContain(email);
+    expect(hashed.puts.map((put) => put.slug)).not.toContain('account-a/bot-a/memory');
+    expect(hashed.puts.map((put) => put.slug)).toContain('account-a/bot-a/profile');
+  });
+
+  test('a deny key assignment still rejects, and phone, ssn, card, and account numbers redact', async () => {
+    const home = temp('gbrain-export-key-block-');
+    const share = join(home, 'share');
+    const tainted = goodFiles('bot-a');
+    tainted['routines.md'] = 'See api_key=' + 'not-a-real-value' + ' in the note.\n';
+    writeBot(join(share, 'drops', '_box-export', 'bot-a'), 'account-a', 'bot-a', tainted);
+    const { brain, puts } = fakeBrain();
+    const blocked = await run(configFor(home, share, [roots(share)[0]!]), brain);
+    expect(blocked.summaryText).toContain('secret rejected routines.md rule=deny.key_assignment line=1');
+    expect(blocked.summaryText).not.toContain('not-a-real-value');
+    expect(puts).toHaveLength(0);
+
+    const fixtures = JSON.parse(readFileSync(join(REPO, 'scripts/bot-loader/redact-fixtures.json'), 'utf8')) as {
+      cases: { name: string; input: string; output: string; hits: { rule: string; line: number; count: number }[] }[];
+    };
+    for (const row of fixtures.cases) {
+      const redacted = redactExportDenyContent(row.input);
+      expect(redacted.text).toBe(row.output);
+      expect(redacted.hits).toEqual(row.hits);
+      const again = redactExportDenyContent(redacted.text);
+      expect(again.text).toBe(redacted.text);
+      expect(again.hits).toEqual([]);
+    }
   });
 });

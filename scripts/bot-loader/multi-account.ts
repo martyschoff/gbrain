@@ -6,7 +6,7 @@
 import { constants, closeSync, lstatSync, openSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { ExportRootConfig } from './config.ts';
-import { deniedContentMatch, deniedNameRule, type RuleMatch } from './export-deny.ts';
+import { deniedContentMatch, deniedNameRule, redactExportDenyContent, type RuleMatch } from './export-deny.ts';
 import { isInside } from './files.ts';
 import type { BotSummary } from './summary.ts';
 import { secretContentMatch, secretNameRule } from './secrets.ts';
@@ -67,7 +67,7 @@ const MANIFEST_KEYS = new Set(['version', 'bot_name', 'bot_id', 'account', 'expo
 const FILE_KEYS = new Set(['size', 'sha256']);
 
 function emptySummary(account: string, bot: string, source: string): BotSummary {
-  return { id: `${account}/${bot}`, source, scanned: 0, written: 0, unchanged: 0, skipped: 0, secretsSkipped: 0, pages: 0 };
+  return { id: `${account}/${bot}`, source, scanned: 0, written: 0, unchanged: 0, skipped: 0, secretsSkipped: 0, redactedHits: 0, pages: 0 };
 }
 
 function readNoFollow(absolute: string): Buffer | null {
@@ -341,6 +341,7 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
     return { planned: { summary, pages: [] }, warnings };
   }
   const pages: ExportPage[] = [];
+  const redactNotes: string[] = [];
   let secret = false;
   for (const [rel, meta] of Object.entries(parsed.body.files)) {
     summary.scanned += 1;
@@ -368,14 +369,6 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
       warnings.push(`export ${tag}: symlink`);
       return { planned: { summary, pages: [] }, warnings };
     }
-    const text = bytes.includes(0) ? null : bytes.toString('utf8');
-    const hit = text === null ? null : textMatch(text);
-    if (hit) {
-      secret = true;
-      summary.secretsSkipped += 1;
-      warnSecret(warnings, tag, rel, { rule: hit.rule, line: hit.line });
-      continue;
-    }
     if (bytes.length !== meta.size) {
       summary.skipped += 1;
       warnings.push(`export ${tag}: size mismatch ${rel}`);
@@ -386,10 +379,36 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
       warnings.push(`export ${tag}: hash mismatch ${rel}`);
       continue;
     }
-    if (bytes.length > opts.maxBytes || text === null) {
+    const text = bytes.includes(0) ? null : bytes.toString('utf8');
+    if (text === null) {
       summary.skipped += 1;
-      warnings.push(`export ${tag}: ${text === null ? 'rejected binary' : 'oversized'} ${rel}`);
+      warnings.push(`export ${tag}: rejected binary ${rel}`);
       continue;
+    }
+    const secretHit = secretContentMatch(text);
+    if (secretHit) {
+      secret = true;
+      summary.secretsSkipped += 1;
+      warnSecret(warnings, tag, rel, { rule: secretHit.rule, line: secretHit.line });
+      continue;
+    }
+    if (bytes.length > opts.maxBytes) {
+      summary.skipped += 1;
+      warnings.push(`export ${tag}: oversized ${rel}`);
+      continue;
+    }
+    const redacted = redactExportDenyContent(text);
+    const again = secretContentMatch(redacted.text) ?? deniedContentMatch(redacted.text);
+    if (again) {
+      secret = true;
+      summary.secretsSkipped += 1;
+      warnSecret(warnings, tag, rel, { rule: again.rule, line: again.line });
+      continue;
+    }
+    const safeRel = rel.replace(/[\r\n]/g, '?');
+    for (const hit of redacted.hits) {
+      redactNotes.push(`export ${tag}: redacted ${safeRel} rule=${hit.rule} line=${hit.line} count=${hit.count}`);
+      summary.redactedHits = (summary.redactedHits ?? 0) + hit.count;
     }
     pages.push({
       absolute,
@@ -399,13 +418,15 @@ function planBot(root: ExportRootConfig, folder: string, botDir: string, opts: P
       botName: parsed.body.botName,
       source: root.source,
       targetRoot: root.targetRoot,
-      bytes,
+      bytes: redacted.hits.length === 0 ? bytes : Buffer.from(redacted.text, 'utf8'),
     });
   }
   if (secret) {
+    summary.redactedHits = 0;
     warnings.push(`export ${tag}: secret rejected`);
     return { planned: { summary, pages: [] }, warnings };
   }
+  warnings.push(...redactNotes);
   const unlisted = walked.files.filter((rel) => rel !== 'manifest.json' && !parsed.body.files[rel]);
   if (unlisted.length > 0) warnings.push(`export ${tag}: ignored unlisted ${unlisted.length}`);
   opts.recheck?.(botDir);

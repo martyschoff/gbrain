@@ -1,0 +1,122 @@
+{
+  "description": "Shared export-deny redaction fixtures. Fake values only. Both redactExportDenyContent and redact_export_deny must match output and hits.",
+  "cases": [
+    {
+      "name": "email",
+      "input": "reach canary-a@example.org today\n",
+      "output": "reach <email> today\n",
+      "hits": [{ "rule": "deny.content[0]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "two-emails",
+      "input": "canary-a@example.org and canary-b@example.org\n",
+      "output": "<email> and <email>\n",
+      "hits": [{ "rule": "deny.content[0]", "line": 1, "count": 2 }]
+    },
+    {
+      "name": "phone-dashed",
+      "input": "call 555-010-0199 later\n",
+      "output": "call <phone> later\n",
+      "hits": [{ "rule": "deny.content[1]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "phone-parens",
+      "input": "call (555) 010-0199 later\n",
+      "output": "call <phone> later\n",
+      "hits": [{ "rule": "deny.content[2]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "phone-dotted",
+      "input": "call 555.010.0199 later\n",
+      "output": "call <phone> later\n",
+      "hits": [{ "rule": "deny.content[8]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "phone-plus",
+      "input": "call +1 555-010-0199 later\n",
+      "output": "call <phone> later\n",
+      "hits": [{ "rule": "deny.content[9]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "ssn",
+      "input": "ssn 000-00-0000\n",
+      "output": "ssn <number>\n",
+      "hits": [{ "rule": "deny.content[10]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "card",
+      "input": "card 4242 4242 4242 4242\n",
+      "output": "card <number>\n",
+      "hits": [{ "rule": "deny.content[3]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "digits-16",
+      "input": "pan 4242424242424242\n",
+      "output": "pan <number>\n",
+      "hits": [{ "rule": "deny.content[4]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "account",
+      "input": "acct 123456\n",
+      "output": "<number>\n",
+      "hits": [{ "rule": "deny.content[5]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "street",
+      "input": "Meet at 12 Canary9f3a Street tomorrow.\n",
+      "output": "Meet at <address> tomorrow.\n",
+      "hits": [{ "rule": "deny.content[6]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "place",
+      "input": "Meet at 9 Example Place tomorrow.\n",
+      "output": "Meet at <address> tomorrow.\n",
+      "hits": [{ "rule": "deny.content[7]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "holdings",
+      "input": "See the holdings note.\n",
+      "output": "See the positions-summary note.\n",
+      "hits": [{ "rule": "deny.content[12]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "mail-block",
+      "input": "Invoice follow-up\nFrom: the desk\nSubject: Re: invoice\nDate: Tuesday\n",
+      "output": "Invoice follow-up\n",
+      "hits": [{ "rule": "deny.mail_headers", "line": 2, "count": 3 }]
+    },
+    {
+      "name": "original-message",
+      "input": "-----Original Message-----\nA note.\n",
+      "output": "A note.\n",
+      "hits": [{ "rule": "deny.mail_markers[0]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "forwarded",
+      "input": "---------- Forwarded message ---------\nFrom: the desk\nSubject: hello\n\nA note.\n",
+      "output": "\nA note.\n",
+      "hits": [
+        { "rule": "deny.mail_markers[1]", "line": 1, "count": 1 },
+        { "rule": "deny.mail_headers", "line": 2, "count": 2 }
+      ]
+    },
+    {
+      "name": "reply-marker",
+      "input": "On Thu, 12 Nov 2026, the desk wrote:\nA note.\n",
+      "output": "A note.\n",
+      "hits": [{ "rule": "deny.mail_markers[2]", "line": 1, "count": 1 }]
+    },
+    {
+      "name": "password-stays",
+      "input": "password: not-a-real-value\n",
+      "output": "password: not-a-real-value\n",
+      "hits": []
+    },
+    {
+      "name": "clean",
+      "input": "A fake fact.\n",
+      "output": "A fake fact.\n",
+      "hits": []
+    }
+  ]
+}

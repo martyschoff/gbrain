@@ -256,3 +256,131 @@ def denied_content_rule(text):
 
 def denied_content(text):
     return denied_content_rule(text) is not None
+
+
+# Index-aligned with export-deny.json content rows. None stays blocking.
+_REDACT_TOKENS = [
+    "<email>",
+    "<phone>",
+    "<phone>",
+    "<number>",
+    "<number>",
+    "<number>",
+    "<address>",
+    "<address>",
+    "<phone>",
+    "<phone>",
+    "<number>",
+    None,
+    "positions-summary",
+]
+
+
+def _line_ranges(text):
+    ranges = {}
+    start = 0
+    line = 1
+    for index, ch in enumerate(text):
+        if ch != "\n":
+            continue
+        ranges[line] = (start, index + 1)
+        start = index + 1
+        line += 1
+    if start < len(text):
+        ranges[line] = (start, len(text))
+    return ranges
+
+
+def _mail_drop_lines(text):
+    if not looks_like_mail(text):
+        return []
+    drops = []
+    seen = set()
+    for index, pattern in enumerate(_MAIL_MARKERS):
+        for lineno, line in _mail_window(text):
+            if lineno in seen or not pattern.search(line):
+                continue
+            seen.add(lineno)
+            drops.append((lineno, "deny.mail_markers[%d]" % index))
+    for lineno, line in _mail_window(text):
+        if lineno in seen:
+            continue
+        candidate = _header_candidate(line)
+        header = (_BLOCK_LINE is not None and _BLOCK_LINE.match(candidate)) or (
+            _MAIL_LINE is not None and _MAIL_LINE.match(line)
+        )
+        if not header:
+            continue
+        seen.add(lineno)
+        drops.append((lineno, "deny.mail_headers"))
+    return drops
+
+
+def _redact_spans(text):
+    found = []
+    for index, pattern in enumerate(_CONTENT):
+        token = _REDACT_TOKENS[index] if index < len(_REDACT_TOKENS) else None
+        if not token:
+            continue
+        for match in pattern.finditer(text):
+            if not match.group(0):
+                continue
+            found.append((match.start(), match.end(), token, "deny.content[%d]" % index))
+    found.sort(key=lambda item: (item[0], item[0] - item[1]))
+    chosen = []
+    end = -1
+    for start, stop, token, rule in found:
+        if start < end:
+            continue
+        chosen.append((start, stop, token, rule))
+        end = stop
+    return chosen
+
+
+def redact_export_deny(text):
+    """Redact deny content. Password and key-assignment rows are left in place.
+
+    Box export does not call this. denied_content stays the skip check.
+    Returns {"text", "hits"} with hits of rule, 1-based line, and count.
+    """
+    ranges = _line_ranges(text)
+    dropped = _mail_drop_lines(text)
+    dropped_lines = {lineno for lineno, _rule in dropped}
+    edits = []
+    for lineno, rule in dropped:
+        span = ranges.get(lineno)
+        if span is None:
+            continue
+        edits.append((span[0], span[1], "", rule, lineno))
+    for start, stop, token, rule in _redact_spans(text):
+        lexeme = text[start:stop]
+        line = _line_at(text, start, lexeme)
+        overlap = False
+        for lineno in dropped_lines:
+            span = ranges.get(lineno)
+            if span is not None and start < span[1] and stop > span[0]:
+                overlap = True
+                break
+        if overlap:
+            continue
+        edits.append((start, stop, token, rule, line))
+    if not edits:
+        return {"text": text, "hits": []}
+    grouped = {}
+    for _start, _stop, _token, rule, line in edits:
+        current = grouped.get(rule)
+        if current is None:
+            grouped[rule] = {"line": line, "count": 1}
+        else:
+            current["count"] += 1
+            if line < current["line"]:
+                current["line"] = line
+    out = text
+    for start, stop, token, _rule, _line in sorted(edits, key=lambda item: item[0], reverse=True):
+        out = out[:start] + token + out[stop:]
+    hits = [
+        {"rule": rule, "line": hit["line"], "count": hit["count"]}
+        for rule, hit in grouped.items()
+    ]
+    hits.sort(key=lambda item: (item["line"], item["rule"]))
+    return {"text": out, "hits": hits}
