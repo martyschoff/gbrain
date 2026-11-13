@@ -49,6 +49,130 @@ const PENDING_EXIT = 10;
 const CLI_SNIP = 300;
 const PIPE_CAP = 8 * 1024;
 
+/** Status words. Any other value after a secret key is redacted. */
+const NON_SECRET_VALUE = new Set([
+  'missing', 'invalid', 'expired', 'required', 'none', 'null', 'empty', 'expected', 'unset', 'undefined',
+]);
+
+/** Longest first so `authorization` wins over `auth` and `access_token` over `token`. */
+const ASSIGNMENT_KEY = [
+  'authorization', 'access_token', 'access-token', 'accesstoken', 'password',
+  'api_key', 'api-key', 'apikey', 'bearer', 'passwd', 'secret', 'token', 'auth',
+] as const;
+const QUERY_KEY = [...ASSIGNMENT_KEY, 'key'] as const;
+
+function wordChar(char: string | undefined): boolean {
+  return char !== undefined && ((char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char === '_');
+}
+
+function keyAt(text: string, index: number, names: readonly string[]): { name: string; end: number } | null {
+  if (wordChar(text[index - 1])) return null;
+  const slice = text.slice(index, index + 16).toLowerCase();
+  for (const name of names) {
+    if (!slice.startsWith(name)) continue;
+    const end = index + name.length;
+    if (wordChar(text[end])) continue;
+    return { name, end };
+  }
+  return null;
+}
+
+/** Index where the value begins, after `:` or `=`. Space and tab only. */
+function valueStartAt(text: string, index: number): number | null {
+  let cursor = index;
+  while (text[cursor] === ' ' || text[cursor] === '\t') cursor++;
+  if (text[cursor] !== ':' && text[cursor] !== '=') return null;
+  cursor++;
+  while (text[cursor] === ' ' || text[cursor] === '\t') cursor++;
+  return cursor;
+}
+
+function nonSecretValue(raw: string): boolean {
+  return NON_SECRET_VALUE.has(raw.toLowerCase());
+}
+
+/**
+ * Quoted values keep spaces and honor backslash escapes. An unterminated quote
+ * runs to the end of the line. Unquoted query values stop at whitespace, `&`,
+ * or `#`. Any other unquoted value runs to whitespace.
+ */
+function readValue(text: string, index: number, query: boolean): { end: number; raw: string; quoted: boolean } {
+  const quote = text[index];
+  if (quote === '"' || quote === "'" || quote === '`') {
+    let cursor = index + 1;
+    while (cursor < text.length && text[cursor] !== '\n' && text[cursor] !== '\r') {
+      if (text[cursor] === '\\') {
+        cursor += cursor + 1 < text.length && text[cursor + 1] !== '\n' && text[cursor + 1] !== '\r' ? 2 : 1;
+        continue;
+      }
+      if (text[cursor] === quote) return { end: cursor + 1, raw: text.slice(index, cursor + 1), quoted: true };
+      cursor++;
+    }
+    return { end: cursor, raw: text.slice(index, cursor), quoted: true };
+  }
+  let cursor = index;
+  while (cursor < text.length) {
+    const char = text[cursor];
+    if (char === ' ' || char === '\t' || char === '\n' || char === '\r') break;
+    if (query && (char === '&' || char === '#')) break;
+    cursor++;
+  }
+  return { end: cursor, raw: text.slice(index, cursor), quoted: false };
+}
+
+/**
+ * One left-to-right pass. `token=` / `token:` is always a key. The value is
+ * kept only when it is a known non-secret word. `Authorization: Bearer <secret>`
+ * keeps the scheme word and redacts the secret. Runs before redactSecrets so a
+ * quoted value is not split by the shared start-of-line `\S+` patterns.
+ */
+function redactAssignments(text: string): string {
+  let out = '';
+  let index = 0;
+  while (index < text.length) {
+    const query = text[index - 1] === '?' || text[index - 1] === '&';
+    const key = keyAt(text, index, query ? QUERY_KEY : ASSIGNMENT_KEY);
+    const start = key ? valueStartAt(text, key.end) : null;
+    if (key && start !== null) {
+      const value = readValue(text, start, query);
+      const schemeIntro = (key.name === 'auth' || key.name === 'authorization')
+        && !value.quoted && value.raw.toLowerCase() === 'bearer';
+      if (schemeIntro) {
+        out += text.slice(index, start);
+        index = start;
+        continue;
+      }
+      if (!value.quoted && nonSecretValue(value.raw)) {
+        out += text.slice(index, value.end);
+      } else if (query) {
+        out += `${text.slice(index, start)}[redacted]`;
+      } else {
+        out += '[redacted]';
+      }
+      index = value.end;
+      continue;
+    }
+    const bearer = keyAt(text, index, ['bearer']);
+    if (bearer && valueStartAt(text, bearer.end) === null && (text[bearer.end] === ' ' || text[bearer.end] === '\t')) {
+      let cursor = bearer.end;
+      while (text[cursor] === ' ' || text[cursor] === '\t') cursor++;
+      const next = keyAt(text, cursor, ASSIGNMENT_KEY);
+      const nextIsToken = next?.name === 'token' && valueStartAt(text, next.end) !== null;
+      if (!nextIsToken && cursor < text.length && text[cursor] !== '\n' && text[cursor] !== '\r') {
+        const value = readValue(text, cursor, false);
+        if (value.raw && (value.quoted || !nonSecretValue(value.raw))) {
+          out += 'Bearer [redacted]';
+          index = value.end;
+          continue;
+        }
+      }
+    }
+    out += text[index];
+    index++;
+  }
+  return out;
+}
+
 /**
  * Redact text that may be copied onto a warning. Page files are not read here.
  * This does not stop a CLI from echoing a page, a path, or a secret, so callers
@@ -56,18 +180,9 @@ const PIPE_CAP = 8 * 1024;
  * a JSON code plus message. argv is never appended.
  */
 function redactCliText(text: string): string {
-  let out = redactSecrets(text);
+  let out = redactAssignments(text);
+  out = redactSecrets(out);
   out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1');
-  out = out.replace(/([?&](?:access_token|api[_-]?key|password|token|secret|bearer|key)=)[^&#\s]*/gi, '$1[redacted]');
-  // Diagnostic only. The shared password pattern stays anchored so other callers keep their tests.
-  // Unquoted values stop at whitespace, & and #. Names after ? or & were handled above.
-  // "invalid token:" is a phrase: token before a colon counts only when no word precedes it.
-  // token= is always a key. Quoted values keep their spaces.
-  const quotedOrToken = "(?:'[^']*'|\"[^\"]*\"|[^\\s&#]+)";
-  out = out.replace(new RegExp(`(?<![?&])\\b(?:password|passwd|secret|api[_-]?key)\\b\\s*[:=]\\s*${quotedOrToken}`, 'gi'), '[redacted]');
-  out = out.replace(new RegExp(`(?<![?&])\\btoken\\b\\s*=\\s*${quotedOrToken}`, 'gi'), '[redacted]');
-  out = out.replace(new RegExp(`(?<![?&])(?<!\\b[A-Za-z]+\\s)\\btoken\\b\\s*:\\s*${quotedOrToken}`, 'gi'), '[redacted]');
-  out = out.replace(/\bbearer\s+\S+/gi, 'Bearer [redacted]');
   out = out.replace(/\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[redacted]');
   out = out.replace(/\S+@\S+/g, '[redacted]');
   out = out.replace(/[A-Za-z]:[/\\]Users[/\\][^/\\\s]+/gi, '~');

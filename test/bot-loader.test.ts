@@ -528,6 +528,42 @@ describe('cli failure diagnostics', () => {
     expect(queryPut.detail).toContain('token=[redacted]');
     expect(queryPut.detail).not.toContain('querytok');
   });
+
+  test('assignments are quote-aware and fail closed', async () => {
+    const detailOf = async (stderr: string): Promise<string> => {
+      const client = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 1, stdout: '', stderr }));
+      const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { detail?: string };
+      return put.detail ?? '';
+    };
+
+    for (const line of ['auth token: abc123\n', 'bearer token: abc123\n', 'error, token: abc123\n', 'invalid\ttoken: abc123\n']) {
+      const detail = await detailOf(line);
+      expect(detail).not.toContain('abc123');
+      expect(detail).toContain('[redacted]');
+    }
+    const phrase = await detailOf('invalid token: missing\n');
+    expect(phrase).toContain('invalid token: missing');
+    expect(phrase).not.toContain('[redacted]');
+
+    for (const line of ["password='abc def'\n", 'PASSWORD="abc def"\n', "api-key='abc def'\n", 'api_key="abc def"\n']) {
+      const detail = await detailOf(line);
+      expect(detail).toBe('exit 1, [redacted]');
+    }
+
+    expect(await detailOf('token="abc def\n')).toBe('exit 1, [redacted]');
+    expect(await detailOf('token="abc\\"def"\n')).toBe('exit 1, [redacted]');
+    expect(await detailOf('token=`abc def`\n')).toBe('exit 1, [redacted]');
+
+    const joined = await detailOf('secret=foo&bar\n');
+    expect(joined).toBe('exit 1, [redacted]');
+    expect(joined).not.toContain('&bar');
+
+    const started = performance.now();
+    const bulky = await detailOf(`token=abc ${'x '.repeat(50000)}`);
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(bulky).not.toContain('token=abc');
+    expect(bulky).toContain('[redacted]');
+  });
 });
 
 describe('secret list', () => {
