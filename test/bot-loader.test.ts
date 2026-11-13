@@ -10,13 +10,14 @@ import { createGbrainClient, manifestCounts, putArgv, addSourceArgv } from '../s
 import { shareIsMounted } from '../scripts/bot-loader/host.ts';
 import { readManifest } from '../scripts/bot-loader/manifest.ts';
 import { csvToMarkdown, renderPage, sha256 } from '../scripts/bot-loader/render.ts';
+import { checkFailClosed } from '../scripts/bot-loader/fail-closed.ts';
 import { runLoader } from '../scripts/bot-loader/run.ts';
 import { contentHasSecret, isSecretFileName } from '../scripts/bot-loader/secrets.ts';
 import secretPatterns from '../scripts/bot-loader/secret-patterns.json';
 import { slugFromRelative } from '../scripts/bot-loader/slug.ts';
 import { formatSummary } from '../scripts/bot-loader/summary.ts';
 import type { BrainClient } from '../scripts/bot-loader/gbrain-client.ts';
-import type { LoaderConfig } from '../scripts/bot-loader/config.ts';
+import type { GroupConfig, LoaderConfig } from '../scripts/bot-loader/config.ts';
 
 const REPO = join(import.meta.dir, '..');
 const CLI = join(REPO, 'scripts/bot-loader/cli.ts');
@@ -719,32 +720,38 @@ describe('box export helper', () => {
     const cfg = join(home, 'box.json');
     writeFileSync(cfg, JSON.stringify({ bots: { 'bot-a': agent, 'fin-bot': join(home, 'missing-agent') } }));
     const out = join(home, 'out');
-    const dry = spawnSync('python3', [BOX, cfg, '--dry-run', '--out', out], { encoding: 'utf8' });
+    const dry = spawnSync('python3', [BOX, cfg, '--dry-run', '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(dry.status).toBe(0);
-    expect(dry.stdout).toContain('dry-run bot bot-a files=4 secrets_skipped=1');
+    expect(dry.stdout).toContain('dry-run bot bot-a files=3 secrets_skipped=2');
     expect(dry.stdout).not.toContain('BEGIN RSA');
     expect(existsSync(out)).toBe(false);
     expect(readFileSync(join(agent, 'profile.json')).equals(source)).toBe(true);
 
-    const wet = spawnSync('python3', [BOX, cfg, '--out', out], { encoding: 'utf8' });
+    const wet = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(wet.status).toBe(0);
-    const stamp = readFileSync(join(out, 'EXPORTED_AT'), 'utf8');
-    expect(stamp.split('\n')[0]).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
-    expect(stamp).toContain('bot-a 4');
+    expect(existsSync(join(out, 'EXPORTED_AT'))).toBe(false);
+    expect(existsSync(join(out, 'MANIFEST.json'))).toBe(false);
+    const manifest = JSON.parse(readFileSync(join(out, 'bot-a/manifest.json'), 'utf8')) as { account: string; bot_id: string; files: Record<string, { size: number; sha256: string }> };
+    expect(manifest.account).toBe('account-a');
+    expect(manifest.bot_id).toBe('bot-a');
     expect(readFileSync(join(out, 'bot-a/profile.json'), 'utf8')).toContain('bot-a');
+    expect(existsSync(join(out, 'bot-a/memory.md'))).toBe(true);
+    expect(existsSync(join(out, 'bot-a/routines.md'))).toBe(true);
+    expect(readFileSync(join(out, 'bot-a/memory.md'), 'utf8')).not.toContain('nope');
     expect(existsSync(join(out, 'bot-a/memory/log/nested/skip.md'))).toBe(false);
     expect(existsSync(join(out, 'bot-a/attachments/picture.png'))).toBe(false);
     expect(existsSync(join(out, 'bot-a/attachments/token.txt'))).toBe(false);
+    expect(existsSync(join(out, 'bot-a/secrets.env'))).toBe(false);
     expect(statSync(join(agent, 'profile.json')).mtimeMs).toBe(mtime);
     writeFileSync(join(out, 'stale.txt'), 'gone\n');
-    const again = spawnSync('python3', [BOX, cfg, '--out', out], { encoding: 'utf8' });
+    const again = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(again.status).toBe(0);
     expect(existsSync(join(out, 'stale.txt'))).toBe(false);
-    expect(existsSync(join(out, 'EXPORTED_AT'))).toBe(true);
-    expect(existsSync(join(out, 'MANIFEST.json'))).toBe(false);
-    const def = spawnSync('python3', [BOX, cfg], { encoding: 'utf8', env: { ...process.env, HOME: home } });
+    expect(existsSync(join(out, 'bot-a/manifest.json'))).toBe(true);
+    const def = spawnSync('python3', [BOX, cfg, '--account', 'account-a'], { encoding: 'utf8', env: { ...process.env, HOME: home } });
     expect(def.status).toBe(0);
-    expect(existsSync(join(home, '.gbrain/box-export/EXPORTED_AT'))).toBe(true);
+    expect(existsSync(join(home, '.gbrain/box-export/bot-a/manifest.json'))).toBe(true);
+    expect(existsSync(join(home, '.gbrain/box-export/EXPORTED_AT'))).toBe(false);
   });
 });
 
@@ -1045,6 +1052,7 @@ describe('fail-closed feeds', () => {
     const home = temp('gbrain-feed-cfg-');
     const share = join(home, 'share');
     const example = loadConfig(join(REPO, 'docs/grok/bot-loader/config.example.json'), home);
+    expect(example.exportRoots.map((root) => root.account)).toEqual(['account-a', 'account-b']);
     expect(example.groups.every((group) => group.failClosed === false)).toBe(true);
     expect(example.groups.some((group) => group.stampRoot)).toBe(false);
     const stamp = join(share, 'businessgrok/gbrain/_box-export');
@@ -1460,7 +1468,7 @@ describe('fail-closed feeds', () => {
     expect(result.stdout).toContain('PASS status fresh');
   });
 
-  test('box export writes a manifest only when account and source are both set', () => {
+  test('box export writes a per-bot manifest with the account tag', () => {
     const home = temp('gbrain-feed-box-');
     const agent = join(home, 'agent');
     write(join(agent, 'profile.json'), '{"id":"example-bot"}\n');
@@ -1469,41 +1477,117 @@ describe('fail-closed feeds', () => {
     const cfg = join(home, 'box.json');
     writeFileSync(cfg, JSON.stringify({ bots: { 'example-bot': agent } }));
     const plain = join(home, 'plain');
-    const noFlags = spawnSync('python3', [BOX, cfg, '--out', plain], { encoding: 'utf8' });
-    expect(noFlags.status).toBe(0);
-    expect(existsSync(join(plain, 'EXPORTED_AT'))).toBe(true);
-    expect(existsSync(join(plain, 'MANIFEST.json'))).toBe(false);
+    const noAccount = spawnSync('python3', [BOX, cfg, '--out', plain], { encoding: 'utf8' });
+    expect(noAccount.status).not.toBe(0);
+    expect(existsSync(plain)).toBe(false);
     const out = join(home, 'out');
-    const dry = spawnSync('python3', [BOX, cfg, '--dry-run', '--out', out, '--account', 'businessgrok', '--source', 'business'], { encoding: 'utf8' });
+    const dry = spawnSync('python3', [BOX, cfg, '--dry-run', '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
     expect(dry.status).toBe(0);
     expect(existsSync(out)).toBe(false);
-    const one = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'businessgrok'], { encoding: 'utf8' });
-    expect(one.status).not.toBe(0);
+    const sourceFlag = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a', '--source', 'business'], { encoding: 'utf8' });
+    expect(sourceFlag.status).not.toBe(0);
     expect(existsSync(out)).toBe(false);
-    const wet = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'businessgrok', '--source', 'business'], { encoding: 'utf8' });
-    expect(wet.status).toBe(0);
-    const manifest = JSON.parse(readFileSync(join(out, 'MANIFEST.json'), 'utf8')) as {
+    const closed = join(home, 'closed');
+    const signed = spawnSync('python3', [BOX, cfg, '--out', closed, '--account', 'account-a', '--source', 'business', '--fail-closed'], { encoding: 'utf8' });
+    expect(signed.status).toBe(0);
+    expect(existsSync(join(closed, 'EXPORTED_AT'))).toBe(true);
+    expect(existsSync(join(closed, 'example-bot/manifest.json'))).toBe(false);
+    const tree = JSON.parse(readFileSync(join(closed, 'MANIFEST.json'), 'utf8')) as {
       version: number;
       account: string;
       source: string;
       exported_at: string;
       files: Record<string, string>;
       file_count: number;
-      byte_count: number;
+    };
+    expect(tree.version).toBe(1);
+    expect(tree.account).toBe('account-a');
+    expect(tree.source).toBe('business');
+    expect(tree.exported_at.endsWith('Z')).toBe(true);
+    expect(typeof tree.files['example-bot/profile.json']).toBe('string');
+    expect(tree.file_count).toBe(Object.keys(tree.files).length);
+    const wet = spawnSync('python3', [BOX, cfg, '--out', out, '--account', 'account-a'], { encoding: 'utf8' });
+    expect(wet.status).toBe(0);
+    expect(existsSync(join(out, 'MANIFEST.json'))).toBe(false);
+    expect(existsSync(join(out, 'EXPORTED_AT'))).toBe(false);
+    const manifest = JSON.parse(readFileSync(join(out, 'example-bot/manifest.json'), 'utf8')) as {
+      version: number;
+      account: string;
+      bot_id: string;
+      bot_name: string;
+      exported_at: string;
+      files: Record<string, { size: number; sha256: string }>;
     };
     expect(manifest.version).toBe(1);
-    expect(manifest.account).toBe('businessgrok');
-    expect(manifest.source).toBe('business');
-    expect(manifest.exported_at).toBe(readFileSync(join(out, 'EXPORTED_AT'), 'utf8').split('\n')[0]);
-    const rels = Object.keys(manifest.files);
-    expect(rels).toEqual(['example-bot/attachments/note.txt', 'example-bot/memory/profile.md', 'example-bot/profile.json']);
-    let bytes = 0;
+    expect(manifest.account).toBe('account-a');
+    expect(manifest.bot_id).toBe('example-bot');
+    expect(manifest.exported_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/);
+    const rels = Object.keys(manifest.files).sort();
+    expect(rels).toEqual(['memory.md', 'profile.json', 'routines.md']);
     for (const rel of rels) {
-      const body = readFileSync(join(out, rel));
-      expect(manifest.files[rel]).toBe(sha256(body));
-      bytes += body.length;
+      const body = readFileSync(join(out, 'example-bot', rel));
+      expect(manifest.files[rel]!.sha256).toBe(sha256(body));
+      expect(manifest.files[rel]!.size).toBe(body.length);
     }
-    expect(manifest.file_count).toBe(rels.length);
-    expect(manifest.byte_count).toBe(bytes);
+    expect(existsSync(join(out, 'example-bot/attachments/note.txt'))).toBe(false);
+  });
+
+  test('a fail-closed export is accepted by the fail-closed reader', async () => {
+    const home = temp('gbrain-feed-produced-');
+    const share = join(home, 'share');
+    const agent = join(home, 'agent');
+    write(join(agent, 'profile.json'), '{"id":"example-bot"}\n');
+    write(join(agent, 'memory/profile.md'), '# profile\n\nA fake fact.\n');
+    write(join(agent, 'attachments/note.txt'), 'hello\n');
+    const cfg = join(home, 'box.json');
+    writeFileSync(cfg, JSON.stringify({ bots: { 'example-bot': agent } }));
+    const closed = join(share, 'share-a/_box-export');
+    const signed = spawnSync('python3', [BOX, cfg, '--out', closed, '--account', 'acme-biz', '--source', 'acme-biz', '--fail-closed'], { encoding: 'utf8' });
+    expect(signed.status).toBe(0);
+    expect(existsSync(join(closed, 'EXPORTED_AT'))).toBe(true);
+    expect(existsSync(join(closed, 'MANIFEST.json'))).toBe(true);
+    const target = join(share, 'share-a/pages');
+    const group: GroupConfig = {
+      id: 'acme-biz',
+      source: 'acme-biz',
+      account: 'acme-biz',
+      failClosed: true,
+      ensureSource: true,
+      forbidGit: false,
+      stampRoot: closed,
+      boxExportDir: closed,
+      targetRoot: target,
+      extensions: ['.md', '.txt', '.json', '.yaml', '.yml'],
+      bots: [{ id: 'example-bot', inputs: [{ path: join(closed, 'example-bot'), required: false, role: 'box-export' }] }],
+    };
+    const config: LoaderConfig = {
+      shareRoot: share,
+      statePath: join(home, 'state.json'),
+      summaryPath: join(home, 'summary.txt'),
+      lockPath: join(home, 'run.lock'),
+      hostEnv: join(home, 'host.env'),
+      gbrainBin: '/usr/bin/gbrain',
+      maxBytes: 1024,
+      csvMaxRows: 500,
+      boxExportMaxAgeHours: 36,
+      boxExportDir: join(share, 'share-a/unused-box'),
+      placeholder: null,
+      groups: [group],
+      exportRoots: [],
+    };
+    writeFileSync(config.hostEnv, 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const checked = checkFailClosed(group, {
+      groups: config.groups,
+      now: new Date(),
+      maxBytes: config.maxBytes,
+      maxAgeHours: config.boxExportMaxAgeHours,
+    });
+    expect(checked.ok).toBe(true);
+    if (!checked.ok) return;
+    expect(checked.files.map((file) => file.relativePosix).sort()).toEqual(['attachments/note.txt', 'memory/profile.md', 'profile.json']);
+    const result = await runAt(config, brainSpy().brain);
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).not.toContain('SKIP acme-biz');
+    expect(readFileSync(join(target, 'example-bot/memory/profile.md'), 'utf8')).toContain('A fake fact.');
   });
 });

@@ -2,7 +2,7 @@
 
 **Say to your agent:** *"Install the nightly bot-knowledge loader from this checkout, keep the real bot list in the local config, and do not push those pages to a git remote."*
 
-The loader reads text from folders you list in a local config, writes one markdown page per file onto the share, and imports the pages that changed. The repo ships placeholders only (`bot-a`, `bot-b`, `fin-bot`). The real bot list, share path, and any extra folders live in `~/.gbrain/bot-loader/config.json`, which is never committed. The list can be any length. Nothing in the loader assumes a fixed number of bots.
+The loader reads text from folders you list in a local config, writes one markdown page per file onto the share, and imports the pages that changed. The repo ships placeholders only (`bot-a`, `bot-b`, `fin-bot`). The real bot list, share path, and any extra folders live in `~/.gbrain/bot-loader/config.json`, which is never committed. The list can be any length. Nothing in the loader assumes a fixed number of bots. Nightly drops from more than one account are a separate list of roots; see [multi-account export](multi-account-export.md).
 
 Hosted GBrain is at [gbrain.io](https://gbrain.io/cli?ref=agents-md). This loader is the self-hosted path for a brain that already runs on the machine.
 
@@ -273,16 +273,19 @@ The finance source is a plain directory (`sources add --force`, no remote). A gr
 | `groups[].account` | Required when `fail_closed` is true. Compared to `MANIFEST.json`. Not written into page frontmatter. |
 | `groups[].stamp_root` | Required when `fail_closed` is true. The only directory those checks read. It must not be the top-level personal `box_export_dir`. A basename `_box-export.in` or ending in `.bak` is a partial copy and is not read. |
 | `groups[].box_export_dir` | Optional per group. Business requires it and it must be the same directory as `stamp_root`. Hermes must omit it. |
+| `export_roots[]` | Optional. Each entry is `{ "account", "path", "source", "target_root", "ensure_source"? }`. `path` is an account root named `_box-export` or `_box-export-<account>`. The loader discovers every bot folder under it. This is not a fail-closed `stamp_root`. See [multi-account export](multi-account-export.md). |
 
 ## Box export helper
 
-`scripts/bot-loader/box-export.py` runs on the Linux host with Python 3.9's standard library. The config path is the only required argument. `--out` defaults to `~/.gbrain/box-export`. `--dry-run` prints counts and writes nothing. Each real run builds a new tree in a temp directory, writes `EXPORTED_AT` (UTC timestamp, then `<bot> <file count>`), and swaps it into place. It copies only `profile.json`, `memory/profile.md`, `memory/log/*.md`, `attachments/*.md`, and `attachments/*.txt`, with the same secret skips, and it does not modify its sources. With no `--account` and no `--source`, the tree has no `MANIFEST.json`. Passing both writes `MANIFEST.json` (`version` 1, `account`, `source`, `exported_at`, `files`, `file_count`, `byte_count`) whose digests are the sha256 of the copied bytes. Passing only one of the two flags is an error and writes nothing.
+`scripts/bot-loader/box-export.py` runs on the Linux host with Python 3.9's standard library. The config path is the only required argument. `--account` is required and must be a lowercase slug with no spaces. `--out` is the account root and defaults to `~/.gbrain/box-export`. Point it at `<EXPORT-ROOT>/_box-export` or `<EXPORT-ROOT>/_box-export-<ACCOUNT>`. `--dry-run` prints counts and writes nothing. Each real run builds a new tree in a temp directory and swaps it into place, so every bot folder is replaced wholesale. There is no dated subfolder, no tree-level `EXPORTED_AT`, and no tree-level `MANIFEST.json`.
+
+For each bot it writes `manifest.json`, `profile.json`, `memory.md` (one dated section per fact), `routines.md` (name, schedule, prompt), plus `skills/<skill>.md` and `notes/` when those sources exist. `manifest.json` records the bot name, bot id, account, an `America/New_York` export time, and the size and sha256 of every other file. Sources are not modified. Tokens, keys, passwords, `.env` files, holdings, account numbers, email addresses, street addresses, and phone numbers are left out. The same secret list as the loader applies, plus `scripts/bot-loader/export-deny.json`.
 
 ```bash
-python3 scripts/bot-loader/box-export.py docs/grok/bot-loader/box-export.example.json --dry-run
+python3 scripts/bot-loader/box-export.py docs/grok/bot-loader/box-export.example.json --account account-a --dry-run
 ```
 
-Copying that directory onto the share at `personalgrok/gbrain/_box-export/` is a separate job and is not part of this checkout.
+Copying that directory onto the share is a separate job and is not part of this checkout. The default layout is the per-bot drop above. `--fail-closed` together with `--source <slug>` writes the other contract the fail-closed readers still expect: a tree-level `EXPORTED_AT` and `MANIFEST.json`. `--source` without `--fail-closed` is refused. An export drop whose `exported_at` is outside `box_export_max_age_hours` (default 36, either direction) is skipped with `stale`.
 
 ## Nightly agent
 
