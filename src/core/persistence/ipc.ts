@@ -3,8 +3,6 @@ import net, { type Server, type Socket } from 'node:net';
 import { chmodSync, lstatSync, unlinkSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { OperationError, opError } from '../ops/contract.ts';
-import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
-import { redactFindings } from '../secret-scan.ts';
 import { readFix } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import type { ProjectionBacklog } from '../page-state/projections.ts';
@@ -175,25 +173,26 @@ function publicError(error: unknown): Record<string, unknown> {
   return { error: 'storage_error', message: 'The persistence owner could not complete this request.' };
 }
 
-const OWNER_FAULT_MESSAGE_CHARS = 300;
+/** A driver field safe to print: letters, digits, underscore. Anything else is dropped. */
+function ownerFaultField(value: unknown): string {
+  const text = typeof value === 'string' || typeof value === 'number' ? String(value) : '';
+  return /^[A-Za-z0-9_]{1,64}$/.test(text) ? text : '-';
+}
 
 /**
- * One stderr line for a fault the client must not see. Class, a redacted
- * message prefix, the operation name and the request id. Never params, file
- * contents, or SQL values.
+ * One stderr line for a fault the client must not see. Structured fields only:
+ * class, driver code, constraint, severity, operation, request id. Never the
+ * message, DETAIL, params, paths, or SQL values.
  */
 function logUnclassifiedOwnerFault(error: unknown, operation: string, requestId: string | undefined): void {
   if (error instanceof OperationError) return;
-  const err = error instanceof Error ? error : new Error(typeof error === 'string' ? error : 'unknown');
-  const cls = err.constructor?.name || err.name || 'Error';
-  let message = '';
-  try {
-    const flat = String(err.message ?? '').replace(/\s+/g, ' ').trim();
-    message = redactConnectionInfo(redactFindings(flat, { highEntropy: true }).text).slice(0, OWNER_FAULT_MESSAGE_CHARS);
-  } catch { message = ''; }
+  const err = error instanceof Error ? error : new Error('unknown');
+  const raw = (error ?? {}) as { code?: unknown; constraint?: unknown; constraint_name?: unknown; severity?: unknown };
+  const cls = ownerFaultField(err.constructor?.name || err.name) === '-' ? 'Error' : (err.constructor?.name || err.name || 'Error');
   const op = /^[a-z][a-z0-9_]{0,63}$/.test(operation) ? operation : 'unknown';
   const id = requestId && isWriteRequestId(requestId) ? requestId : '-';
-  try { process.stderr.write(`[gbrain persistence] ${cls}: ${message} operation=${op} request_id=${id}\n`); }
+  const line = `[gbrain persistence] ${cls} code=${ownerFaultField(raw.code)} constraint=${ownerFaultField(raw.constraint_name ?? raw.constraint)} severity=${ownerFaultField(raw.severity)} operation=${op} request_id=${id}\n`;
+  try { process.stderr.write(line); }
   catch { /* stderr gone */ }
 }
 

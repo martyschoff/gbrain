@@ -20,6 +20,7 @@ import { flushTopologyDirectory, topologyDirectoryIdentity } from './topology-fi
 import { assertPhysicalRoot } from './physical-root.ts';
 import { assertPhysicalRootStamp, readPhysicalRootReservation } from './physical-root-record.ts';
 import { resumeWorktreeRefreshes } from './worktree-refresh.ts';
+import { isSourceNameUniqueViolation, refuseSourceNameRace } from '../source-name.ts';
 
 const cloneStatusFix=(sourceId:string):Action=>readFix(
   `Shows source ${sourceId}'s owner, worktree state (recovering while a clone is unresolved) and blocking effects, read-only.`,
@@ -190,6 +191,10 @@ export async function finishTopologyClone(engine:BrainEngine,id:string,hooks:Clo
         // No speculation on an unknown database commit. Its durable state
         // decides whether to finish cleanup or preserve the original checkout.
         row=await readChange(engine,id);
+        if(row.state!=='committed'&&isSourceNameUniqueViolation(error)){
+          await abortClone(engine,row,record,'source_name_taken');
+          await refuseSourceNameRace(engine,error,record.sourceId,record.input.name??record.sourceId);
+        }
         if(row.state!=='committed'){
           const code=(error as {code?:string}).code;
           if(['permission_denied','source_changed','recovery_required','owner_marker_missing'].includes(code??''))return abortClone(engine,row,record,code!);

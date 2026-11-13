@@ -30,6 +30,7 @@ import { assertWriterAdminState, WRITER_INSPECTION_HINT } from './admin-intent.t
 import { assertWriterAdminUnlocked } from './admin-lock.ts';
 import { rebindContentReceipts } from '../shared-skills/receipt-root.ts';
 import { assertLinkedWorktreeIntact } from './worktree-link.ts';
+import { assertSourceNameFree, refuseSourceNameRace } from '../source-name.ts';
 
 export interface SourceLifecycleInput {
   operation:'add'|'claim'|'archive'|'restore'|'remove'|'purge'|'rebind'|'reclone';
@@ -67,14 +68,10 @@ function displayNameBeingWritten(input:SourceLifecycleInput, existing:SourceStat
   if(existing)return input.name;
   return input.name??input.sourceId;
 }
-/** `sources.name` is UNIQUE apart from the id. A collision is a caller mistake, not a retry. */
-async function refuseTakenDisplayName(engine:BrainEngine,sourceId:string,name:string|undefined,operation:string):Promise<void>{
+/** `sources.name` is UNIQUE apart from the id. A collision is a caller mistake, not a retry. The holder's id is not named. */
+async function refuseTakenDisplayName(engine:BrainEngine,sourceId:string,name:string|undefined):Promise<void>{
   if(name===undefined)return;
-  const [other]=await engine.executeRaw<{id:string}>(`SELECT id FROM sources WHERE name=$1 AND id<>$2 LIMIT 1`,[name,sourceId]);
-  if(!other)return;
-  throw opError('source_name_taken',`Source name "${name}" is already used by source "${other.id}".`,
-    `Pick a different --name for '${sourceId}'. Display names are unique across sources, so this ${operation} did not register it.`,
-    {retryable:false,fix:sourcesListFix()});
+  await assertSourceNameFree(engine,sourceId,name);
 }
 function replayTopologyChange(row:TopologyChange|null):Record<string,unknown>|null{
   if(!row||isRetireAdmission(row))return null;
@@ -200,7 +197,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
     `SELECT w.manifest->>'digest' AS digest FROM persistence_source_bindings b JOIN persistence_worktrees w ON w.id=b.worktree_id WHERE b.source_id=$1`,[input.sourceId])).some(row=>!row.digest);
   if(input.dryRun) await inspectTopologyPhysicalRoot(engine,input.sourceId,root?.worktree,{relocation:input.operation==='rebind'});
   if(input.dryRun){
-    await refuseTakenDisplayName(engine,input.sourceId,displayNameBeingWritten(input,before),input.operation);
+    await refuseTakenDisplayName(engine,input.sourceId,displayNameBeingWritten(input,before));
     return {dry_run:true,operation:input.operation,source_id:input.sourceId,source_incarnation:before?.incarnation??null,path:root?.source??before?.local_path??null,manifest_required:manifestRequired};
   }
   return withTopologyLocks(engine,input.sourceId,async bindings=>{
@@ -331,7 +328,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       let incarnation=source?.incarnation??randomUUID();
       let pagesDeleted=retiredPages;
       if(input.operation==='add'||input.operation==='claim'){
-        await refuseTakenDisplayName(tx,input.sourceId,displayNameBeingWritten(input,source),input.operation);
+        await refuseTakenDisplayName(tx,input.sourceId,displayNameBeingWritten(input,source));
         if(root&&input.createDirectory&&!existsSync(root.source)){mkdirSync(root.source,{recursive:true});flushTopologyDirectory(dirname(root.source));}
         if(source) await tx.executeRaw("UPDATE sources SET local_path=$2,name=COALESCE($3,name),config=$4::text::jsonb WHERE id=$1",
           [input.sourceId,root!.source,input.name??null,JSON.stringify({...source.config,...input.config})]);
@@ -391,7 +388,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
         error.suggestion=`This run had already deleted ${retiredPages} page(s) of source '${input.sourceId}' in committed batches before it stopped; the source and its remaining pages are still registered. ${error.suggestion??''}`.trim();
       throw error;
     }
-  },root?.worktree,5000,{relocation:input.operation==='rebind'});
+  },root?.worktree,5000,{relocation:input.operation==='rebind'}).catch(error=>refuseSourceNameRace(engine,error,input.sourceId,displayNameBeingWritten(input,before)));
 }
 
 /** #6099: a rebind's new directory does not match the current checkout; names the first differing paths (Git-tracked paths in git scope). */

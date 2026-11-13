@@ -17,6 +17,9 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { OperationError } from '../src/core/ops/contract.ts';
+import { toAgentError } from '../src/core/agent-output.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
 import {
   addSource,
   listSources,
@@ -163,10 +166,19 @@ describe('addSource — Q4 pre-flight collision', () => {
         await addSource(engine, { id: 'beta-notes', name: 'Shared Label', localPath: next, force: true });
         throw new Error('expected throw');
       } catch (e) {
-        expect(e).toBeInstanceOf(SourceOpError);
-        expect((e as SourceOpError).code).toBe('source_name_taken');
-        expect((e as SourceOpError).message).toContain('alpha-notes');
-        expect((e as SourceOpError).retryable).toBe(false);
+        expect(e).toBeInstanceOf(OperationError);
+        expect((e as OperationError).code).toBe('source_name_taken');
+        expect((e as OperationError).message).toBe('Display name already in use.');
+        expect((e as OperationError).message).not.toContain('alpha-notes');
+        expect((e as OperationError).retryable).toBe(false);
+        const envelope = toAgentError(e, {
+          transport: 'stdio', op: 'sources_add', mutating: true,
+          render: { transport: 'stdio', isCallable: () => true, preapproved: () => false },
+        });
+        expect(envelope.code).toBe('source_name_taken');
+        expect(envelope.class).toBe('caller');
+        expect(envelope.retryable).toBe(false);
+        expect(envelope.message).not.toContain('alpha-notes');
       }
       expect(await engine.executeRaw('SELECT id FROM sources WHERE id = $1', ['beta-notes'])).toHaveLength(0);
       // The id default is the display name, so it collides with a different source's name too.
@@ -175,10 +187,36 @@ describe('addSource — Q4 pre-flight collision', () => {
         await addSource(engine, { id: 'delta-notes', name: 'gamma-notes', localPath: held });
         throw new Error('expected throw');
       } catch (e) {
-        expect(e).toBeInstanceOf(SourceOpError);
-        expect((e as SourceOpError).code).toBe('source_name_taken');
-        expect((e as SourceOpError).message).toContain('gamma-notes');
+        expect(e).toBeInstanceOf(OperationError);
+        expect((e as OperationError).code).toBe('source_name_taken');
+        expect((e as OperationError).message).toBe('Display name already in use.');
+        expect((e as OperationError).message).not.toContain('gamma-notes');
       }
+    });
+  });
+
+  test('a lost race on sources_name_key is source_name_taken, not the driver error', async () => {
+    await withEnv2(async () => {
+      const held = join(tmpdir(), `gbrain-name-race-${process.pid}-${Date.now()}`);
+      const next = join(tmpdir(), `gbrain-name-race-next-${process.pid}-${Date.now()}`);
+      await addSource(engine, { id: 'alpha-notes', name: 'Shared Label', localPath: held, force: true });
+      let skipped = false;
+      const racing = Object.create(engine, {
+        executeRaw: { value: async (sql: string, params?: unknown[]) => {
+          if (!skipped && sql.includes('WHERE name = $1 AND id <> $2')) { skipped = true; return []; }
+          return engine.executeRaw(sql, params);
+        } },
+      }) as BrainEngine;
+      try {
+        await addSource(racing, { id: 'beta-notes', name: 'Shared Label', localPath: next, force: true });
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(e).toBeInstanceOf(OperationError);
+        expect((e as OperationError).code).toBe('source_name_taken');
+        expect(String((e as Error).message)).not.toContain('sources_name_key');
+      }
+      expect(skipped).toBe(true);
+      expect(await engine.executeRaw('SELECT id FROM sources WHERE id = $1', ['beta-notes'])).toHaveLength(0);
     });
   });
 

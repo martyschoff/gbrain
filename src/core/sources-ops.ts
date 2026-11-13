@@ -63,13 +63,14 @@ import { resolveSourceWithTier, type SourceTier } from './source-resolver.ts';
 import { deleteSourceRow } from './source-delete.ts';
 import { defaultCloneDir, isOwnedClone } from './url-clone.ts';
 import { hookSessionCwd } from './session-cwd.ts';
+import { OperationError } from './ops/contract.ts';
+import { assertSourceNameFree, isSourceNameUniqueViolation, refuseSourceNameRace } from './source-name.ts';
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
 export type SourceOpErrorCode =
   | 'invalid_id'
   | 'source_id_taken'
-  | 'source_name_taken'
   | 'overlapping_path'
   | 'invalid_remote_url'
   | 'clone_failed'
@@ -83,8 +84,6 @@ export type SourceOpErrorCode =
   | 'not_a_git_repo';
 
 export class SourceOpError extends Error {
-  /** Set false for a caller mistake that must not be retried (`source_name_taken`). */
-  retryable?: boolean;
   constructor(
     public code: SourceOpErrorCode,
     message: string,
@@ -452,31 +451,56 @@ async function insertApiSource(engine: BrainEngine, opts: AddSourceOpts, kind: '
       `${choice.dir} overlaps source "${overlap.id}" at ${overlap.local_path}; its pages would be imported by both sources. Choose a directory no other source covers.`);
     mkdirPrivate(choice.dir);
   }
-  await engine.executeRaw(
+  await sourceNameWrite(
+    engine,
     `INSERT INTO sources (id, name, local_path, config)
          VALUES ($1, $2, $3, $4::text::jsonb)`,
     [opts.id, opts.name ?? opts.id, choice.dir, JSON.stringify(kind === 'slack' ? slackSourceConfig(opts.slack!, choice, opts.federated, false)
       : meetingsSourceConfig(opts.meetings!, choice, opts.federated, false))],
+    opts.id,
+    opts.name ?? opts.id,
   );
 }
 
-/**
- * `sources.name` is UNIQUE on its own. The id pre-flight does not see a
- * different source that already holds this display name (or the id, when
- * `--name` is omitted). Not retryable: the same request collides again.
- */
-export async function assertSourceNameFree(engine: BrainEngine, id: string, name: string): Promise<void> {
-  const [other] = await engine.executeRaw<{ id: string }>(
-    `SELECT id FROM sources WHERE name = $1 AND id <> $2 LIMIT 1`,
-    [name, id],
-  );
-  if (!other) return;
-  const error = new SourceOpError(
-    'source_name_taken',
-    `Source name "${name}" is already used by source "${other.id}". Display names are unique. Pick a different --name for "${id}"; nothing was registered.`,
-  );
-  error.retryable = false;
-  throw error;
+/** Clone INSERT. A name collision stays `source_name_taken`; any other failure removes the temp clone and is `insert_failed`. */
+async function insertClonedSourceRow(
+  engine: BrainEngine,
+  opts: AddSourceOpts,
+  tempDir: string,
+  finalPath: string | null,
+  config: Record<string, unknown>,
+  displayName: string,
+): Promise<void> {
+  try {
+    await sourceNameWrite(
+      engine,
+      `INSERT INTO sources (id, name, local_path, config)
+           VALUES ($1, $2, $3, $4::text::jsonb)`,
+      [opts.id, displayName, finalPath, JSON.stringify(config)],
+      opts.id,
+      displayName,
+    );
+  } catch (e) {
+    rmSync(tempDir, { recursive: true, force: true });
+    if (e instanceof OperationError) throw e;
+    if (isSourceNameUniqueViolation(e)) await refuseSourceNameRace(engine, e, opts.id, displayName);
+    throw new SourceOpError(
+      'insert_failed',
+      `INSERT failed for source "${opts.id}": ${(e as Error).message}`,
+      e,
+    );
+  }
+}
+
+/** INSERT/UPDATE of `sources.name`. A lost race (23505 on sources_name_key) is `source_name_taken`, not a raw driver error. */
+function sourceNameWrite(
+  engine: BrainEngine,
+  sql: string,
+  params: unknown[],
+  id: string,
+  name: string | null | undefined,
+): Promise<unknown> {
+  return engine.executeRaw(sql, params).catch((error: unknown) => refuseSourceNameRace(engine, error, id, name));
 }
 
 /**
@@ -620,22 +644,7 @@ export async function addSource(
     if (opts.federated !== null && opts.federated !== undefined) {
       config.federated = opts.federated;
     }
-    const displayName = opts.name ?? opts.id;
-
-    try {
-      await engine.executeRaw(
-        `INSERT INTO sources (id, name, local_path, config)
-             VALUES ($1, $2, $3, $4::text::jsonb)`,
-        [opts.id, displayName, finalPath, JSON.stringify(config)],
-      );
-    } catch (e) {
-      rmSync(tempDir, { recursive: true, force: true });
-      throw new SourceOpError(
-        'insert_failed',
-        `INSERT failed for source "${opts.id}": ${(e as Error).message}`,
-        e,
-      );
-    }
+    await insertClonedSourceRow(engine, opts, tempDir, finalPath, config, opts.name ?? opts.id);
 
     // Final step: rename temp dir to final clone path. EXDEV (cross-device
     // rename) is rare on a single-host brain but possible if $GBRAIN_HOME
@@ -695,10 +704,13 @@ export async function addSource(
       }
     }
     const displayName = opts.name ?? opts.id;
-    await engine.executeRaw(
+    await sourceNameWrite(
+      engine,
       `INSERT INTO sources (id, name, local_path, config)
            VALUES ($1, $2, $3, $4::text::jsonb)`,
       [opts.id, displayName, finalPath, JSON.stringify(config)],
+      opts.id,
+      displayName,
     );
   } else if (opts.google) {
     // ── Path D: --kind google (v0.47) ─────────────────────────────────────
@@ -731,10 +743,13 @@ export async function addSource(
       federated: opts.federated ?? true,
     };
     const displayName = opts.name ?? opts.id;
-    await engine.executeRaw(
+    await sourceNameWrite(
+      engine,
       `INSERT INTO sources (id, name, local_path, config)
            VALUES ($1, $2, $3, $4::text::jsonb)`,
       [opts.id, displayName, finalPath, JSON.stringify(config)],
+      opts.id,
+      displayName,
     );
   } else if (opts.meetings || opts.slack) {
     await insertApiSource(engine, opts, opts.slack ? 'slack' : 'meetings');
@@ -778,7 +793,8 @@ export async function addSource(
       // typed them). Unmentioned fields, other config keys, and pages all
       // survive. No JSON.stringify into ::jsonb — the federated flag merges
       // via jsonb_build_object on a bound boolean.
-      await engine.executeRaw(
+      await sourceNameWrite(
+        engine,
         `UPDATE sources
             SET local_path = $2,
                 name = COALESCE($3, name),
@@ -787,6 +803,8 @@ export async function addSource(
                                    || jsonb_build_object('federated', $4::boolean) END
           WHERE id = $1`,
         [opts.id, finalPath, opts.name ?? null, opts.federated ?? null],
+        opts.id,
+        opts.name,
       );
     } else {
       const config: Record<string, unknown> = {};
@@ -794,10 +812,13 @@ export async function addSource(
         config.federated = opts.federated;
       }
       const displayName = opts.name ?? opts.id;
-      await engine.executeRaw(
+      await sourceNameWrite(
+        engine,
         `INSERT INTO sources (id, name, local_path, config)
              VALUES ($1, $2, $3, $4::text::jsonb)`,
         [opts.id, displayName, finalPath, JSON.stringify(config)],
+        opts.id,
+        displayName,
       );
     }
   }

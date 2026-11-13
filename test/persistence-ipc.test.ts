@@ -265,11 +265,19 @@ describe('dedicated persistence IPC', () => {
     }) as typeof process.stderr.write;
     const requestId = '40000000-0000-4000-8000-000000000099';
     const secret = 'sk-ant-abcdefghijklmnop';
+    const digitless = `secret=${'a'.repeat(64)}`;
+    const detail = 'DETAIL: Key (name)=(user-example) already exists.';
+    const hint = 'HINT: see the server log';
+    const homePath = '/home/user-example/notes';
     try {
       const result = await startPersistenceIpcServer(path, {
         brainId: BRAIN,
         dispatch: async () => ({}),
-        administer: async () => { throw new Error(`duplicate key value violates unique constraint "sources_name_key" password=s3cret ${secret}`); },
+        administer: async () => {
+          const fault = new Error(`duplicate key value violates unique constraint "sources_name_key" password=s3cret ${secret} ${digitless} ${detail} ${hint} ${homePath}`);
+          Object.assign(fault, { code: '23505', constraint: 'sources_name_key', severity: 'ERROR' });
+          throw fault;
+        },
       });
       bindings.push(result!);
       const response = await rawExchange(path, JSON.stringify({
@@ -282,15 +290,18 @@ describe('dedicated persistence IPC', () => {
         error: { error: 'storage_error', message: 'The persistence owner could not complete this request.' },
       });
       const log = lines.join('');
-      expect(log.startsWith('[gbrain persistence] Error: ')).toBe(true);
-      expect(log).toContain('operation=source_add');
-      expect(log).toContain(`request_id=${requestId}`);
+      expect(log).toBe(`[gbrain persistence] Error code=23505 constraint=sources_name_key severity=ERROR operation=source_add request_id=${requestId}\n`);
       expect(log).not.toContain('s3cret');
       expect(log).not.toContain(secret);
+      expect(log).not.toContain(digitless);
+      expect(log).not.toContain('secret=');
+      expect(log).not.toContain('DETAIL');
+      expect(log).not.toContain('Key (name)');
+      expect(log).not.toContain('HINT');
+      expect(log).not.toContain('user-example');
+      expect(log).not.toContain(homePath);
       expect(log).not.toContain('do-not-log-this-param');
       expect(log.trim().split('\n')).toHaveLength(1);
-      const message = log.slice('[gbrain persistence] Error: '.length).split(' operation=')[0] ?? '';
-      expect(message.length).toBeLessThanOrEqual(300);
     } finally {
       process.stderr.write = write as typeof process.stderr.write;
     }

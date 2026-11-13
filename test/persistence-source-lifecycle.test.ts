@@ -60,10 +60,42 @@ test('add refuses a display name another source already holds',()=>fixture(async
   await runManagedSourceLifecycle(engine,{operation:'add',sourceId:'alpha-notes',path:other,name:'Shared Label'});
   const dup=join(home,'dup-root');mkdirSync(dup);writeFileSync(join(dup,'note.md'),'hello\n');
   await expect(runManagedSourceLifecycle(engine,{operation:'add',sourceId:'beta-notes',path:dup,name:'Shared Label',dryRun:true}))
-    .rejects.toMatchObject({name:'OperationError',code:'source_name_taken',retryable:false});
+    .rejects.toMatchObject({name:'OperationError',code:'source_name_taken',retryable:false,message:'Display name already in use.'});
   await expect(runManagedSourceLifecycle(engine,{operation:'add',sourceId:'beta-notes',path:dup,name:'Shared Label'}))
-    .rejects.toMatchObject({code:'source_name_taken'});
+    .rejects.toMatchObject({code:'source_name_taken',message:'Display name already in use.'});
   expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',['beta-notes'])).toHaveLength(0);
+}),60_000);
+
+test('claim of a source under its own id and display name succeeds',()=>fixture(async(_home,source,root)=>{
+  await expect(runManagedSourceLifecycle(engine,{operation:'claim',sourceId:source,path:root,name:source,dryRun:true}))
+    .resolves.toMatchObject({dry_run:true,source_id:source});
+  const claimed=await runManagedSourceLifecycle(engine,{operation:'claim',sourceId:source,path:root,name:source});
+  expect(claimed.source_id).toBe(source);
+  expect((await engine.executeRaw<{name:string}>('SELECT name FROM sources WHERE id=$1',[source]))[0]!.name).toBe(source);
+}),60_000);
+
+test('add by url refuses a taken display name, including a name taken during the clone',()=>fixture(async(home,source,root)=>{
+  await engine.executeRaw('UPDATE sources SET name=$2 WHERE id=$1',[source,'Shared Label']);
+  const blocked={operation:'add' as const,sourceId:'beta-notes',path:join(home,'url-clone'),remoteUrl:'https://example.invalid/brain.git',name:'Shared Label',requestId:randomUUID()};
+  const intent={...blocked,requestId:undefined,dryRun:undefined};
+  await expect(runManagedSourceClone(engine,{...blocked,dryRun:true},await topologyPrincipal(engine),blocked.requestId,intent))
+    .rejects.toMatchObject({code:'source_name_taken',message:'Display name already in use.'});
+  let cloned=false;
+  await expect(runManagedSourceClone(engine,blocked,await topologyPrincipal(engine),blocked.requestId,intent,{
+    clone:async()=>{cloned=true;},
+  })).rejects.toMatchObject({code:'source_name_taken'});
+  expect(cloned).toBe(false);
+  expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',['beta-notes'])).toHaveLength(0);
+  await engine.executeRaw('UPDATE sources SET name=$2 WHERE id=$1',[source,source]);
+  const raced={...blocked,sourceId:'gamma-notes',path:join(home,'url-clone-2'),requestId:randomUUID()};
+  await expect(runManagedSourceClone(engine,raced,await topologyPrincipal(engine),raced.requestId,{...raced,requestId:undefined,dryRun:undefined},{
+    clone:async(_url,stage)=>{
+      cpSync(root,stage,{recursive:true,filter:path=>!isPhysicalRootMetadata(basename(path))});
+      await engine.executeRaw('UPDATE sources SET name=$2 WHERE id=$1',[source,'Shared Label']);
+    },
+  })).rejects.toMatchObject({name:'OperationError',code:'source_name_taken',retryable:false,message:'Display name already in use.'});
+  expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',['gamma-notes'])).toHaveLength(0);
+  expect((await engine.executeRaw<{name:string}>('SELECT name FROM sources WHERE id=$1',[source]))[0]!.name).toBe('Shared Label');
 }),60_000);
 
 test('archive/restore advance topology and permanently invalidate accepted old bindings',()=>fixture(async(_home,source)=>{

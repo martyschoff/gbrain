@@ -16,6 +16,7 @@ import { topologyTransaction } from '../persistence/topology-transaction.ts';
 import { lockTopologyRows, lockTopologyPrincipal, topologyPrincipal, withTopologyLocks } from '../persistence/topology-locks.ts';
 import { priorTopologyChange, recordTopologyChange } from '../persistence/topology-receipts.ts';
 import { runManagedSourceLifecycle } from '../persistence/source-lifecycle.ts';
+import { refuseSourceNameRace } from '../source-name.ts';
 import { validateCompanyBrainPlan } from './inspection.ts';
 import { beginSourceIngestionReceipt, getSourceIngestionReceipt, linkSourceIngestionCheckpoints, type SourceIngestionFence } from './receipts.ts';
 import type { CompanyBrainPlan, PlanValidationResult } from './types.ts';
@@ -288,5 +289,5 @@ export async function admitCompanyBrain(engine: BrainEngine, input: CompanyBrain
     await recordTopologyChange(tx, { principal, requestId, intent, operation: 'company-brain-connect', sourceId: input.sourceId, incarnation, worktrees: [] },
       { source_id: input.sourceId, source_incarnation: incarnation, receipt_id: requestId });
     return { receiptId: requestId, sourceIncarnation: incarnation };
-  }), plan.revision!.git_root);
+  }), plan.revision!.git_root).catch(error => refuseSourceNameRace(engine, error, input.sourceId, input.sourceId));
 }
