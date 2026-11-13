@@ -16,7 +16,7 @@ export interface PutOutcome {
   ok: boolean;
   /** Exit 10: accepted, not committed. Retried next run. Not a failure and not counted. */
   pending: boolean;
-  /** Set only when the put failed. One redacted line: exit code, then JSON code/message or a short stderr/stdout clip. */
+  /** Set only when the put failed. One redacted line: exit code or kill signal, then a JSON code and message, or one stderr line. */
   detail?: string;
 }
 
@@ -30,6 +30,8 @@ export interface SpawnResult {
   code: number;
   stdout: string;
   stderr: string;
+  /** Set when the child was killed. The diagnostic names the signal instead of an exit code. */
+  signal?: string | null;
 }
 
 export type SpawnFn = (argv: string[]) => Promise<SpawnResult>;
@@ -45,10 +47,26 @@ export function addSourceArgv(bin: string, source: string, directory: string): s
 const ALREADY = /already registered|already exists|duplicate key/i;
 const PENDING_EXIT = 10;
 const CLI_SNIP = 300;
+const PIPE_CAP = 8 * 1024;
 
-/** redactSecrets, then any long token-shaped run. Never used on a page body. */
+/**
+ * Redact text that may be copied onto a warning. Page files are not read here.
+ * This does not stop a CLI from echoing a page, a path, or a secret, so callers
+ * keep stdout off the warning and only attach a short redacted stderr line or
+ * a JSON code plus message. argv is never appended.
+ */
 function redactCliText(text: string): string {
-  return redactSecrets(text).replace(/[A-Za-z0-9_-]{32,}/g, '[redacted]');
+  let out = redactSecrets(text);
+  out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1');
+  out = out.replace(/([?&](?:access_token|password|token|secret|bearer|key)=)[^&#\s]*/gi, '$1[redacted]');
+  out = out.replace(/\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[redacted]');
+  out = out.replace(/\S+@\S+/g, '[redacted]');
+  out = out.replace(/(?:\/home|\/Users)\/[^/\s]+/g, '~');
+  out = out.replace(/(^|[\s"'`(])(\/(?:[^\s/]+\/)*[^\s/]+)/g, (_match, lead: string, path: string) => {
+    const base = path.slice(path.lastIndexOf('/') + 1);
+    return `${lead}${base}`;
+  });
+  return out.replace(/[A-Za-z0-9+/=._~-]{24,}/g, '[redacted]');
 }
 
 function oneLine(text: string, max: number): string {
@@ -72,56 +90,98 @@ function asOpError(value: unknown): { code: string; message: string } | null {
   return { code: record.code, message: record.message };
 }
 
-function parseOpError(text: string): { code: string; message: string } | null {
-  const trimmed = text.trim();
-  if (!trimmed) return null;
-  const direct = asOpError(parseJson(trimmed));
-  if (direct) return direct;
-  for (const line of trimmed.split('\n')) {
-    const hit = asOpError(parseJson(line.trim()));
-    if (hit) return hit;
+function firstBalancedObject(text: string): unknown {
+  const start = text.indexOf('{');
+  if (start < 0) return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') depth++;
+    else if (char === '}') {
+      depth--;
+      if (depth === 0) return parseJson(text.slice(start, i + 1));
+    }
   }
-  const start = trimmed.indexOf('{');
-  const end = trimmed.lastIndexOf('}');
-  if (start >= 0 && end > start) return asOpError(parseJson(trimmed.slice(start, end + 1)));
-  return null;
+  return undefined;
 }
 
-/** First ~300 characters of stderr, then the same clip of stdout. */
-function fallbackText(stderr: string, stdout: string): string {
-  const err = oneLine(stderr, CLI_SNIP);
-  const out = oneLine(stdout, CLI_SNIP);
-  if (err && out) return `${err} ${out}`;
-  return err || out;
+/** One JSON value: the whole text, else the first JSON line, else the first balanced object. */
+function firstJsonValue(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const whole = parseJson(trimmed);
+  if (whole !== undefined) return whole;
+  for (const line of trimmed.split('\n')) {
+    const parsed = parseJson(line.trim());
+    if (parsed !== undefined) return parsed;
+  }
+  return firstBalancedObject(trimmed);
+}
+
+function parseOpError(text: string): { code: string; message: string } | null {
+  return asOpError(firstJsonValue(text));
+}
+
+function failureHead(result: SpawnResult): string {
+  if (result.signal) return `killed ${result.signal}`;
+  return `exit ${result.code}`;
+}
+
+function stderrLine(stderr: string): string {
+  const redacted = redactCliText(stderr);
+  const line = redacted.split(/\r?\n/).map((part) => part.trim()).find(Boolean) ?? '';
+  return oneLine(line, CLI_SNIP);
 }
 
 function failureDetail(result: SpawnResult): string {
-  const stdout = redactCliText(result.stdout);
-  const stderr = redactCliText(result.stderr);
-  const parsed = parseOpError(stdout) ?? parseOpError(stderr);
+  const head = failureHead(result);
+  const parsed = parseOpError(result.stdout) ?? parseOpError(result.stderr);
   if (parsed) {
     const code = oneLine(redactCliText(parsed.code), 80);
     const message = oneLine(redactCliText(parsed.message), CLI_SNIP);
-    const body = message ? `${code}: ${message}` : code;
-    return `exit ${result.code}, ${body}`;
+    return message ? `${head}, ${code}: ${message}` : `${head}, ${code}`;
   }
-  const text = fallbackText(stderr, stdout);
-  return text ? `exit ${result.code}, ${text}` : `exit ${result.code}`;
+  const line = stderrLine(result.stderr);
+  return line ? `${head}, ${line}` : head;
+}
+
+function pushCapped(chunks: Buffer[], state: { n: number }, chunk: Buffer): void {
+  if (state.n >= PIPE_CAP) return;
+  const room = PIPE_CAP - state.n;
+  const slice = chunk.length > room ? chunk.subarray(0, room) : chunk;
+  chunks.push(slice);
+  state.n += slice.length;
 }
 
 export function spawnGbrain(argv: string[]): Promise<SpawnResult> {
   return new Promise((resolvePromise) => {
+    // argv is the command. It is not copied into the result or the diagnostic.
     const child = spawn(argv[0]!, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
-    child.stdout.on('data', (chunk: Buffer) => out.push(chunk));
-    child.stderr.on('data', (chunk: Buffer) => err.push(chunk));
-    child.on('error', (error) => resolvePromise({ code: 127, stdout: '', stderr: redactSecrets(error.message) }));
-    child.on('close', (code) => {
+    const outBytes = { n: 0 };
+    const errBytes = { n: 0 };
+    child.stdout.on('data', (chunk: Buffer) => pushCapped(out, outBytes, chunk));
+    child.stderr.on('data', (chunk: Buffer) => pushCapped(err, errBytes, chunk));
+    child.on('error', (error) => resolvePromise({ code: 127, stdout: '', stderr: redactCliText(error.message) }));
+    child.on('close', (code, signal) => {
       resolvePromise({
         code: code ?? 1,
-        stdout: Buffer.concat(out).toString('utf8'),
-        stderr: redactSecrets(Buffer.concat(err).toString('utf8')),
+        stdout: redactCliText(Buffer.concat(out).toString('utf8')),
+        stderr: redactCliText(Buffer.concat(err).toString('utf8')),
+        ...(signal ? { signal } : {}),
       });
     });
   });

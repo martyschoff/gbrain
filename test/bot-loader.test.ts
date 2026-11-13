@@ -6,7 +6,7 @@ import { join, resolve, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import * as files from '../scripts/bot-loader/files.ts';
 import { loadConfig, assertRoutes } from '../scripts/bot-loader/config.ts';
-import { createGbrainClient, manifestCounts, putArgv, addSourceArgv } from '../scripts/bot-loader/gbrain-client.ts';
+import { createGbrainClient, manifestCounts, putArgv, addSourceArgv, spawnGbrain } from '../scripts/bot-loader/gbrain-client.ts';
 import { shareIsMounted } from '../scripts/bot-loader/host.ts';
 import { readManifest } from '../scripts/bot-loader/manifest.ts';
 import { csvToMarkdown, renderPage, sha256 } from '../scripts/bot-loader/render.ts';
@@ -332,21 +332,100 @@ describe('cli failure diagnostics', () => {
     expect(readFileSync(config.summaryPath, 'utf8')).toContain('put failed alpha/note');
   });
 
-  test('putPage uses stderr then stdout when the CLI output is not JSON', async () => {
+  test('putPage keeps one redacted stderr line and drops stdout', async () => {
     const noise = 'c'.repeat(40);
+    const page = 'page body that must stay out\n';
     const client = createGbrainClient('/usr/bin/gbrain', async () => ({
       code: 2,
-      stdout: 'plain stdout tail',
-      stderr: `gbrain: source directory is not writable ${noise}\n`,
+      stdout: page,
+      stderr: `gbrain: source directory is not writable ${noise}\nsecond line stays off the warning\n`,
     }));
     const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
     expect(put).toMatchObject({ ok: false, pending: false });
     expect(put.detail).toContain('exit 2');
     expect(put.detail).toContain('source directory is not writable');
-    expect(put.detail).toContain('plain stdout tail');
+    expect(put.detail).not.toContain(page.trim());
+    expect(put.detail).not.toContain('second line stays off');
     expect(put.detail).not.toContain(noise);
     expect(put.detail).toContain('[redacted]');
-    expect(put.detail?.indexOf('not writable')).toBeLessThan(put.detail?.indexOf('plain stdout tail') ?? -1);
+  });
+
+  test('diagnostics redact a short token, a url, an email, and a home path', async () => {
+    const shortToken = 'abcdefghijklmnop';
+    const page = 'stdout is the page body\n';
+    const stderr = [
+      `auth failed https://user-example:x@host.example/db?access_token=${shortToken} user-example@mail.example Cannot read /home/user-example/note.md`,
+      'second-line-marker',
+    ].join('\n');
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: page,
+      stderr,
+    }));
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put.detail).toContain('exit 1');
+    expect(put.detail).toContain('auth failed');
+    expect(put.detail).toContain('~/note.md');
+    expect(put.detail).not.toContain(shortToken);
+    expect(put.detail).not.toContain('user-example');
+    expect(put.detail).not.toContain('mail.example');
+    expect(put.detail).not.toContain('/home/');
+    expect(put.detail).not.toContain(page.trim());
+    expect(put.detail).not.toContain('second-line-marker');
+  });
+
+  test('a numeric JSON code falls back to stderr and a second object is ignored', async () => {
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 4,
+      stdout: '{"code":1,"message":"numeric code message"}\n{"argv":["token-example-should-not-leak"]}\n',
+      stderr: 'caller rejected the write\n',
+    }));
+    const numeric = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(numeric).toMatchObject({ ok: false, pending: false });
+    expect(numeric.detail).toContain('exit 4');
+    expect(numeric.detail).toContain('caller rejected the write');
+    expect(numeric.detail).not.toContain('numeric code message');
+    expect(numeric.detail).not.toContain('token-example-should-not-leak');
+
+    const wrapped = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: 'note {"code":"live_serve","message":"busy"} trailing {"argv":["also-not-logged"]}',
+      stderr: '',
+    }));
+    const parsed = await wrapped.ensureSource('finance', '/tmp/finance') as { ok: boolean; detail?: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.detail).toContain('exit 1, live_serve: busy');
+    expect(parsed.detail).not.toContain('also-not-logged');
+    expect(parsed.detail).not.toContain('trailing');
+  });
+
+  test('a kill signal is named and a huge pipe is capped before redaction', async () => {
+    const killed = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      signal: 'SIGTERM',
+      stdout: 'should-not-copy-stdout',
+      stderr: 'terminated\n',
+    }));
+    const put = await killed.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put.detail).toContain('killed SIGTERM');
+    expect(put.detail).toContain('terminated');
+    expect(put.detail).not.toContain('should-not-copy-stdout');
+    expect(put.detail).not.toContain('exit 1');
+
+    const token = 'd'.repeat(40);
+    const result = await spawnGbrain([
+      process.execPath,
+      '-e',
+      `/* argv-marker-zz */ process.stdout.write(${JSON.stringify(token)} + ' ' + 'A '.repeat(10000)); process.stderr.write('B '.repeat(10000)); process.kill(process.pid, 'SIGKILL');`,
+    ]);
+    expect(result.signal).toBe('SIGKILL');
+    expect(result.stdout.length).toBeLessThanOrEqual(8192);
+    expect(result.stderr.length).toBeLessThanOrEqual(8192);
+    expect(result.stdout.length).toBeGreaterThan(1000);
+    expect(result.stdout).not.toContain(token);
+    expect(result.stdout).toContain('[redacted]');
+    expect(result.stdout).not.toContain('argv-marker-zz');
+    expect(result.stderr).not.toContain('argv-marker-zz');
   });
 });
 
