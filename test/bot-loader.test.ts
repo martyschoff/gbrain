@@ -198,7 +198,7 @@ describe('classification', () => {
     return client.ensureSource('finance', '/tmp/finance').then(async () => {
       expect((await client.putPage('finance', 'ledger/feeds/prices', '/tmp/prices.md')).ok).toBe(true);
       const failed = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 1, stdout: '', stderr: '' }));
-      expect(await failed.putPage('finance', 'ledger/failed', '/tmp/failed.md')).toEqual({ ok: false, pending: false });
+      expect(await failed.putPage('finance', 'ledger/failed', '/tmp/failed.md')).toEqual({ ok: false, pending: false, detail: 'exit 1' });
       const pending = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 10, stdout: '', stderr: '' }));
       expect(await pending.putPage('finance', 'ledger/pending', '/tmp/pending.md')).toEqual({ ok: false, pending: true });
       const kept = join(temp('gbrain-count-'), 'kept.md');
@@ -219,6 +219,134 @@ describe('classification', () => {
       expect(counts.via).toBe('pages written by the loader (manifest)');
       expect(recorded.some((argv) => argv.includes('stats') || argv.includes('list') || argv.includes('--no-delegate') || argv.includes('push'))).toBe(false);
     });
+  });
+});
+
+describe('cli failure diagnostics', () => {
+  const stamp = '2026-11-12T02:00:00-05:00';
+  const token = 'b'.repeat(40);
+
+  function writeDrop(dir: string): void {
+    const files: Record<string, string> = {
+      'profile.json': '{"id":"bot-a","name":"Bot A"}\n',
+      'memory.md': '# Memory\n\n## 2026-11-12\n\nA fake fact.\n',
+      'routines.md': '# Routines\n\n## morning\n\n- schedule: 0 2 * * *\n- prompt: Summarize the day.\n',
+    };
+    const listed: Record<string, { size: number; sha256: string }> = {};
+    for (const [rel, text] of Object.entries(files)) {
+      write(join(dir, rel), text);
+      const buf = Buffer.from(text);
+      listed[rel] = { size: buf.length, sha256: sha256(buf) };
+    }
+    write(join(dir, 'manifest.json'), `${JSON.stringify({
+      version: 1,
+      bot_name: 'Bot A',
+      bot_id: 'bot-a',
+      account: 'account-a',
+      exported_at: stamp,
+      files: listed,
+    })}\n`);
+  }
+
+  test('ensureSource failure names the exit code and redacts a long stderr token', async () => {
+    const home = temp('gbrain-loader-src-fail-');
+    const share = join(home, 'share');
+    writeDrop(join(share, 'drops', '_box-export', 'bot-a'));
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const config = baseConfig(home, share, {
+      export_roots: [{
+        account: 'account-a',
+        path: join(share, 'drops', '_box-export'),
+        source: 'account-a',
+        target_root: join(share, 'pages-a'),
+        ensure_source: true,
+      }],
+    });
+    const brain = createGbrainClient('/usr/bin/gbrain', async (argv) => {
+      if (argv[3] === 'account-a') {
+        return {
+          code: 1,
+          stdout: JSON.stringify({
+            code: 'writer_manifest_unsafe',
+            message: `checkout refused ${token}`,
+            suggestion: 'inspect the checkout',
+          }),
+          stderr: `refused ${token}\n`,
+        };
+      }
+      return { code: 0, stdout: '{"ok":true}', stderr: '' };
+    });
+    const direct = await brain.ensureSource('account-a', join(share, 'pages-a')) as { ok: boolean; detail?: string };
+    expect(direct.ok).toBe(false);
+    expect(direct.detail).toContain('exit 1');
+    expect(direct.detail).toContain('writer_manifest_unsafe');
+    expect(direct.detail).toContain('[redacted]');
+    expect(direct.detail).not.toContain(token);
+    expect(direct.detail).not.toContain('inspect the checkout');
+    const result = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain,
+      now: new Date('2026-11-12T12:00:00Z'),
+    });
+    expect(result.summaryText).toContain('WARN export account-a: source not created (exit 1, writer_manifest_unsafe:');
+    expect(result.summaryText).not.toContain(token);
+    expect(result.summaryText).not.toContain('A fake fact');
+    expect(readFileSync(config.summaryPath, 'utf8')).toContain('exit 1, writer_manifest_unsafe');
+    const exists = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 1, stdout: '', stderr: 'source already exists\n' }));
+    expect((await exists.ensureSource('finance', '/tmp/finance')).ok).toBe(true);
+  });
+
+  test('putPage failure names the exit code on the warning', async () => {
+    const home = temp('gbrain-loader-put-fail-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    write(join(share, 'personalgrok/alpha/note.md'), 'hello from the note\n');
+    const config = baseConfig(home, share);
+    const brain = createGbrainClient('/usr/bin/gbrain', async (argv) => {
+      if (argv.includes('put')) {
+        return {
+          code: 1,
+          stdout: JSON.stringify({ code: 'live_serve', message: 'the brain is busy', suggestion: 'retry later' }),
+          stderr: 'Error [live_serve]: the brain is busy\n',
+        };
+      }
+      return { code: 0, stdout: '{"ok":true}', stderr: '' };
+    });
+    const put = await brain.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put).toMatchObject({ ok: false, pending: false });
+    expect(put.detail).toContain('exit 1');
+    expect(put.detail).toContain('live_serve');
+    expect(put.detail).toContain('the brain is busy');
+    expect(put.detail).not.toContain('retry later');
+    const result = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain,
+      now: new Date('2026-11-12T12:00:00Z'),
+    });
+    expect(result.summaryText).toContain('WARN put failed alpha/note (exit 1, live_serve: the brain is busy)');
+    expect(result.summaryText).not.toContain('hello from the note');
+    expect(readFileSync(config.summaryPath, 'utf8')).toContain('put failed alpha/note');
+  });
+
+  test('putPage uses stderr then stdout when the CLI output is not JSON', async () => {
+    const noise = 'c'.repeat(40);
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 2,
+      stdout: 'plain stdout tail',
+      stderr: `gbrain: source directory is not writable ${noise}\n`,
+    }));
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put).toMatchObject({ ok: false, pending: false });
+    expect(put.detail).toContain('exit 2');
+    expect(put.detail).toContain('source directory is not writable');
+    expect(put.detail).toContain('plain stdout tail');
+    expect(put.detail).not.toContain(noise);
+    expect(put.detail).toContain('[redacted]');
+    expect(put.detail?.indexOf('not writable')).toBeLessThan(put.detail?.indexOf('plain stdout tail') ?? -1);
   });
 });
 
