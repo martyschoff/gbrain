@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { basename, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath } from 'node:path';
 import type { LoaderConfig, GroupConfig } from './config.ts';
 import { assertRoutes } from './config.ts';
 import { isInside, toPosix, writeAtomic } from './files.ts';
@@ -8,6 +8,7 @@ import { acquireLock, LockBusy, readExpectedHost, serveLockHeld, shareIsMounted,
 import type { BrainClient } from './gbrain-client.ts';
 import { createGbrainClient } from './gbrain-client.ts';
 import { readManifest, writeManifest, type Manifest, type ManifestEntry } from './manifest.ts';
+import { openStage, publishPage, type PublishResult } from './publish.ts';
 import { bodyForExtension, pageSlug, renderPage, sha256 } from './render.ts';
 import { checkFailClosed, type PlannedFile } from './fail-closed.ts';
 import { planExportRoots, type ExportPage } from './multi-account.ts';
@@ -32,6 +33,13 @@ export interface RunResult {
   summaryText: string;
 }
 
+interface PublishEnv {
+  stageDir: string;
+  holdDir?: string;
+  warnings: string[];
+  statePath: string;
+}
+
 function mdRelative(relativePosix: string): string {
   const slash = relativePosix.lastIndexOf('/');
   const dir = slash >= 0 ? relativePosix.slice(0, slash + 1) : '';
@@ -49,12 +57,22 @@ function originOf(shareRoot: string, absolute: string, botId: string, index: num
 function boxWarning(directory: string, maxAgeHours: number, now: Date): string | null {
   if (!existsSync(directory)) return 'box-export missing';
   const stamp = join(directory, 'EXPORTED_AT');
-  if (!existsSync(stamp)) return 'box-export stamp missing';
+  if (!existsSync(stamp)) {
+    if (perBotDrop(directory)) return null;
+    return 'box-export stamp missing';
+  }
   const first = readFileSync(stamp, 'utf8').split(/\r?\n/)[0]?.trim() ?? '';
   const when = Date.parse(first);
   if (Number.isNaN(when)) return 'box-export stamp missing';
   if (now.getTime() - when > maxAgeHours * 60 * 60 * 1000) return 'box-export stale';
   return null;
+}
+
+/** A per-bot drop has a `manifest.json` in each bot folder and no top-level `EXPORTED_AT`. */
+function perBotDrop(directory: string): boolean {
+  let names: string[] = [];
+  try { names = readdirSync(directory); } catch { return false; }
+  return names.some((name) => existsSync(join(directory, name, 'manifest.json')));
 }
 
 function assertDestination(groups: GroupConfig[], group: GroupConfig, output: string): void {
@@ -140,6 +158,17 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
   if (box) warnings.push(box);
   if (serveHeld) warnings.push('live brain totals are unavailable while serve runs');
   const manifest = readManifest(config.statePath);
+  const roots = [...config.groups.map((group) => group.targetRoot), ...config.exportRoots.map((root) => root.targetRoot)];
+  const stage = openStage(roots, dirname(config.statePath));
+  const holdDir = join(dirname(config.statePath), 'loader-held');
+  const holdOutside = roots.every((root) => root && !isInside(root, holdDir) && !isInside(holdDir, root));
+  const env: PublishEnv = {
+    stageDir: stage.dir,
+    ...(holdOutside ? { holdDir } : {}),
+    warnings,
+    statePath: config.statePath,
+  };
+  try {
   const seen = new Set<string>();
   const bots: BotSummary[] = [];
   const skips: string[] = [];
@@ -148,7 +177,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
 
   for (const group of config.groups) {
     if (group.failClosed) {
-      const closed = await runFailClosedGroup(config, group, brain, manifest, seen, now, warnings);
+      const closed = await runFailClosedGroup(config, group, brain, manifest, seen, now, env);
       bots.push(...closed.bots);
       if (closed.skip) skips.push(`SKIP ${group.source}: ${closed.skip}`);
       if (!closed.putOk) ok = false;
@@ -212,9 +241,9 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
             n++;
           }
           claimed.add(outputRel);
-          const output = join(group.targetRoot, bot.id, outputRel);
-          assertDestination(config.groups, group, output);
           const slug = `${bot.id}/${pageSlug(outputRel)}`;
+          const output = join(group.targetRoot, `${slug}.md`);
+          assertDestination(config.groups, group, output);
           if (prior && prior.sha256 === digest && prior.inBrain && prior.output === output && prior.slug === slug) {
             summary.unchanged++;
             continue;
@@ -230,28 +259,19 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
           });
           if (pageSlug(`${bot.id}/${outputRel}`) !== slug) throw new Error('slug drifted from the output path');
           if (!slug.startsWith(`${bot.id}/`) || !isInside(group.targetRoot, output)) throw new Error('route check failed');
-          writeAtomic(output, page, 0o644);
-          const put = await brain.putPage(group.source, slug, output);
-          const attempts = put.pending ? (prior && prior.sha256 === digest ? (prior.pendingAttempts ?? 0) : 0) + 1 : 0;
-          const entry: ManifestEntry = {
+          const published = await publishPage({
+            brain, source: group.source, slug, canonicalPath: output, body: page, stageDir: env.stageDir,
+            prior, manifest, warnings, holdDir: env.holdDir,
+          });
+          const wrote = notePublish(manifest, summary, file.absolute, prior, {
             sha256: digest,
             bot: bot.id,
             source: group.source,
             slug,
             output,
             originRelpath: originOf(config.shareRoot, file.absolute, bot.id, index, file.relativePosix),
-            inBrain: put.ok,
-            pending: put.pending,
-            ...(put.pending ? { pendingAttempts: attempts } : {}),
-          };
-          manifest.files[file.absolute] = entry;
-          if (put.pending) continue;
-          if (!put.ok) {
-            warnings.push(withCliDetail(`put failed ${slug}`, put.detail));
-            ok = false;
-            continue;
-          }
-          summary.written++;
+          }, published, env.statePath);
+          if (!wrote) ok = false;
         }
       }
       summary.pages = 0;
@@ -283,7 +303,7 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
     }
     for (const bot of root.bots) {
       for (const page of bot.pages) {
-        const wrote = await commitExport(config, brain, manifest, seen, bot.summary, page, warnings);
+        const wrote = await commitExport(config, brain, manifest, seen, bot.summary, page, env);
         if (!wrote) ok = false;
       }
       bots.push(bot.summary);
@@ -313,6 +333,9 @@ async function runLocked(config: LoaderConfig, brain: BrainClient, now: Date, se
   const text = formatSummary(summary);
   writeAtomic(config.summaryPath, text, 0o600);
   return { exitCode: ok ? 0 : 1, summaryText: text };
+  } finally {
+    stage.close();
+  }
 }
 
 async function runFailClosedGroup(
@@ -322,7 +345,7 @@ async function runFailClosedGroup(
   manifest: Manifest,
   seen: Set<string>,
   now: Date,
-  warnings: string[],
+  env: PublishEnv,
 ): Promise<{ bots: BotSummary[]; skip: string | null; putOk: boolean }> {
   const blanks = () => group.bots.map((bot) => emptyBot(bot.id, group.source));
   if (group.bots.length === 0) return { bots: [], skip: 'no bots named', putOk: true };
@@ -344,7 +367,7 @@ async function runFailClosedGroup(
     const summary = summaries.get(file.botId);
     if (!summary) return { bots: blanks(), skip: 'route', putOk: true };
     summary.scanned++;
-    const wrote = await commitPlanned(config, group, brain, manifest, seen, summary, file, warnings);
+    const wrote = await commitPlanned(config, group, brain, manifest, seen, summary, file, env);
     if (!wrote) putOk = false;
   }
   return { bots: group.bots.map((bot) => summaries.get(bot.id)!), skip: null, putOk };
@@ -358,13 +381,14 @@ async function commitPlanned(
   seen: Set<string>,
   summary: BotSummary,
   file: PlannedFile,
-  warnings: string[],
+  env: PublishEnv,
 ): Promise<boolean> {
   const digest = sha256(file.bytes);
   seen.add(file.absolute);
   const prior = manifest.files[file.absolute];
   const slug = `${file.botId}/${pageSlug(file.outputRel)}`;
-  if (prior && prior.sha256 === digest && prior.inBrain && prior.output === file.outputPath && prior.slug === slug) {
+  const output = join(group.targetRoot, `${slug}.md`);
+  if (prior && prior.sha256 === digest && prior.inBrain && prior.output === output && prior.slug === slug) {
     summary.unchanged++;
     return true;
   }
@@ -377,28 +401,19 @@ async function commitPlanned(
     body: bodyForExtension(ext, file.bytes.toString('utf8'), config.csvMaxRows),
   });
   if (pageSlug(`${file.botId}/${file.outputRel}`) !== slug) throw new Error('slug drifted from the output path');
-  writeAtomic(file.outputPath, page, 0o644);
-  const put = await brain.putPage(group.source, slug, file.outputPath);
-  const attempts = put.pending ? (prior && prior.sha256 === digest ? (prior.pendingAttempts ?? 0) : 0) + 1 : 0;
-  const entry: ManifestEntry = {
+  if (!isInside(group.targetRoot, output)) throw new Error('route check failed');
+  const published = await publishPage({
+    brain, source: group.source, slug, canonicalPath: output, body: page, stageDir: env.stageDir,
+    prior, manifest, warnings: env.warnings, holdDir: env.holdDir,
+  });
+  return notePublish(manifest, summary, file.absolute, prior, {
     sha256: digest,
     bot: file.botId,
     source: group.source,
     slug,
-    output: file.outputPath,
+    output,
     originRelpath: originOf(config.shareRoot, file.absolute, file.botId, file.inputIndex, file.relativePosix),
-    inBrain: put.ok,
-    pending: put.pending,
-    ...(put.pending ? { pendingAttempts: attempts } : {}),
-  };
-  manifest.files[file.absolute] = entry;
-  if (put.pending) return true;
-  if (!put.ok) {
-    warnings.push(withCliDetail(`put failed ${slug}`, put.detail));
-    return false;
-  }
-  summary.written++;
-  return true;
+  }, published, env.statePath);
 }
 
 async function commitExport(
@@ -408,15 +423,15 @@ async function commitExport(
   seen: Set<string>,
   summary: BotSummary,
   page: ExportPage,
-  warnings: string[],
+  env: PublishEnv,
 ): Promise<boolean> {
   const digest = sha256(page.bytes);
   seen.add(page.absolute);
   const owner = destinationGroup(config, page);
   const relativeMd = mdRelative(page.relativePosix);
-  const output = join(owner.targetRoot, page.account, page.botId, relativeMd);
-  assertDestination(config.groups.concat(owner), owner, output);
   const slug = `${page.account}/${page.botId}/${pageSlug(relativeMd)}`;
+  const output = join(owner.targetRoot, `${slug}.md`);
+  assertDestination(config.groups.concat(owner), owner, output);
   const prior = manifest.files[page.absolute];
   if (prior && prior.sha256 === digest && prior.inBrain && prior.output === output && prior.slug === slug) {
     summary.unchanged++;
@@ -435,28 +450,18 @@ async function commitExport(
     botName: page.botName,
   });
   if (pageSlug(`${page.account}/${page.botId}/${relativeMd}`) !== slug) throw new Error('slug drifted from the output path');
-  writeAtomic(output, rendered, 0o644);
-  const put = await brain.putPage(page.source, slug, output);
-  const attempts = put.pending ? (prior && prior.sha256 === digest ? (prior.pendingAttempts ?? 0) : 0) + 1 : 0;
-  const entry: ManifestEntry = {
+  const published = await publishPage({
+    brain, source: page.source, slug, canonicalPath: output, body: rendered, stageDir: env.stageDir,
+    prior, manifest, warnings: env.warnings, holdDir: env.holdDir,
+  });
+  return notePublish(manifest, summary, page.absolute, prior, {
     sha256: digest,
     bot: `${page.account}/${page.botId}`,
     source: page.source,
     slug,
     output,
     originRelpath: origin,
-    inBrain: put.ok,
-    pending: put.pending,
-    ...(put.pending ? { pendingAttempts: attempts } : {}),
-  };
-  manifest.files[page.absolute] = entry;
-  if (put.pending) return true;
-  if (!put.ok) {
-    warnings.push(withCliDetail(`put failed ${slug}`, put.detail));
-    return false;
-  }
-  summary.written++;
-  return true;
+  }, published, env.statePath);
 }
 
 function destinationGroup(config: LoaderConfig, page: ExportPage): GroupConfig {
@@ -477,6 +482,35 @@ function destinationGroup(config: LoaderConfig, page: ExportPage): GroupConfig {
 function originOfExport(shareRoot: string, absolute: string, account: string, botId: string, relativePosix: string): string {
   if (isInside(shareRoot, absolute)) return toPosix(relative(shareRoot, absolute));
   return `external/${account}/${botId}/${relativePosix}`;
+}
+
+function notePublish(
+  manifest: Manifest,
+  summary: BotSummary,
+  key: string,
+  prior: ManifestEntry | undefined,
+  base: Omit<ManifestEntry, 'inBrain' | 'pending' | 'pendingAttempts' | 'revision'>,
+  result: PublishResult,
+  statePath: string,
+): boolean {
+  if (result.status === 'skipped') return false;
+  if (result.status === 'failed' && prior?.inBrain) return false;
+  const attempts = result.status === 'pending'
+    ? (prior && prior.sha256 === base.sha256 ? (prior.pendingAttempts ?? 0) : 0) + 1
+    : 0;
+  const entry: ManifestEntry = {
+    ...base,
+    inBrain: result.status === 'written',
+    pending: result.status === 'pending',
+    ...(result.status === 'pending' ? { pendingAttempts: attempts } : {}),
+    ...(result.status === 'written' && result.revision ? { revision: result.revision } : {}),
+  };
+  manifest.files[key] = entry;
+  if (result.status === 'pending') return true;
+  if (result.status !== 'written') return false;
+  writeManifest(statePath, manifest);
+  summary.written++;
+  return true;
 }
 
 function emptyBot(id: string, source: string): BotSummary {

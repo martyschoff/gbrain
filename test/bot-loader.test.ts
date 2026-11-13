@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
@@ -8,7 +8,7 @@ import * as files from '../scripts/bot-loader/files.ts';
 import { loadConfig, assertRoutes } from '../scripts/bot-loader/config.ts';
 import { createGbrainClient, manifestCounts, putArgv, addSourceArgv, spawnGbrain } from '../scripts/bot-loader/gbrain-client.ts';
 import { shareIsMounted } from '../scripts/bot-loader/host.ts';
-import { readManifest } from '../scripts/bot-loader/manifest.ts';
+import { readManifest, writeManifest } from '../scripts/bot-loader/manifest.ts';
 import { csvToMarkdown, renderPage, sha256 } from '../scripts/bot-loader/render.ts';
 import { checkFailClosed } from '../scripts/bot-loader/fail-closed.ts';
 import { runLoader } from '../scripts/bot-loader/run.ts';
@@ -98,11 +98,14 @@ function baseConfig(home: string, share: string, extra: Record<string, unknown> 
   return loadConfig(path, home);
 }
 
-function fakeBrain(): { brain: BrainClient; puts: { source: string; slug: string; file: string }[] } {
-  const puts: { source: string; slug: string; file: string }[] = [];
+function fakeBrain(): { brain: BrainClient; puts: { source: string; slug: string; file: string; text: string; revision?: string }[] } {
+  const puts: { source: string; slug: string; file: string; text: string; revision?: string }[] = [];
   const brain: BrainClient = {
     async ensureSource() { return { ok: true }; },
-    async putPage(source, slug, file) { puts.push({ source, slug, file }); return { ok: true, pending: false }; },
+    async putPage(source, slug, file, revision) {
+      puts.push({ source, slug, file, text: existsSync(file) ? readFileSync(file, 'utf8') : '', revision });
+      return { ok: true, pending: false, revision: '00000000-0000-4000-8000-000000000001' };
+    },
     async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
   };
   return { brain, puts };
@@ -185,7 +188,11 @@ describe('classification', () => {
 
   test('put argv stays on the group source and never delegates away from the owner', () => {
     expect(putArgv('gbrain', 'finance', 'fin-bot/feeds/prices', '/tmp/prices.md')).toEqual([
-      'gbrain', '--source', 'finance', 'put', 'fin-bot/feeds/prices', '--file', '/tmp/prices.md', '--json',
+      'gbrain', 'put', 'fin-bot/feeds/prices', '--source', 'finance', '--file', '/tmp/prices.md', '--json',
+    ]);
+    expect(putArgv('gbrain', 'finance', 'fin-bot/feeds/prices', '/tmp/prices.md', '00000000-0000-4000-8000-000000000001')).toEqual([
+      'gbrain', 'put', 'fin-bot/feeds/prices', '--source', 'finance', '--file', '/tmp/prices.md',
+      '--expected-revision', '00000000-0000-4000-8000-000000000001', '--json',
     ]);
     expect(addSourceArgv('gbrain', 'finance', '/tmp/finance').join(' ')).not.toContain('--url');
     expect(addSourceArgv('gbrain', 'finance', '/tmp/finance')).toContain('--force');
@@ -199,6 +206,18 @@ describe('classification', () => {
       expect((await client.putPage('finance', 'ledger/feeds/prices', '/tmp/prices.md')).ok).toBe(true);
       const failed = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 1, stdout: '', stderr: '' }));
       expect(await failed.putPage('finance', 'ledger/failed', '/tmp/failed.md')).toEqual({ ok: false, pending: false, detail: 'exit 1' });
+      const occupied = createGbrainClient('/usr/bin/gbrain', async () => ({
+        code: 1,
+        stdout: '{"code":"source_changed","message":"An unindexed file already occupies /home/acct-example/note.md"}',
+        stderr: 'Error [source_changed]: /home/acct-example/note.md',
+      }));
+      const refused = await occupied.putPage('finance', 'ledger/occupied', '/tmp/occupied.md');
+      expect(refused.ok).toBe(false);
+      expect(refused.pending).toBe(false);
+      expect(refused.code).toBe('source_changed');
+      expect(refused.detail).toContain('exit 1, source_changed');
+      expect(refused.detail).not.toContain('acct-example');
+      expect(refused.detail).not.toContain('/home');
       const pending = createGbrainClient('/usr/bin/gbrain', async () => ({ code: 10, stdout: '', stderr: '' }));
       expect(await pending.putPage('finance', 'ledger/pending', '/tmp/pending.md')).toEqual({ ok: false, pending: true });
       const kept = join(temp('gbrain-count-'), 'kept.md');
@@ -223,6 +242,56 @@ describe('classification', () => {
 });
 
 describe('cli failure diagnostics', () => {
+  test('a uuid revision is parsed from raw stdout before redaction', async () => {
+    const rev = '11111111-2222-4333-8444-555555555555';
+    const home = temp('gbrain-loader-uuid-');
+    const bin = join(home, 'gbrain-bin');
+    writeFileSync(bin, `#!/bin/bash\nprintf '%s' '{"ok":true,"revision":"${rev}"}'\n`);
+    chmodSync(bin, 0o755);
+    const client = createGbrainClient(bin);
+    const put = await client.putPage('personal', 'alpha/note', join(home, 'note.md'));
+    expect(put.ok).toBe(true);
+    expect(put.revision).toBe(rev);
+    const read = await client.getRevision!('personal', 'alpha/note');
+    expect(read).toEqual({ ok: true, revision: rev });
+    const spawned = await spawnGbrain([bin, 'put', 'alpha/note', '--json']);
+    expect(spawned.revision).toBe(rev);
+    expect(spawned.stdout).not.toContain(rev);
+    expect(spawned.stdout).toContain('[redacted]');
+  });
+
+  test('a hung child is killed at the timeout and the loader lock is released', async () => {
+    const hung = await spawnGbrain([process.execPath, '-e', 'setTimeout(() => {}, 30000)'], { timeoutMs: 200 });
+    expect(hung.timedOut).toBe(true);
+    const client = createGbrainClient('/usr/bin/gbrain', async () => hung);
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md');
+    expect(put.ok).toBe(false);
+    expect(put.pending).toBe(false);
+    expect(put.detail).toContain('timeout');
+    expect(put.detail).not.toContain('/tmp/note.md');
+
+    const home = temp('gbrain-loader-timeout-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    write(join(share, 'personalgrok/alpha/local.md'), 'keep\n');
+    const config = baseConfig(home, share);
+    const slow = createGbrainClient(process.execPath, () => spawnGbrain(
+      [process.execPath, '-e', 'setTimeout(() => {}, 30000)'],
+      { timeoutMs: 200 },
+    ));
+    const failed = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain: slow, now: new Date('2026-11-11T00:00:00Z') });
+    expect(failed.exitCode).toBe(1);
+    expect(failed.summaryText).toContain('timeout');
+    const next = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain: fakeBrain().brain,
+      now: new Date('2026-11-11T01:00:00Z'),
+    });
+    expect(next.exitCode).toBe(0);
+  });
+
   const stamp = '2026-11-12T02:00:00-05:00';
   const token = 'b'.repeat(40);
 
@@ -607,27 +676,27 @@ describe('loader run', () => {
     expect(first.summaryText).not.toContain('sk-abc');
     expect(first.summaryText).not.toContain('Hello from alpha');
     expect(first.summaryText).not.toContain('[redacted]');
-    const personalPage = join(share, 'personalgrok/gbrain/personal/alpha/Hello World.md');
-    const financePage = join(share, 'personalgrok/gbrain/finance/ledger/feeds/prices.md');
-    expect(existsSync(personalPage)).toBe(true);
-    expect(existsSync(financePage)).toBe(true);
-    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/only.md'))).toBe(false);
-    expect(existsSync(join(share, 'personalgrok/gbrain/finance/ledger/cache.md'))).toBe(false);
-    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/automations/plan.md'))).toBe(false);
-    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/secret.md'))).toBe(false);
-    const notesPage = readFileSync(join(share, 'personalgrok/gbrain/personal/alpha/notes.md'), 'utf8');
+    const personalRoot = join(share, 'personalgrok/gbrain/personal');
+    const financeRoot = join(share, 'personalgrok/gbrain/finance');
+    const staged = (slug: string) => puts.find((put) => put.slug === slug)?.text ?? '';
+    expect(existsSync(join(personalRoot, 'alpha/hello-world.md'))).toBe(false);
+    expect(existsSync(join(financeRoot, 'ledger/feeds/prices.md'))).toBe(false);
+    expect(existsSync(join(personalRoot, 'alpha/only.md'))).toBe(false);
+    expect(existsSync(join(financeRoot, 'ledger/cache.md'))).toBe(false);
+    expect(existsSync(join(personalRoot, 'alpha/automations/plan.md'))).toBe(false);
+    expect(existsSync(join(personalRoot, 'alpha/secret.md'))).toBe(false);
+    const notesPage = staged('alpha/notes');
     expect(notesPage).toContain('The token in this sentence is a word.');
     expect(notesPage).not.toContain('[redacted]');
-    const page = readFileSync(personalPage, 'utf8');
+    const page = staged('alpha/hello-world');
     expect(page).toContain('slug: alpha/hello-world');
     expect(page).toContain(`origin_sha256: "${sha256(readFileSync(note))}"`);
     expect(page).toContain('origin_relpath: "personalgrok/alpha/Hello World.md"');
     expect(page).not.toContain('slug: hijack');
-    expect(readFileSync(financePage, 'utf8')).toContain('_Truncated after 1 data rows._');
+    expect(staged('ledger/feeds/prices')).toContain('_Truncated after 1 data rows._');
     expect(puts.map((put) => put.source).sort()).toEqual(['finance', 'personal', 'personal', 'personal']);
-    expect(puts.every((put) => put.source !== 'personal' || !put.file.includes(`${join('gbrain', 'finance')}`))).toBe(true);
-    expect(puts.filter((put) => put.source === 'finance').every((put) => put.file.startsWith(join(share, 'personalgrok/gbrain/finance')))).toBe(true);
-    expect(puts.some((put) => put.source === 'personal' && put.file.includes(`${join('gbrain', 'finance')}`))).toBe(false);
+    expect(puts.every((put) => !put.file.startsWith(personalRoot) && !put.file.startsWith(financeRoot))).toBe(true);
+    expect(puts.every((put) => put.revision === undefined)).toBe(true);
     expect(statSync(note).mtimeMs).toBe(before);
     expect(statSync(join(home, 'state.json')).mode & 0o777).toBe(0o600);
 
@@ -641,11 +710,13 @@ describe('loader run', () => {
     writeFileSync(note, removed);
     const { unlinkSync } = await import('node:fs');
     unlinkSync(note);
+    const kept = join(share, 'personalgrok/gbrain/personal/alpha/hello-world.md');
+    write(kept, 'left on disk\n');
     const third = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T02:00:00Z') });
     expect(third.summaryText).toContain('orphaned alpha 1');
     expect(third.summaryText).toContain('bot alpha source=personal scanned=5 written=0 unchanged=1 skipped=2 secrets_skipped=2 pages=1');
     expect(third.summaryText).toContain('source personal pages=2 via=pages written by the loader (manifest)');
-    expect(existsSync(personalPage)).toBe(true);
+    expect(readFileSync(kept, 'utf8')).toBe('left on disk\n');
     expect(puts).toHaveLength(4);
     expect(readManifest(join(home, 'state.json')).files[note]?.originRelpath).toContain('Hello World.md');
   });
@@ -667,8 +738,8 @@ describe('loader run', () => {
     expect(result.summaryText).toContain('WARN box-export stale');
     expect(result.summaryText).toContain('WARN optional input missing bot=alpha');
     expect(result.summaryText).toContain('WARN required input missing bot=alpha');
-    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
-    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/from-box.md'))).toBe(true);
+    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(false);
+    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/from-box.md'))).toBe(false);
   });
 
   test('host mismatch exits 0 and an unmounted share or a held lock changes nothing', async () => {
@@ -717,15 +788,17 @@ describe('loader run', () => {
     const allowed = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain: open.brain });
     expect(allowed.exitCode).toBe(0);
     expect(open.puts.some((put) => put.source === 'finance')).toBe(true);
-    expect(existsSync(join(clean, 'ledger/feed.md'))).toBe(true);
+    expect(open.puts.find((put) => put.source === 'finance')!.text).toContain('numbers');
+    expect(existsSync(join(clean, 'ledger/feed.md'))).toBe(false);
 
     expect(spawnSync('git', ['remote', 'add', 'origin', 'https://example.invalid/finance.git'], { cwd: clean }).status).toBe(0);
     const blocked = fakeBrain();
     const refused = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain: blocked.brain });
     expect(refused.exitCode).toBe(1);
     expect(refused.summaryText).toContain('source finance has a git remote; refusing to write');
-    expect(blocked.puts.every((put) => put.source === 'personal')).toBe(true);
-    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
+    expect(blocked.puts).toEqual([]);
+    expect(open.puts.find((put) => put.slug === 'alpha/local')!.text).toContain('keep');
+    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(false);
   });
 
   test('a clean file containing an xoxb token is not written or queued', async () => {
@@ -764,10 +837,265 @@ describe('loader run', () => {
     expect(result.exitCode).toBe(1);
     expect(result.summaryText).toContain('source finance has a git remote; refusing to write');
     expect(puts.map((put) => put.source)).toEqual(['personal']);
-    expect(existsSync(join(personal, 'alpha/local.md'))).toBe(true);
+    expect(puts[0]!.text).toContain('keep');
+    expect(existsSync(join(personal, 'alpha/local.md'))).toBe(false);
     expect(existsSync(join(finance, 'ledger/feed.md'))).toBe(false);
   });
 });
+
+  test('a per-bot drop does not warn that the top-level stamp is missing', async () => {
+    const home = temp('gbrain-loader-per-bot-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    write(join(share, 'personalgrok/gbrain/_box-export/alpha/manifest.json'), '{}\n');
+    write(join(share, 'personalgrok/alpha/local.md'), 'from share\n');
+    const config = baseConfig(home, share);
+    const result = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain: fakeBrain().brain, now: new Date('2026-11-11T00:00:00Z') });
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).not.toContain('box-export stamp missing');
+    expect(result.summaryText).not.toContain('box-export missing');
+
+    const flat = temp('gbrain-loader-flat-stamp-');
+    const flatShare = join(flat, 'share');
+    writeFileSync(join(flat, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    mkdirSync(join(flatShare, 'personalgrok/gbrain/_box-export'), { recursive: true });
+    write(join(flatShare, 'personalgrok/alpha/local.md'), 'from share\n');
+    const flatResult = await runLoader({
+      config: baseConfig(flat, flatShare),
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain: fakeBrain().brain,
+      now: new Date('2026-11-11T00:00:00Z'),
+    });
+    expect(flatResult.summaryText).toContain('WARN box-export stamp missing');
+  });
+
+  test('a changed page sends the stored revision and a conflict skips', async () => {
+    const home = temp('gbrain-loader-rev-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const note = join(share, 'personalgrok/alpha/note.md');
+    write(note, 'first text\n');
+    const config = baseConfig(home, share);
+    const rev = '00000000-0000-4000-8000-0000000000aa';
+    const puts: { slug: string; revision?: string }[] = [];
+    let conflict = false;
+    const brain: BrainClient = {
+      async ensureSource() { return { ok: true }; },
+      async putPage(_source, slug, _file, revision) {
+        puts.push({ slug, revision });
+        if (conflict && slug === 'alpha/note') {
+          return { ok: false, pending: false, code: 'revision_conflict', detail: 'exit 1, revision_conflict' };
+        }
+        return { ok: true, pending: false, revision: rev };
+      },
+      async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+    };
+    const first = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T00:00:00Z') });
+    expect(first.exitCode).toBe(0);
+    expect(puts.find((put) => put.slug === 'alpha/note')?.revision).toBeUndefined();
+    expect(readManifest(join(home, 'state.json')).files[note]?.revision).toBe(rev);
+    write(note, 'second text\n');
+    const second = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T01:00:00Z') });
+    expect(second.exitCode).toBe(0);
+    expect(puts.filter((put) => put.slug === 'alpha/note').at(-1)?.revision).toBe(rev);
+    conflict = true;
+    write(note, 'third text\n');
+    const third = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T02:00:00Z') });
+    expect(third.exitCode).toBe(1);
+    expect(third.summaryText).toContain('WARN put failed alpha/note skipped (exit 1, revision_conflict)');
+    expect(readManifest(join(home, 'state.json')).files[note]?.revision).toBe(rev);
+    expect(third.summaryText).not.toContain('--force');
+  });
+
+  test('revision_required reads the revision once and a second conflict is a failure', async () => {
+    const home = temp('gbrain-loader-revreq-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const note = join(share, 'personalgrok/alpha/note.md');
+    write(note, 'first text\n');
+    const config = baseConfig(home, share);
+    const rev = '00000000-0000-4000-8000-0000000000cc';
+    const puts: { revision?: string }[] = [];
+    let reads = 0;
+    let mode: 'required' | 'ok' | 'conflict' = 'required';
+    const brain: BrainClient = {
+      async ensureSource() { return { ok: true }; },
+      async putPage(_source, _slug, _file, revision) {
+        puts.push({ revision });
+        if (mode === 'required' && revision === undefined) {
+          return { ok: false, pending: false, code: 'revision_required', detail: 'exit 1, revision_required' };
+        }
+        if (mode === 'conflict') {
+          return { ok: false, pending: false, code: 'revision_conflict', detail: 'exit 1, revision_conflict' };
+        }
+        return { ok: true, pending: false, revision: rev };
+      },
+      async getRevision() {
+        reads++;
+        return { ok: true, revision: rev };
+      },
+      async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+    };
+    const first = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T00:00:00Z') });
+    expect(first.exitCode).toBe(0);
+    expect(reads).toBe(1);
+    expect(puts.map((put) => put.revision)).toEqual([undefined, rev]);
+    expect(readManifest(config.statePath).files[note]?.revision).toBe(rev);
+    mode = 'conflict';
+    write(note, 'second text\n');
+    const second = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T01:00:00Z') });
+    expect(second.exitCode).toBe(1);
+    expect(second.summaryText).toContain('WARN put failed alpha/note skipped (exit 1, revision_conflict)');
+    expect(readManifest(config.statePath).files[note]?.revision).toBe(rev);
+    expect(second.summaryText).not.toContain('--force');
+  });
+
+  test('an unindexed loader file is moved aside without sync, and a stranger file stays', async () => {
+    const home = temp('gbrain-loader-hold-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const note = join(share, 'personalgrok/alpha/note.md');
+    write(note, 'hello note\n');
+    const target = join(share, 'personalgrok/gbrain/personal');
+    const occupant = join(target, 'alpha/note.md');
+    write(occupant, 'left by an earlier loader run\n');
+    const kept = join(target, 'alpha/user-kept.md');
+    write(kept, 'do not touch this sentence\n');
+    const config = baseConfig(home, share);
+    writeManifest(config.statePath, {
+      version: 1,
+      files: {
+        [note]: {
+          sha256: 'stale',
+          bot: 'alpha',
+          source: 'personal',
+          slug: 'alpha/note',
+          output: occupant,
+          originRelpath: 'personalgrok/alpha/note.md',
+          inBrain: false,
+        },
+      },
+    });
+    const calls: string[] = [];
+    const brain: BrainClient = {
+      async ensureSource(source) {
+        calls.push(`ensure ${source}`);
+        return { ok: true };
+      },
+      async putPage(source, slug, file) {
+        calls.push(`put ${source} ${slug}`);
+        const canonical = join(target, `${slug}.md`);
+        if (existsSync(canonical)) return { ok: false, pending: false, code: 'source_changed', detail: 'exit 1, source_changed' };
+        return { ok: true, pending: false, revision: '00000000-0000-4000-8000-0000000000bb' };
+      },
+      async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+    };
+    const result = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T00:00:00Z') });
+    expect(result.exitCode).toBe(0);
+    expect(result.summaryText).not.toContain('put failed alpha/note');
+    expect(calls.some((call) => call.startsWith('sync'))).toBe(false);
+    expect(existsSync(occupant)).toBe(false);
+    expect(readFileSync(join(home, 'loader-held/personal/alpha/note.md'), 'utf8')).toBe('left by an earlier loader run\n');
+    expect((statSync(join(home, 'loader-held')).mode & 0o777)).toBe(0o700);
+    expect(readFileSync(kept, 'utf8')).toBe('do not touch this sentence\n');
+    expect(readManifest(config.statePath).files[note]?.inBrain).toBe(true);
+    expect(calls.filter((call) => call === 'put personal alpha/note').length).toBe(2);
+  });
+
+  test('a symlink occupant and an in-brain neighbor are not moved', async () => {
+    const home = temp('gbrain-loader-symlink-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const note = join(share, 'personalgrok/alpha/note.md');
+    write(note, 'hello note\n');
+    const target = join(share, 'personalgrok/gbrain/personal');
+    const outside = join(home, 'outside.md');
+    write(outside, 'do not follow this sentence\n');
+    const occupant = join(target, 'alpha/note.md');
+    mkdirSync(join(target, 'alpha'), { recursive: true });
+    symlinkSync(outside, occupant);
+    const neighbor = join(share, 'personalgrok/alpha/other.md');
+    write(neighbor, 'other\n');
+    const neighborOut = join(target, 'alpha/other.md');
+    write(neighborOut, 'indexed neighbor\n');
+    const config = baseConfig(home, share);
+    writeManifest(config.statePath, {
+      version: 1,
+      files: {
+        [note]: {
+          sha256: 'stale', bot: 'alpha', source: 'personal', slug: 'alpha/note', output: occupant,
+          originRelpath: 'personalgrok/alpha/note.md', inBrain: false,
+        },
+        [neighbor]: {
+          sha256: sha256(readFileSync(neighbor)), bot: 'alpha', source: 'personal', slug: 'alpha/other',
+          output: neighborOut, originRelpath: 'personalgrok/alpha/other.md', inBrain: true,
+          revision: '00000000-0000-4000-8000-0000000000dd',
+        },
+      },
+    });
+    const puts: string[] = [];
+    const brain: BrainClient = {
+      async ensureSource() { return { ok: true }; },
+      async putPage(_source, slug) {
+        puts.push(slug);
+        return { ok: true, pending: false, revision: '00000000-0000-4000-8000-0000000000ee' };
+      },
+      async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+    };
+    const result = await runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T00:00:00Z') });
+    expect(result.exitCode).toBe(1);
+    expect(puts).not.toContain('alpha/note');
+    expect(result.summaryText).toContain('WARN put failed alpha/note (not a regular file)');
+    expect(lstatSync(occupant).isSymbolicLink()).toBe(true);
+    expect(readFileSync(outside, 'utf8')).toBe('do not follow this sentence\n');
+    expect(readFileSync(neighborOut, 'utf8')).toBe('indexed neighbor\n');
+    expect(existsSync(join(home, 'loader-held'))).toBe(false);
+  });
+
+  test('a successful put is on disk before the next page, so a crash keeps the revision', async () => {
+    const home = temp('gbrain-loader-crash-');
+    const share = join(home, 'share');
+    writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
+    const first = join(share, 'personalgrok/alpha/one.md');
+    const second = join(share, 'personalgrok/alpha/two.md');
+    write(first, 'one\n');
+    write(second, 'two\n');
+    const config = baseConfig(home, share);
+    const rev = '00000000-0000-4000-8000-0000000000ff';
+    let puts = 0;
+    const brain: BrainClient = {
+      async ensureSource() { return { ok: true }; },
+      async putPage() {
+        puts++;
+        if (puts === 2) throw new Error('simulated crash');
+        return { ok: true, pending: false, revision: rev };
+      },
+      async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+    };
+    await expect(runLoader({ config, hostname: 'test-host', isMounted: () => true, brain, now: new Date('2026-11-11T00:00:00Z') })).rejects.toThrow('simulated crash');
+    const saved = readManifest(config.statePath);
+    const stored = Object.values(saved.files).filter((entry) => entry.inBrain);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.revision).toBe(rev);
+    const again = await runLoader({
+      config,
+      hostname: 'test-host',
+      isMounted: () => true,
+      brain: {
+        async ensureSource() { return { ok: true }; },
+        async putPage(_source, _slug, _file, revision) {
+          expect(revision).toBeUndefined();
+          return { ok: true, pending: false, revision: rev };
+        },
+        async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
+      },
+      now: new Date('2026-11-11T01:00:00Z'),
+    });
+    expect(again.exitCode).toBe(0);
+    expect(again.summaryText).toContain('unchanged=1');
+    expect(again.summaryText).toContain('written=1');
+  });
 
 describe('counts, placeholders, and the lock', () => {
   test('failed puts are excluded, pending puts retry, and a gone bot is orphaned', async () => {
@@ -886,9 +1214,11 @@ describe('counts, placeholders, and the lock', () => {
     write(join(home, 'in/note.md'), 'hello\n');
     const confirmed = writeCfg('~/mnt/netfs', true);
     expect(confirmed.placeholder).toBeNull();
-    const allowed = await runLoader({ config: confirmed, hostname: 'test-host', isMounted: () => true, brain: fakeBrain().brain });
+    const confirmedBrain = fakeBrain();
+    const allowed = await runLoader({ config: confirmed, hostname: 'test-host', isMounted: () => true, brain: confirmedBrain.brain });
     expect(allowed.exitCode).toBe(0);
-    expect(existsSync(join(home, 'personal/alpha/note.md'))).toBe(true);
+    expect(confirmedBrain.puts.find((put) => put.slug === 'alpha/note')!.text).toContain('hello');
+    expect(existsSync(join(home, 'personal/alpha/note.md'))).toBe(false);
   });
 
   test('a symlink to the example share root is refused unless it is confirmed', async () => {
@@ -933,15 +1263,19 @@ describe('counts, placeholders, and the lock', () => {
 
     const confirmed = writeCfg(toExample, true);
     expect(confirmed.placeholder).toBeNull();
-    const allowed = await runLoader({ config: confirmed, hostname: 'test-host', isMounted: () => true, brain: fakeBrain().brain });
+    const confirmedBrain = fakeBrain();
+    const allowed = await runLoader({ config: confirmed, hostname: 'test-host', isMounted: () => true, brain: confirmedBrain.brain });
     expect(allowed.exitCode).toBe(0);
-    expect(existsSync(join(example, 'personal/alpha/note.md'))).toBe(true);
+    expect(confirmedBrain.puts.find((put) => put.slug === 'alpha/note')!.text).toContain('hello');
+    expect(existsSync(join(example, 'personal/alpha/note.md'))).toBe(false);
 
     const different = writeCfg(toOther, false);
     expect(different.placeholder).toBeNull();
-    const elsewhere = await runLoader({ config: different, hostname: 'test-host', isMounted: () => true, brain: fakeBrain().brain });
+    const otherBrain = fakeBrain();
+    const elsewhere = await runLoader({ config: different, hostname: 'test-host', isMounted: () => true, brain: otherBrain.brain });
     expect(elsewhere.exitCode).toBe(0);
-    expect(existsSync(join(other, 'personal/alpha/note.md'))).toBe(true);
+    expect(otherBrain.puts.find((put) => put.slug === 'alpha/note')!.text).toContain('hello');
+    expect(existsSync(join(other, 'personal/alpha/note.md'))).toBe(false);
   });
 
   test('sources add is recorded and not spawned again', async () => {
@@ -1319,10 +1653,10 @@ function feedConfig(home: string, share: string, groups: unknown[]): LoaderConfi
 
 function brainSpy(ensureOk: (source: string) => boolean = () => true): {
   brain: BrainClient;
-  puts: { source: string; slug: string; file: string }[];
+  puts: { source: string; slug: string; file: string; text: string }[];
   ensured: string[];
 } {
-  const puts: { source: string; slug: string; file: string }[] = [];
+  const puts: { source: string; slug: string; file: string; text: string }[] = [];
   const ensured: string[] = [];
   const brain: BrainClient = {
     async ensureSource(source) {
@@ -1330,8 +1664,8 @@ function brainSpy(ensureOk: (source: string) => boolean = () => true): {
       return { ok: ensureOk(source) };
     },
     async putPage(source, slug, file) {
-      puts.push({ source, slug, file });
-      return { ok: true, pending: false };
+      puts.push({ source, slug, file, text: existsSync(file) ? readFileSync(file, 'utf8') : '' });
+      return { ok: true, pending: false, revision: '00000000-0000-4000-8000-000000000001' };
     },
     async counts(sources, bots, manifest) { return manifestCounts(sources, bots, manifest); },
   };
@@ -1467,7 +1801,8 @@ describe('fail-closed feeds', () => {
     expectNoDestination(join(share, 'personalgrok/gbrain/hermes'));
     expect(staleResult.summaryText).not.toContain('WARN box-export stale');
     expect(staleResult.summaryText).not.toContain('SKIP personal');
-    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
+    expect(staleRun.puts.find((put) => put.slug === 'alpha/local')!.text).toContain('from personal');
+    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(false);
     expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
     expect(staleRun.puts.some((put) => put.source === 'hermes')).toBe(false);
     expect(staleRun.ensured).toEqual([]);
@@ -1479,8 +1814,8 @@ describe('fail-closed feeds', () => {
     expect(freshResult.exitCode).toBe(0);
     expect(freshResult.summaryText).toContain('WARN box-export stale');
     expect(freshResult.summaryText).not.toContain('SKIP hermes');
-    expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(true);
-    const hermesPage = readFileSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'), 'utf8');
+    expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
+    const hermesPage = fresh.puts.find((put) => put.slug === 'hermes/note')!.text;
     expect(hermesPage).toContain('origin_relpath: "external/hermes/0/note.md"');
     expect(hermesPage).not.toContain('account:');
     expect(fresh.puts.map((put) => put.source)).toContain('hermes');
@@ -1489,11 +1824,13 @@ describe('fail-closed feeds', () => {
     const missingShare = join(missingHome, 'share');
     write(join(missingShare, 'personalgrok/alpha/local.md'), 'from personal\n');
     const missing = feedConfig(missingHome, missingShare, [personalGroup(missingShare), hermesGroup(missingShare, join(missingHome, 'absent-feed'))]);
-    const missingResult = await runAt(missing, brainSpy().brain);
+    const missingSpy = brainSpy();
+    const missingResult = await runAt(missing, missingSpy.brain);
     expect(missingResult.summaryText).toContain('SKIP hermes: input missing');
     expectNoDestination(join(missingShare, 'personalgrok/gbrain/hermes'));
     expect(missingResult.summaryText).not.toContain('SKIP hermes: feed stale');
-    expect(existsSync(join(missingShare, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
+    expect(missingSpy.puts.find((put) => put.slug === 'alpha/local')!.text).toContain('from personal');
+    expect(existsSync(join(missingShare, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(false);
 
     const unsignedHome = temp('gbrain-feed-unsigned-');
     const unsignedShare = join(unsignedHome, 'share');
@@ -1525,11 +1862,13 @@ describe('fail-closed feeds', () => {
     write(join(partialShare, 'personalgrok/alpha/local.md'), 'from personal\n');
     writeFeed(partialStamp, stampAt(1), 'hermes', 'hermes', { 'note.md': 'partial\n' });
     const partial = feedConfig(partialHome, partialShare, [personalGroup(partialShare), hermesGroup(partialShare, partialStamp)]);
-    const partialResult = await runAt(partial, brainSpy().brain);
+    const partialSpy = brainSpy();
+    const partialResult = await runAt(partial, partialSpy.brain);
     expect(partialResult.summaryText).toContain('SKIP hermes: partial copy');
     expectNoDestination(join(partialShare, 'personalgrok/gbrain/hermes'));
     expect(existsSync(join(partialShare, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
-    expect(existsSync(join(partialShare, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
+    expect(partialSpy.puts.find((put) => put.slug === 'alpha/local')!.text).toContain('from personal');
+    expect(existsSync(join(partialShare, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(false);
 
     const holdHome = temp('gbrain-feed-hold-');
     const holdShare = join(holdHome, 'share');
@@ -1552,7 +1891,8 @@ describe('fail-closed feeds', () => {
     const wordResult = await runAt(worded, wordSpy.brain);
     expect(wordResult.exitCode).toBe(0);
     expect(wordResult.summaryText).not.toContain('SKIP hermes');
-    const wordPage = readFileSync(join(wordShare, 'personalgrok/gbrain/hermes/hermes/note.md'), 'utf8');
+    expect(existsSync(join(wordShare, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
+    const wordPage = wordSpy.puts.find((put) => put.slug === 'hermes/note')!.text;
     expect(wordPage).toContain('portfolio is only a word');
     const again = await runAt(worded, wordSpy.brain);
     expect(again.summaryText).toContain('unchanged=1');
@@ -1578,7 +1918,8 @@ describe('fail-closed feeds', () => {
     expectNoDestination(linked);
     expect(routeSpy.puts.some((put) => put.source === 'hermes')).toBe(false);
     expect(routeSpy.ensured).toEqual([]);
-    expect(existsSync(join(personalTarget, 'alpha/local.md'))).toBe(true);
+    expect(routeSpy.puts.find((put) => put.slug === 'alpha/local')!.text).toContain('from personal');
+    expect(existsSync(join(personalTarget, 'alpha/local.md'))).toBe(false);
     expect(existsSync(join(personalTarget, 'hermes/note.md'))).toBe(false);
   });
 
@@ -1607,10 +1948,12 @@ describe('fail-closed feeds', () => {
     expect(result.summaryText).not.toContain('SKIP personal');
     expect(result.summaryText).toContain('secrets_skipped=1');
     expect(spy.ensured).toEqual(['business', 'hermes']);
-    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
+    expect(spy.puts.find((put) => put.slug === 'alpha/local')!.text).toContain('from personal');
+    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(false);
     expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/secret.md'))).toBe(false);
     expect(existsSync(join(share, 'personalgrok/gbrain/business/example-bot/hello.md'))).toBe(false);
-    expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(true);
+    expect(spy.puts.find((put) => put.slug === 'hermes/note')!.text).toContain('hermes note');
+    expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
     expect(spy.puts.some((put) => put.source === 'business')).toBe(false);
     expect(spy.puts.some((put) => put.source === 'hermes')).toBe(true);
 
@@ -1625,7 +1968,8 @@ describe('fail-closed feeds', () => {
     expect(emptyResult.summaryText).toContain('SKIP business: no bots named');
     expectNoDestination(join(emptyShare, 'personalgrok/gbrain/business'));
     expect(emptySpy.ensured).toEqual([]);
-    expect(existsSync(join(emptyShare, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
+    expect(emptySpy.puts.find((put) => put.slug === 'alpha/local')!.text).toContain('from personal');
+    expect(existsSync(join(emptyShare, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(false);
   });
 
   test('hermes allowlist skips a denied manifest path and ignores extras', async () => {
@@ -1656,10 +2000,12 @@ describe('fail-closed feeds', () => {
     writeFeed(extraStamp, stampAt(1), 'hermes', 'hermes', { 'note.md': 'keep\n' });
     write(join(extraStamp, 'picture.png'), 'png\n');
     const extra = feedConfig(extraHome, extraShare, [hermesGroup(extraShare, extraStamp)]);
-    const extraResult = await runAt(extra, brainSpy().brain);
+    const extraSpy = brainSpy();
+    const extraResult = await runAt(extra, extraSpy.brain);
     expect(extraResult.exitCode).toBe(0);
     expect(extraResult.summaryText).not.toContain('SKIP hermes');
-    expect(readFileSync(join(extraShare, 'personalgrok/gbrain/hermes/hermes/note.md'), 'utf8')).toContain('keep');
+    expect(extraSpy.puts.find((put) => put.slug === 'hermes/note')!.text).toContain('keep');
+    expect(existsSync(join(extraShare, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
     expect(existsSync(join(extraShare, 'personalgrok/gbrain/hermes/hermes/picture.md'))).toBe(false);
   });
 
@@ -1670,12 +2016,14 @@ describe('fail-closed feeds', () => {
     write(join(share, 'personalgrok/alpha/local.md'), 'from personal\n');
     writeFeed(stamp, stampAt(1), 'hermes', 'personal', { 'note.md': 'wrong tree\n' });
     const wrong = feedConfig(home, share, [personalGroup(share), hermesGroup(share, stamp)]);
-    const wrongResult = await runAt(wrong, brainSpy().brain);
+    const wrongSpy = brainSpy();
+    const wrongResult = await runAt(wrong, wrongSpy.brain);
     expect(wrongResult.exitCode).toBe(0);
     expect(wrongResult.summaryText).toContain('SKIP hermes: wrong source');
     expectNoDestination(join(share, 'personalgrok/gbrain/hermes'));
     expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
-    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
+    expect(wrongSpy.puts.find((put) => put.slug === 'alpha/local')!.text).toContain('from personal');
+    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(false);
 
     const bigHome = temp('gbrain-feed-big-');
     const bigShare = join(bigHome, 'share');
@@ -1704,15 +2052,18 @@ describe('fail-closed feeds', () => {
       }]),
       hermesGroup(share, hermes),
     ]);
-    const result = await runAt(config, brainSpy().brain);
+    const bizSpy = brainSpy();
+    const result = await runAt(config, bizSpy.brain);
     expect(result.exitCode).toBe(0);
     expect(result.summaryText).toContain('SKIP business: box-export stale');
     expect(result.summaryText).not.toContain('SKIP business: feed stale');
     expect(result.summaryText).not.toContain('SKIP hermes');
     expectNoDestination(join(share, 'personalgrok/gbrain/business'));
     expect(existsSync(join(share, 'personalgrok/gbrain/business/example-bot'))).toBe(false);
-    expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(true);
-    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(true);
+    expect(bizSpy.puts.find((put) => put.slug === 'hermes/note')!.text).toContain('fresh hermes');
+    expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
+    expect(bizSpy.puts.find((put) => put.slug === 'alpha/local')!.text).toContain('from personal');
+    expect(existsSync(join(share, 'personalgrok/gbrain/personal/alpha/local.md'))).toBe(false);
   });
 
   test('a Zulu stamp with fractional seconds is parseable and still ages out', async () => {
@@ -1723,10 +2074,12 @@ describe('fail-closed feeds', () => {
     expect(freshMillis).toMatch(/\.000Z$/);
     writeFeed(stamp, freshMillis, 'hermes', 'hermes', { 'note.md': 'millis fresh\n' });
     const fresh = feedConfig(home, share, [hermesGroup(share, stamp)]);
-    const freshResult = await runAt(fresh, brainSpy().brain);
+    const freshSpy = brainSpy();
+    const freshResult = await runAt(fresh, freshSpy.brain);
     expect(freshResult.exitCode).toBe(0);
     expect(freshResult.summaryText).not.toContain('SKIP hermes');
-    expect(readFileSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'), 'utf8')).toContain('millis fresh');
+    expect(freshSpy.puts.find((put) => put.slug === 'hermes/note')!.text).toContain('millis fresh');
+    expect(existsSync(join(share, 'personalgrok/gbrain/hermes/hermes/note.md'))).toBe(false);
 
     const oldHome = temp('gbrain-feed-millis-old-');
     const oldShare = join(oldHome, 'share');
@@ -1929,9 +2282,11 @@ describe('fail-closed feeds', () => {
     expect(checked.ok).toBe(true);
     if (!checked.ok) return;
     expect(checked.files.map((file) => file.relativePosix).sort()).toEqual(['attachments/note.txt', 'memory/profile.md', 'profile.json']);
-    const result = await runAt(config, brainSpy().brain);
+    const closedSpy = brainSpy();
+    const result = await runAt(config, closedSpy.brain);
     expect(result.exitCode).toBe(0);
     expect(result.summaryText).not.toContain('SKIP acme-biz');
-    expect(readFileSync(join(target, 'example-bot/memory/profile.md'), 'utf8')).toContain('A fake fact.');
+    expect(closedSpy.puts.find((put) => put.slug === 'example-bot/memory/profile')!.text).toContain('A fake fact.');
+    expect(existsSync(join(target, 'example-bot/memory/profile.md'))).toBe(false);
   });
 });

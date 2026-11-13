@@ -16,13 +16,19 @@ export interface PutOutcome {
   ok: boolean;
   /** Exit 10: accepted, not committed. Retried next run. Not a failure and not counted. */
   pending: boolean;
-  /** Set only when the put failed. One redacted line: exit code or kill signal, then a JSON code and message, or one stderr line. */
+  /** Revision from a successful put, parsed from raw stdout before redaction. */
+  revision?: string;
+  /** Machine error code from a failed command, when the CLI printed one. */
+  code?: string;
+  /** Set only when the command failed. One redacted line: exit, timeout, or kill, then a JSON code and message, or one stderr line. */
   detail?: string;
 }
 
 export interface BrainClient {
   ensureSource(source: string, directory: string): Promise<{ ok: boolean; detail?: string }>;
-  putPage(source: string, slug: string, file: string): Promise<PutOutcome>;
+  putPage(source: string, slug: string, file: string, expectedRevision?: string): Promise<PutOutcome>;
+  /** Read the current page revision. Optional so older test doubles still compile. */
+  getRevision?(source: string, slug: string): Promise<{ ok: boolean; revision?: string; code?: string }>;
   counts(sources: string[], bots: { source: string; bot: string }[], manifest: Manifest): Promise<PageCounts>;
 }
 
@@ -32,12 +38,23 @@ export interface SpawnResult {
   stderr: string;
   /** Set when the child was killed. The diagnostic names the signal instead of an exit code. */
   signal?: string | null;
+  /** UUID revision parsed from raw stdout before the diagnostic redaction. */
+  revision?: string;
+  /** The child was killed because it ran past the timeout. */
+  timedOut?: boolean;
 }
 
 export type SpawnFn = (argv: string[]) => Promise<SpawnResult>;
 
-export function putArgv(bin: string, source: string, slug: string, file: string): string[] {
-  return [bin, '--source', source, 'put', slug, '--file', file, '--json'];
+export function putArgv(bin: string, source: string, slug: string, file: string, expectedRevision?: string): string[] {
+  const argv = [bin, 'put', slug, '--source', source, '--file', file];
+  if (expectedRevision) argv.push('--expected-revision', expectedRevision);
+  argv.push('--json');
+  return argv;
+}
+
+export function getArgv(bin: string, source: string, slug: string): string[] {
+  return [bin, 'get', slug, '--source', source, '--json'];
 }
 
 export function addSourceArgv(bin: string, source: string, directory: string): string[] {
@@ -260,6 +277,7 @@ function parseOpError(text: string): { code: string; message: string } | null {
 }
 
 function failureHead(result: SpawnResult): string {
+  if (result.timedOut) return 'timeout';
   if (result.signal) return `killed ${result.signal}`;
   return `exit ${result.code}`;
 }
@@ -290,9 +308,24 @@ function pushCapped(chunks: Buffer[], state: { n: number }, chunk: Buffer): void
   state.n += slice.length;
 }
 
-export function spawnGbrain(argv: string[]): Promise<SpawnResult> {
+/** Default bound for one gbrain child. A timeout kills it and the run releases the loader lock. */
+export const SPAWN_TIMEOUT_MS = 120_000;
+
+export function spawnGbrain(argv: string[], options: { timeoutMs?: number } = {}): Promise<SpawnResult> {
+  const timeoutMs = Number.isFinite(options.timeoutMs) && (options.timeoutMs ?? 0) > 0 ? options.timeoutMs! : SPAWN_TIMEOUT_MS;
   return new Promise((resolvePromise) => {
     // argv is the command. It is not copied into the result or the diagnostic.
+    let settled = false;
+    let timedOut = false;
+    let hardKill: ReturnType<typeof setTimeout> | undefined;
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = (result: SpawnResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (hardKill) clearTimeout(hardKill);
+      resolvePromise(result);
+    };
     const child = spawn(argv[0]!, argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] });
     const out: Buffer[] = [];
     const err: Buffer[] = [];
@@ -300,13 +333,29 @@ export function spawnGbrain(argv: string[]): Promise<SpawnResult> {
     const errBytes = { n: 0 };
     child.stdout.on('data', (chunk: Buffer) => pushCapped(out, outBytes, chunk));
     child.stderr.on('data', (chunk: Buffer) => pushCapped(err, errBytes, chunk));
-    child.on('error', (error) => resolvePromise({ code: 127, stdout: '', stderr: redactCliText(error.message) }));
+    timer = setTimeout(() => {
+      timedOut = true;
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+      hardKill = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }, 1000);
+    }, timeoutMs);
+    child.on('error', (error) => finish({
+      code: 127,
+      stdout: '',
+      stderr: redactCliText(error.message),
+      ...(timedOut ? { timedOut: true } : {}),
+    }));
     child.on('close', (code, signal) => {
-      resolvePromise({
+      const rawOut = Buffer.concat(out).toString('utf8');
+      const revision = revisionOf(rawOut);
+      finish({
         code: code ?? 1,
-        stdout: redactCliText(Buffer.concat(out).toString('utf8')),
+        stdout: redactCliText(rawOut),
         stderr: redactCliText(Buffer.concat(err).toString('utf8')),
         ...(signal ? { signal } : {}),
+        ...(revision ? { revision } : {}),
+        ...(timedOut ? { timedOut: true } : {}),
       });
     });
   });
@@ -329,19 +378,30 @@ export function manifestCounts(sources: string[], bots: { source: string; bot: s
   return { sources: sourceCounts, bots: botCounts, via: 'pages written by the loader (manifest)' };
 }
 
-export function createGbrainClient(bin: string, spawnFn: SpawnFn = spawnGbrain): BrainClient {
+export function createGbrainClient(bin: string, spawnFn?: SpawnFn, options?: { timeoutMs?: number }): BrainClient {
+  const spawn = spawnFn ?? ((argv: string[]) => spawnGbrain(argv, options));
   return {
     async ensureSource(source, directory) {
-      const result = await spawnFn(addSourceArgv(bin, source, directory));
+      const result = await spawn(addSourceArgv(bin, source, directory));
       if (result.code === 0) return { ok: true };
       if (ALREADY.test(result.stdout) || ALREADY.test(result.stderr)) return { ok: true };
       return { ok: false, detail: failureDetail(result) };
     },
-    async putPage(source, slug, file) {
-      const result = await spawnFn(putArgv(bin, source, slug, file));
-      if (result.code === 0) return { ok: true, pending: false };
-      if (result.code === PENDING_EXIT) return { ok: false, pending: true };
-      return { ok: false, pending: false, detail: failureDetail(result) };
+    async putPage(source, slug, file, expectedRevision) {
+      const result = await spawn(putArgv(bin, source, slug, file, expectedRevision));
+      if (!result.timedOut && result.code === 0) return { ok: true, pending: false, revision: result.revision ?? revisionOf(result.stdout) };
+      if (!result.timedOut && result.code === PENDING_EXIT) return { ok: false, pending: true };
+      const code = errorCode(result);
+      return { ok: false, pending: false, ...(code ? { code } : {}), detail: failureDetail(result) };
+    },
+    async getRevision(source, slug) {
+      const result = await spawn(getArgv(bin, source, slug));
+      if (!result.timedOut && result.code === 0) {
+        const revision = result.revision ?? revisionOf(result.stdout);
+        return revision ? { ok: true, revision } : { ok: false };
+      }
+      const code = errorCode(result);
+      return { ok: false, ...(code ? { code } : {}) };
     },
     async counts(sources, bots, manifest) {
       // stats and list call connectEngine. Never spawn them; the manifest is the count.
@@ -352,4 +412,41 @@ export function createGbrainClient(bin: string, spawnFn: SpawnFn = spawnGbrain):
 
 export function loadManifestCounts(path: string, sources: string[], bots: { source: string; bot: string }[]): PageCounts {
   return manifestCounts(sources, bots, readManifest(path));
+}
+
+const REV = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CODE = /^[a-z][a-z0-9_]*$/;
+
+function jsonObject(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    const value = JSON.parse(trimmed) as unknown;
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function revisionOf(stdout: string): string | undefined {
+  const doc = jsonObject(stdout);
+  if (!doc) return undefined;
+  const outcome = doc.outcome;
+  const nested = outcome && typeof outcome === 'object' && !Array.isArray(outcome)
+    ? (outcome as Record<string, unknown>).revision
+    : undefined;
+  for (const value of [doc.revision, nested]) {
+    if (typeof value === 'string' && REV.test(value)) return value;
+  }
+  return undefined;
+}
+
+function errorCode(result: SpawnResult): string | undefined {
+  for (const text of [result.stdout, result.stderr]) {
+    const doc = jsonObject(text);
+    if (!doc) continue;
+    const raw = typeof doc.code === 'string' ? doc.code : typeof doc.error === 'string' ? doc.error : '';
+    if (CODE.test(raw)) return raw;
+  }
+  return undefined;
 }
