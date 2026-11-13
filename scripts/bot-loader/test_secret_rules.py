@@ -56,6 +56,8 @@ class SecretRulesTest(unittest.TestCase):
         self.assertFalse(denied_content("From: ada\nSubject: hello\n\nA note.\n"))
         self.assertTrue(denied_content("Invoice follow-up\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n"))
         self.assertTrue(denied_content("Invoice follow-up\n\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n"))
+        self.assertTrue(denied_content("> From: Ada Example\n> Subject: Re: invoice\n> Date: Tuesday\n"))
+        self.assertTrue(denied_content("  From: Ada Example\n  Subject: Re: invoice\n  Date: Tuesday\n"))
         self.assertFalse(denied_content("| From | To |\n| --- | --- |\n| Ada Example | Quinn Example |\n"))
         self.assertTrue(denied_content("From: Ada Example\nSubject: Re: invoice\nDate: Thursday\n\nA note.\n"))
         self.assertTrue(denied_content("From: Ada Example\nSent: Thursday, November 12, 2026 2:00 AM\nTo: the team\nSubject: Re: invoice\n"))
