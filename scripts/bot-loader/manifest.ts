@@ -14,6 +14,8 @@ export interface ManifestEntry {
   pending?: boolean;
   /** How many times this unchanged page has come back pending. */
   pendingAttempts?: number;
+  /** Revision gbrain returned for the last successful put. Sent as `--expected-revision` next time. */
+  revision?: string;
 }
 
 export interface Manifest {

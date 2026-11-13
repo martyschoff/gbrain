@@ -25,11 +25,14 @@ function write(path: string, text: string): void {
   writeFileSync(path, text);
 }
 
-function fakeBrain(): { brain: BrainClient; puts: { source: string; slug: string; file: string }[] } {
-  const puts: { source: string; slug: string; file: string }[] = [];
+function fakeBrain(): { brain: BrainClient; puts: { source: string; slug: string; file: string; text: string }[] } {
+  const puts: { source: string; slug: string; file: string; text: string }[] = [];
   const brain: BrainClient = {
     async ensureSource() { return { ok: true }; },
-    async putPage(source, slug, file) { puts.push({ source, slug, file }); return { ok: true, pending: false }; },
+    async putPage(source, slug, file) {
+      puts.push({ source, slug, file, text: existsSync(file) ? readFileSync(file, 'utf8') : '' });
+      return { ok: true, pending: false };
+    },
     async counts() { return { sources: {}, bots: {}, via: 'pages written by the loader (manifest)' }; },
   };
   return { brain, puts };
@@ -199,7 +202,9 @@ describe('multi-account drops', () => {
     expect(result.summaryText).toContain('bot account-b/bot-b source=account-b');
     expect(puts.map((put) => put.slug).sort()).toContain('account-a/bot-a/memory');
     expect(puts.map((put) => put.slug)).toContain('account-b/bot-b/skills/daily');
-    const page = readFileSync(join(share, 'pages-a', 'account-a', 'bot-a', 'memory.md'), 'utf8');
+    const page = puts.find((put) => put.slug === 'account-a/bot-a/memory')!.text;
+    expect(existsSync(join(share, 'pages-a', 'account-a', 'bot-a', 'memory.md'))).toBe(false);
+    expect(puts.every((put) => !put.file.startsWith(join(share, 'pages-a')) && !put.file.startsWith(join(share, 'pages-b')))).toBe(true);
     expect(page).toContain('account: "account-a"');
     expect(page).toContain('bot: "bot-a"');
     expect(page).toContain('## 2026-11-12');
@@ -447,7 +452,7 @@ describe('multi-account drops', () => {
     expect(result.exitCode).toBe(0);
     expect(result.summaryText).toContain('ignored unlisted 1');
     expect(puts).toHaveLength(5);
-    const dumped = puts.map((put) => readFileSync(put.file, 'utf8')).join('\n');
+    const dumped = puts.map((put) => put.text).join('\n');
     expect(dumped).not.toContain('ignore me please');
   });
 
@@ -525,7 +530,7 @@ describe('multi-account drops', () => {
     const loaded = await run(configFor(home, share, [roots(share)[0]!]), brain);
     expect(loaded.exitCode).toBe(0);
     expect(puts.map((put) => put.slug)).toContain('account-a/bot-a/memory');
-    expect(readFileSync(puts.find((put) => put.slug === 'account-a/bot-a/memory')!.file, 'utf8')).toContain('Remember the fake fact.');
+    expect(puts.find((put) => put.slug === 'account-a/bot-a/memory')!.text).toContain('Remember the fake fact.');
     expect(puts.map((put) => put.slug).join(' ')).not.toContain('holdings');
 
     const bad = join(home, 'bad.json');
