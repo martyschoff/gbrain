@@ -59,8 +59,12 @@ function redactCliText(text: string): string {
   let out = redactSecrets(text);
   out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+:[^/\s@]+@/gi, '$1');
   out = out.replace(/([?&](?:access_token|password|token|secret|bearer|key)=)[^&#\s]*/gi, '$1[redacted]');
+  // Diagnostic only. The shared password pattern stays anchored so other callers keep their tests.
+  out = out.replace(/\b(?:password|passwd|secret|token|api_key)\s*[:=]\s*\S+/gi, '[redacted]');
+  out = out.replace(/\bbearer\s+\S+/gi, 'Bearer [redacted]');
   out = out.replace(/\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[redacted]');
   out = out.replace(/\S+@\S+/g, '[redacted]');
+  out = out.replace(/[A-Za-z]:[/\\]Users[/\\][^/\\\s]+/gi, '~');
   out = out.replace(/(?:\/home|\/Users)\/[^/\s]+/g, '~');
   out = out.replace(/(^|[\s"'`(])(\/(?:[^\s/]+\/)*[^\s/]+)/g, (_match, lead: string, path: string) => {
     const base = path.slice(path.lastIndexOf('/') + 1);

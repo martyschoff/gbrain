@@ -427,6 +427,50 @@ describe('cli failure diagnostics', () => {
     expect(result.stdout).not.toContain('argv-marker-zz');
     expect(result.stderr).not.toContain('argv-marker-zz');
   });
+
+  test('mid-line assignments, a short bearer, and a windows user path are redacted', async () => {
+    const client = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'login failed password=abcdefgh token=tokentok api_key: keykeykey passwd=passpass secret: secsecsec\n',
+    }));
+    const put = await client.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(put.detail).toContain('exit 1');
+    expect(put.detail).toContain('login failed');
+    expect(put.detail).not.toContain('abcdefgh');
+    expect(put.detail).not.toContain('tokentok');
+    expect(put.detail).not.toContain('keykeykey');
+    expect(put.detail).not.toContain('passpass');
+    expect(put.detail).not.toContain('secsecsec');
+
+    const upper = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'auth PASSWORD: hunter2\n',
+    }));
+    const password = await upper.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(password.detail).toContain('auth');
+    expect(password.detail).not.toContain('hunter2');
+
+    const header = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'Authorization: Bearer abc.def\n',
+    }));
+    const bearer = await header.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(bearer.detail).toContain('Bearer [redacted]');
+    expect(bearer.detail).not.toContain('abc.def');
+
+    const paths = createGbrainClient('/usr/bin/gbrain', async () => ({
+      code: 1,
+      stdout: '',
+      stderr: 'Cannot read C:\\Users\\user-example\\x and D:/Users/user-example/note.md\n',
+    }));
+    const windows = await paths.putPage('personal', 'alpha/note', '/tmp/note.md') as { ok: boolean; pending: boolean; detail?: string };
+    expect(windows.detail).toContain('~\\x');
+    expect(windows.detail).toContain('~/note.md');
+    expect(windows.detail).not.toContain('user-example');
+  });
 });
 
 describe('secret list', () => {
