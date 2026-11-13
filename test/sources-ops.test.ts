@@ -154,6 +154,34 @@ describe('addSource — Q4 pre-flight collision', () => {
     });
   });
 
+  test('rejects a display name another source already holds, before any insert', async () => {
+    await withEnv2(async () => {
+      const held = join(tmpdir(), `gbrain-name-held-${process.pid}-${Date.now()}`);
+      const next = join(tmpdir(), `gbrain-name-next-${process.pid}-${Date.now()}`);
+      await addSource(engine, { id: 'alpha-notes', name: 'Shared Label', localPath: held });
+      try {
+        await addSource(engine, { id: 'beta-notes', name: 'Shared Label', localPath: next, force: true });
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(e).toBeInstanceOf(SourceOpError);
+        expect((e as SourceOpError).code).toBe('source_name_taken');
+        expect((e as SourceOpError).message).toContain('alpha-notes');
+        expect((e as SourceOpError).retryable).toBe(false);
+      }
+      expect(await engine.executeRaw('SELECT id FROM sources WHERE id = $1', ['beta-notes'])).toHaveLength(0);
+      // The id default is the display name, so it collides with a different source's name too.
+      try {
+        await addSource(engine, { id: 'gamma-notes', localPath: next });
+        await addSource(engine, { id: 'delta-notes', name: 'gamma-notes', localPath: held });
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(e).toBeInstanceOf(SourceOpError);
+        expect((e as SourceOpError).code).toBe('source_name_taken');
+        expect((e as SourceOpError).message).toContain('gamma-notes');
+      }
+    });
+  });
+
   test('rejects invalid id format with structured error', async () => {
     await withEnv2(async () => {
       try {

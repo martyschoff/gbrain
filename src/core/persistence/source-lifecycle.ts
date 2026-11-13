@@ -61,6 +61,21 @@ function retireSuperseded(row:TopologyChange):OperationError{
     {fix:ownerStatusFix(row.source_id)});
 }
 /** A prior receipt of this request_id, replayed; a retire admission (#8984) returns null so the run resumes. */
+/** The display name an add or claim will write, or undefined when the stored name stays. */
+function displayNameBeingWritten(input:SourceLifecycleInput, existing:SourceState|undefined):string|undefined{
+  if(input.operation!=='add'&&input.operation!=='claim')return undefined;
+  if(existing)return input.name;
+  return input.name??input.sourceId;
+}
+/** `sources.name` is UNIQUE apart from the id. A collision is a caller mistake, not a retry. */
+async function refuseTakenDisplayName(engine:BrainEngine,sourceId:string,name:string|undefined,operation:string):Promise<void>{
+  if(name===undefined)return;
+  const [other]=await engine.executeRaw<{id:string}>(`SELECT id FROM sources WHERE name=$1 AND id<>$2 LIMIT 1`,[name,sourceId]);
+  if(!other)return;
+  throw opError('source_name_taken',`Source name "${name}" is already used by source "${other.id}".`,
+    `Pick a different --name for '${sourceId}'. Display names are unique across sources, so this ${operation} did not register it.`,
+    {retryable:false,fix:sourcesListFix()});
+}
 function replayTopologyChange(row:TopologyChange|null):Record<string,unknown>|null{
   if(!row||isRetireAdmission(row))return null;
   if(isSupersededRetire(row))throw retireSuperseded(row);
@@ -184,7 +199,10 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
   const manifestRequired=!retire||(await engine.executeRaw<{digest:string|null}>(
     `SELECT w.manifest->>'digest' AS digest FROM persistence_source_bindings b JOIN persistence_worktrees w ON w.id=b.worktree_id WHERE b.source_id=$1`,[input.sourceId])).some(row=>!row.digest);
   if(input.dryRun) await inspectTopologyPhysicalRoot(engine,input.sourceId,root?.worktree,{relocation:input.operation==='rebind'});
-  if(input.dryRun) return {dry_run:true,operation:input.operation,source_id:input.sourceId,source_incarnation:before?.incarnation??null,path:root?.source??before?.local_path??null,manifest_required:manifestRequired};
+  if(input.dryRun){
+    await refuseTakenDisplayName(engine,input.sourceId,displayNameBeingWritten(input,before),input.operation);
+    return {dry_run:true,operation:input.operation,source_id:input.sourceId,source_incarnation:before?.incarnation??null,path:root?.source??before?.local_path??null,manifest_required:manifestRequired};
+  }
   return withTopologyLocks(engine,input.sourceId,async bindings=>{
     // Hash canonical bytes while holding native exclusion, without a database
     // connection checked out. The final transaction rejects new pending mirrors.
@@ -313,6 +331,7 @@ export async function runManagedSourceLifecycle(engine:BrainEngine,input:SourceL
       let incarnation=source?.incarnation??randomUUID();
       let pagesDeleted=retiredPages;
       if(input.operation==='add'||input.operation==='claim'){
+        await refuseTakenDisplayName(tx,input.sourceId,displayNameBeingWritten(input,source),input.operation);
         if(root&&input.createDirectory&&!existsSync(root.source)){mkdirSync(root.source,{recursive:true});flushTopologyDirectory(dirname(root.source));}
         if(source) await tx.executeRaw("UPDATE sources SET local_path=$2,name=COALESCE($3,name),config=$4::text::jsonb WHERE id=$1",
           [input.sourceId,root!.source,input.name??null,JSON.stringify({...source.config,...input.config})]);

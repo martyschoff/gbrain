@@ -69,6 +69,7 @@ import { hookSessionCwd } from './session-cwd.ts';
 export type SourceOpErrorCode =
   | 'invalid_id'
   | 'source_id_taken'
+  | 'source_name_taken'
   | 'overlapping_path'
   | 'invalid_remote_url'
   | 'clone_failed'
@@ -82,6 +83,8 @@ export type SourceOpErrorCode =
   | 'not_a_git_repo';
 
 export class SourceOpError extends Error {
+  /** Set false for a caller mistake that must not be retried (`source_name_taken`). */
+  retryable?: boolean;
   constructor(
     public code: SourceOpErrorCode,
     message: string,
@@ -457,6 +460,70 @@ async function insertApiSource(engine: BrainEngine, opts: AddSourceOpts, kind: '
   );
 }
 
+/**
+ * `sources.name` is UNIQUE on its own. The id pre-flight does not see a
+ * different source that already holds this display name (or the id, when
+ * `--name` is omitted). Not retryable: the same request collides again.
+ */
+export async function assertSourceNameFree(engine: BrainEngine, id: string, name: string): Promise<void> {
+  const [other] = await engine.executeRaw<{ id: string }>(
+    `SELECT id FROM sources WHERE name = $1 AND id <> $2 LIMIT 1`,
+    [name, id],
+  );
+  if (!other) return;
+  const error = new SourceOpError(
+    'source_name_taken',
+    `Source name "${name}" is already used by source "${other.id}". Display names are unique. Pick a different --name for "${id}"; nothing was registered.`,
+  );
+  error.retryable = false;
+  throw error;
+}
+
+/**
+ * Id collision (including the path-less attach exception) and the display-name
+ * collision. Runs once, before the url, github, google, meetings, slack and
+ * local-path inserts.
+ */
+async function assertSourceAddAvailable(
+  engine: BrainEngine,
+  opts: AddSourceOpts,
+): Promise<{ attachPath: boolean }> {
+  const existing = await engine.executeRaw<{ id: string; local_path: string | null }>(
+    `SELECT id, local_path FROM sources WHERE id = $1`,
+    [opts.id],
+  );
+  // #3903: attach, don't collide. `gbrain sync --source X` on a path-less
+  // source prints "Run: gbrain sources add X --path <path>" — so when the
+  // existing row has NO local_path and the caller supplies exactly a --path
+  // (no --url, no --kind github), treat this as attaching a working tree to
+  // the existing row (non-destructive UPDATE) instead of demanding
+  // `sources remove --confirm-destructive`, which cascades page deletion.
+  const attachPath =
+    existing.length > 0 &&
+    existing[0]!.local_path === null &&
+    !!opts.localPath &&
+    !opts.remoteUrl &&
+    !opts.github &&
+    !opts.google && !opts.meetings && !opts.slack;
+  if (existing.length > 0 && !attachPath) {
+    const pathNote = existing[0]!.local_path
+      ? ` with local_path ${existing[0]!.local_path}`
+      : '';
+    throw new SourceOpError(
+      'source_id_taken',
+      `Source id "${opts.id}" is already registered${pathNote}. ` +
+        `To replace it, run 'gbrain sources remove ${opts.id} --confirm-destructive' ` +
+        `first, then re-add — WARNING: remove permanently deletes every page ` +
+        `imported for this source.`,
+    );
+  }
+  // An attach keeps the stored name unless --name is set. Every insert writes
+  // --name, or the id when --name is omitted.
+  const name = attachPath ? opts.name : (opts.name ?? opts.id);
+  if (name !== undefined) await assertSourceNameFree(engine, opts.id, name);
+  return { attachPath };
+}
+
 export async function addSource(
   engine: BrainEngine,
   opts: AddSourceOpts,
@@ -504,36 +571,8 @@ export async function addSource(
     opts = { ...opts, google: { ...opts.google, dir: resolvePath(msysToNativePath(opts.google.dir)) } };
   }
 
-  // Q4: pre-flight collision check before any clone work.
-  const existing = await engine.executeRaw<{ id: string; local_path: string | null }>(
-    `SELECT id, local_path FROM sources WHERE id = $1`,
-    [opts.id],
-  );
-  // #3903: attach, don't collide. `gbrain sync --source X` on a path-less
-  // source prints "Run: gbrain sources add X --path <path>" — so when the
-  // existing row has NO local_path and the caller supplies exactly a --path
-  // (no --url, no --kind github), treat this as attaching a working tree to
-  // the existing row (non-destructive UPDATE) instead of demanding
-  // `sources remove --confirm-destructive`, which cascades page deletion.
-  const attachPath =
-    existing.length > 0 &&
-    existing[0]!.local_path === null &&
-    !!opts.localPath &&
-    !opts.remoteUrl &&
-    !opts.github &&
-    !opts.google && !opts.meetings && !opts.slack;
-  if (existing.length > 0 && !attachPath) {
-    const pathNote = existing[0]!.local_path
-      ? ` with local_path ${existing[0]!.local_path}`
-      : '';
-    throw new SourceOpError(
-      'source_id_taken',
-      `Source id "${opts.id}" is already registered${pathNote}. ` +
-        `To replace it, run 'gbrain sources remove ${opts.id} --confirm-destructive' ` +
-        `first, then re-add — WARNING: remove permanently deletes every page ` +
-        `imported for this source.`,
-    );
-  }
+  // Id and display-name collisions, before any clone or INSERT (every insert path below).
+  const { attachPath } = await assertSourceAddAvailable(engine, opts);
 
   // Validate URL before doing any filesystem work.
   let parsedUrl: { url: string; hostname: string } | null = null;

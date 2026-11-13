@@ -55,6 +55,17 @@ async function queued(source:string,requestId=randomUUID()){
     worktreeId:binding.worktree_id,topologyGeneration:binding.topology_generation});
 }
 
+test('add refuses a display name another source already holds',()=>fixture(async(home)=>{
+  const other=join(home,'other-root');mkdirSync(other);writeFileSync(join(other,'note.md'),'hello\n');
+  await runManagedSourceLifecycle(engine,{operation:'add',sourceId:'alpha-notes',path:other,name:'Shared Label'});
+  const dup=join(home,'dup-root');mkdirSync(dup);writeFileSync(join(dup,'note.md'),'hello\n');
+  await expect(runManagedSourceLifecycle(engine,{operation:'add',sourceId:'beta-notes',path:dup,name:'Shared Label',dryRun:true}))
+    .rejects.toMatchObject({name:'OperationError',code:'source_name_taken',retryable:false});
+  await expect(runManagedSourceLifecycle(engine,{operation:'add',sourceId:'beta-notes',path:dup,name:'Shared Label'}))
+    .rejects.toMatchObject({code:'source_name_taken'});
+  expect(await engine.executeRaw('SELECT id FROM sources WHERE id=$1',['beta-notes'])).toHaveLength(0);
+}),60_000);
+
 test('archive/restore advance topology and permanently invalidate accepted old bindings',()=>fixture(async(_home,source)=>{
   const old=(await getWorktreeBinding(engine,source))!;const accepted=await queued(source);
   const requestId=randomUUID();
