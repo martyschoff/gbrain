@@ -131,13 +131,18 @@ def _mail_lines(text):
     return visible
 
 
+def _header_candidate(line):
+    return re.sub(r"^(?:>\s*)+", "", line.strip())
+
+
 def _contiguous_header_block(lines):
     """A run of header lines anywhere in the window, not only at line 1."""
     if _BLOCK_LINE is None:
         return False
     run = 0
     for line in lines:
-        if _BLOCK_LINE.match(line):
+        candidate = _header_candidate(line)
+        if _BLOCK_LINE.match(candidate):
             run += 1
             if run >= _BLOCK_MIN:
                 return True

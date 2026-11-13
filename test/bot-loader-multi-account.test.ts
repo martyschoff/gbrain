@@ -309,13 +309,13 @@ describe('multi-account drops', () => {
     write(join(agent, 'memory/log/2026-11-12.md'), 'Remember the fake fact.\n');
     const notes: Record<string, string> = {
       'invoice.md': 'From: Ada Example\nSubject: Re: invoice\nDate: Tue, 12 Nov 2026 02:00:00 -0500\n\nA pasted note with no address.\n',
+      'titled.md': 'Invoice follow-up\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n',
+      'titled-blank.md': 'Invoice follow-up\n\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n',
       'outlook.md': 'From: Ada Example\nSent: Thursday, November 12, 2026 2:00 AM\nTo: Quinn Example\nSubject: Re: invoice\n',
       'original.md': '-----Original Message-----\nFrom: Ada Example\nSubject: Re: invoice\n\nPlease read the note.\n',
       'forward.md': '---------- Forwarded message ---------\nFrom: Ada Example\nDate: Tuesday\nSubject: Re: invoice\n\nA note.\n',
       'reply.md': 'On Thu, 12 Nov 2026, Ada Example wrote:\nThe invoice is a story.\n',
       'headers.md': 'From: Pat Example\nTo: Quinn Example\nSubject: notes\nDate: Tuesday\n',
-      'titled.md': 'Invoice follow-up\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n',
-      'titled-blank.md': 'Invoice follow-up\n\nFrom: Ada Example\nSubject: Re: invoice\nDate: Tuesday\n',
       'table.md': '| From | To |\n| --- | --- |\n| Ada Example | Quinn Example |\n',
       'twoline.md': 'From: Ada Example\nSubject: Re: invoice\n',
       'yaml.md': '---\nfrom: the notes\ndate: Tuesday\n---\n\nThe plan is to walk the hill.\n',
