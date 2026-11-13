@@ -302,8 +302,21 @@ describe('cli failure diagnostics', () => {
     const home = temp('gbrain-loader-put-fail-');
     const share = join(home, 'share');
     writeFileSync(join(home, 'host.env'), 'GBRAIN_EXPECTED_HOST=test-host\n');
-    write(join(share, 'personalgrok/alpha/note.md'), 'hello from the note\n');
-    const config = baseConfig(home, share);
+    write(join(share, 'acct-example/alpha/note.md'), 'hello from the note\n');
+    const config = baseConfig(home, share, {
+      groups: [{
+        id: 'personal',
+        source: 'personal',
+        target_root: join(share, 'acct-example/gbrain/personal'),
+        ensure_source: false,
+        forbid_git: false,
+        extensions: ['.md'],
+        bots: [{
+          id: 'alpha',
+          inputs: [{ path: join(share, 'acct-example/alpha'), required: false }],
+        }],
+      }],
+    });
     const brain = createGbrainClient('/usr/bin/gbrain', async (argv) => {
       if (argv.includes('put')) {
         return {
