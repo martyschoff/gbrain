@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import unittest
 
-from secret_rules import load_patterns, secret_content, secret_name
+from export_deny import denied_content, denied_content_rule, denied_name, denied_name_rule
+from secret_rules import load_patterns, secret_content, secret_content_rule, secret_name, secret_name_rule
 
 
 class SecretRulesTest(unittest.TestCase):
@@ -101,6 +102,41 @@ class SecretRulesTest(unittest.TestCase):
         self.assertFalse(denied_content("From the hill the path was clear.\nSubject matter stays in the notes.\n"))
         self.assertFalse(denied_content("A fake fact from yesterday."))
         self.assertFalse(denied_content("Meet at 2 AM."))
+
+    def test_rule_labels_and_wrappers(self):
+        data = load_patterns()
+        for row in data["names"]:
+            self.assertEqual(secret_name(row["sample"]), secret_name_rule(row["sample"]) is not None, row["sample"])
+            self.assertIsNotNone(secret_name_rule(row["sample"]), row["sample"])
+        for name in data["name_negatives"]:
+            self.assertIsNone(secret_name_rule(name), name)
+            self.assertFalse(secret_name(name), name)
+        for row in data["content"]:
+            self.assertEqual(secret_content(row["sample"]), secret_content_rule(row["sample"]) is not None, row["sample"][:24])
+            self.assertIsNotNone(secret_content_rule(row["sample"]), row["sample"][:24])
+        for text in data["content_negatives"]:
+            self.assertIsNone(secret_content_rule(text), text)
+            self.assertFalse(secret_content(text), text)
+        self.assertEqual(secret_name_rule("api-token.txt"), "secrets.names[9]")
+        self.assertEqual(secret_content_rule("note\n-----BEGIN OPENSSH PRIVATE KEY-----\n"), "secrets.content[0]")
+        self.assertEqual(secret_content_rule("x\napi_key=" + "not-a-real-value\n"), "secrets.key_assignment")
+        self.assertEqual(denied_name_rule("holdings.csv"), "deny.names[0]")
+        self.assertFalse(denied_name("memory.md"))
+        self.assertEqual(denied_name("holdings.csv"), denied_name_rule("holdings.csv") is not None)
+        self.assertEqual(denied_content_rule("reach " + "ada" + "@" + "example.org"), "deny.content[0]")
+        self.assertEqual(denied_content_rule("api_key=" + "not-a-real-value"), "deny.key_assignment")
+        self.assertEqual(
+            denied_content_rule("From: " + "ada" + "@" + "example.org" + "\nSubject: hello\n"),
+            "deny.mail_headers",
+        )
+        self.assertEqual(denied_content("reach " + "ada" + "@" + "example.org"), denied_content_rule("reach " + "ada" + "@" + "example.org") is not None)
+        self.assertFalse(denied_content("A fake fact."))
+        self.assertIsNone(denied_content_rule("A fake fact."))
+        loaded = load_patterns()
+        self.assertIn("names", loaded)
+        self.assertIn("content", loaded)
+        self.assertTrue(loaded["names"])
+        self.assertTrue(loaded["content"])
 
 
 if __name__ == "__main__":
